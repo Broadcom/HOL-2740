@@ -1,0 +1,4 @@
+provider_installation {
+  dev_overrides {
+      "vmware/nsxt" = "/hol/hol-2740/migration_files/nsx-t-migration/terraform-nsx-lb-deployment/.terraform/providers/registry.terraform.io/vmware/nsxt/3.9.0/linux_amd64"
+}}

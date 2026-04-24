@@ -1,0 +1,26 @@
+#Version 2671
+
+VirtualService:
+  - match_name: ".*"
+    patch:
+      vrf_context_ref: /api/vrfcontext/?name=t1-wld-a
+      enabled: true 
+      traffic_enabled: true
+ 
+VsVip:
+  - match_name: ".*"
+    patch:
+      vip:
+      - vip_id: 1
+        auto_allocate_ip: false
+        prefix_length: 32
+        placement_networks:
+        - network_ref: /api/network/?name=wld-a-avi-data
+      tier1_lr: /infra/tier-1s/349361ff-2844-4ad3-9f03-6ab52b47f5af
+      vrf_context_ref: /api/vrfcontext/?name=t1-wld-a
+ 
+Pool:
+  - match_name: ".*"
+    patch:
+      tier1_lr: /infra/tier-1s/349361ff-2844-4ad3-9f03-6ab52b47f5af
+      vrf_ref: /api/vrfcontext/?name=t1-wld-a
