@@ -1,0 +1,42 @@
+# python_bin: absolute path to the python binary inside the venv that has
+# ansible-playbook installed (e.g. /home/holuser/py312venv/bin/python).
+# Set to null to fall back to standard PATH resolution.
+config:
+  python_bin: null
+
+skus:
+  - id: HOL-2671-01
+    title: "HOL-2671-01 - Load balancing VCF apps with Avi"
+    modules:
+      - name: "Module 1 - Environment Setup"
+        description: "Deploys the base Avi Controller and initial cloud connector configuration."
+        playbook: ../module-scripts/2671-01-module_1.yaml
+      - name: "Module 2 - Configure a Virtual Service"
+        description: "Creates the first virtual service and pool fronting the demo app."
+        playbook: ../module-scripts/2671-01-module_2.yaml
+      - name: "Module 3 - Health Monitors"
+        description: "Attaches HTTP health monitors and validates pool member status."
+        playbook: ../module-scripts/2671-01-module_3.yaml
+      - name: "Module 4 - SSL Termination"
+        description: "Enables SSL termination on the virtual service using a lab certificate."
+        playbook: demo_module_fail.yaml
+
+  - id: HOL-2671-02
+    title: "HOL-2671-02 - Getting started with application delivery"
+    modules:
+      - name: "Module 1 - Base Networking"
+        description: "Configures VRFs and static routes required for the lab topology."
+        playbook: ../module-scripts/2671-02-module_1.yaml
+      - name: "Module 2 - WAF Policy"
+        description: "Applies a starter WAF policy to the demo virtual service."
+        playbook: ../module-scripts/2671-02-module_2.yaml
+      - name: "Module 3 - Autoscale"
+        description: "Enables predictive autoscale on the backend server pool."
+        playbook: ../module-scripts/2671-02-module_3.yaml
+
+  - id: HOL-2671-03
+    title: "HOL-2671-03 - Migrating legacy load balancing"
+    modules:
+      - name: "Module 1 - Import Legacy Config"
+        description: "Imports an example legacy load balancer configuration for migration."
+        playbook: ../module-scripts/2671-03-module_1.yaml

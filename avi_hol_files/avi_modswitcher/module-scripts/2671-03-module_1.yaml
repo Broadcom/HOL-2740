@@ -1,0 +1,35 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  pre_tasks:
+    - name: Have we run before?
+      stat:
+        path: /hol/modswitcher_status.txt
+      register: statfile_exists
+    - name: Add a file in /hol with the command of playbook if we haven't run before
+      ansible.builtin.lineinfile:
+        path: /hol/modswitcher_status.txt
+        line: "{{ lookup('file', '/proc/self/cmdline') | regex_replace('\u0000',' ') }}"
+        create: yes
+      when: not statfile_exists.stat.exists
+    - block:
+      - name: "Mod switcher has run before, ending the play"
+        debug:
+          msg: "Mod switcher has run before, ending the play"
+      - meta: end_play
+      when: statfile_exists.stat.exists
+
+  tasks:
+    - name: init and push
+      community.general.terraform:
+        project_path: '/hol/hol-2671/migration_files/nsx-t-migration/terraform-nsx-lb-deployment'
+        state: present
+        variables:
+          nsxt_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      environment:
+        #http_proxy: http://proxy:3128
+        #https_proxy: http://proxy:3128
+        no_proxy: "nsx-wld01-01a.site-a.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+        NO_PROXY: "nsx-wld01-01a.site-a.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
