@@ -21,9 +21,9 @@
           tier1_lr: "/infra/tier-1s/{{ t1_uuid }}"
           default_server_port: 30001 
           servers:
-            - hostname: "linux-01a.site-a.vcf.lab"
+            - hostname: "web1.site-a.vcf.lab"
               resolve_server_by_dns: true
-            - hostname: "linux-02a.site-a.vcf.lab"
+            - hostname: "web2.site-a.vcf.lab"
               resolve_server_by_dns: true
           health_monitor_refs:
             - '/api/healthmonitor/?name=System-HTTP'
@@ -108,9 +108,9 @@
           sni_enabled: true
           ssl_profile_ref: '/api/sslprofile?name=System-Standard'
           servers:
-            - hostname: "linux-01a.site-a.vcf.lab"
+            - hostname: "web1.site-a.vcf.lab"
               resolve_server_by_dns: true
-            - hostname: "linux-02a.site-a.vcf.lab"
+            - hostname: "web2.site-a.vcf.lab"
               resolve_server_by_dns: true
           health_monitor_refs:
             - '/api/healthmonitor/?name=System-HTTPS'
@@ -203,9 +203,9 @@
           sni_enabled: true
           ssl_profile_ref: '/api/sslprofile/?name=System-Standard'
           servers:
-            - hostname: "linux-01a.site-a.vcf.lab"
+            - hostname: "web1.site-a.vcf.lab"
               resolve_server_by_dns: true
-            - hostname: "linux-02a.site-a.vcf.lab"
+            - hostname: "web2.site-a.vcf.lab"
               resolve_server_by_dns: true
           health_monitor_refs:
             - '/api/healthmonitor/?name=System-HTTPS'

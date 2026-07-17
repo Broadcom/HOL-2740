@@ -16,11 +16,11 @@ all:
           ansible_sudo_pass: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
     linuxhosts:
       hosts:
-        linux-01a:
+        web1:
           connection: ssh
           ansible_user: holuser
           ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
-        linux-02a:
+        web2:
           connection: ssh
           ansible_user: holuser
           ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"

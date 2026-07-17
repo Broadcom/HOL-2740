@@ -14,9 +14,9 @@ all:
           #old_cluster_uuid: cluster-b6647c06-c211-479b-b980-192608b408b7
     linuxhosts:
       hosts:
-        linux-01a:
+        web1:
           connection: ssh
           ansible_user: holuser
-        linux-02a:
+        web2:
           connection: ssh
           ansible_user: holuser

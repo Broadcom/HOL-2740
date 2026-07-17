@@ -9,9 +9,9 @@ site_a_load_balancer_1 = "site_a_load_balancer_1"
 
 
 # Pool Member Vars
-site_a_pool_member_1_name = "linux-01a"
+site_a_pool_member_1_name = "web1"
 site_a_pool_member_1_ip = "10.1.13.11"
-site_a_pool_member_2_name = "linux-02a"
+site_a_pool_member_2_name = "web2"
 site_a_pool_member_2_ip = "10.1.13.12"
 http-30001 = "http-30001"
 

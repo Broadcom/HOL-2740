@@ -289,12 +289,12 @@
             ip:
               addr: "{{worker1}}"
               type: V4
-            hostname: "linux-01a"
+            hostname: "web1"
           - port: 30001
             ip:
               addr: "{{worker2}}"
               type: V4
-            hostname: "linux-02a"
+            hostname: "web2"
         tenant: admin
 
 

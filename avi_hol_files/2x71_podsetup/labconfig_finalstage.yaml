@@ -80,7 +80,7 @@
 
 #  ####################################################
 
-# - hosts: linux-01a
+# - hosts: web1
 #   tasks:
 #     - name: cleanup
 #       docker_container:
