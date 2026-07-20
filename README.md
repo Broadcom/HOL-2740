@@ -65,9 +65,10 @@ big long command line that nobody wants to type
 
 ### Principal
 
-* Principal Name:
+* Principal Name: Nick Robbins
 
 ### Captain(s)
 
-* Captain:
-* Captain:
+* Captain: Brandon Andersen
+* Captain: Brandon Fulton
+* Captain: Chris Mentjox
