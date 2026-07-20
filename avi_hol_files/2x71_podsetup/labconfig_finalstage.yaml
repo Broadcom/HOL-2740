@@ -12,6 +12,12 @@
       controller: 10.1.1.90
       api_version: "32.1.1"
 
+    site_b:
+      username: "admin"
+      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      controller: 10.1.1.92
+      api_version: "32.1.1"
+
   tasks:
     - name: admin columns
       vmware.alb.avi_api_session:
@@ -174,7 +180,7 @@
 
     - name: Copy modswitcher folder
       ansible.posix.synchronize:
-        src: /vpodrepo/2027-labs/2740/avi_hol_files/hol_modswitcher
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/avi_modswitcher
         dest: /hol/hol-2740
 
     - name: Copy migration files folder
