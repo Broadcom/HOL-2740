@@ -13,9 +13,9 @@ from pathlib import Path
 
 APP_ID = "modswitcher"
 APP_NAME = "Hands-on Labs Module Switcher"
-APP_DIR = Path("/hol/hol-2671/hol_modswitcher")
+APP_DIR = Path("/hol/hol-2740/avi_modswitcher/modswitcher")
 PYTHON_BIN = "/home/holuser/py312venv/bin/python3"
-ENTRYPOINT = APP_DIR / "modswitcher.py"
+ENTRYPOINT = APP_DIR / "app.py"
 ICON_PATH = APP_DIR / "hol-logo.png"
 
 REQUIRED_PACKAGES = [

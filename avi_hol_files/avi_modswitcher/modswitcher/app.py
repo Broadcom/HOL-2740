@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 
 BASE_DIR = Path(__file__).resolve().parent
 MANIFEST_PATH = BASE_DIR / "manifest.yaml"
-LOGO_PATH = BASE_DIR.parent / "hol-logo.png"
+LOGO_PATH = BASE_DIR / "hol-logo.png"
 
 
 def resolve_ansible_playbook_bin(configured_python_bin):

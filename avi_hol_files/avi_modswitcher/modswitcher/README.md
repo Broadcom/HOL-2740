@@ -131,17 +131,28 @@ changes is safe and won't create duplicate dash icons.
 
 ## Moving to production
 
-Everything above works against this prototype's file layout. Before this
-becomes the real LMC tool, update the placeholder constants at the top of
-`create_launcher.py` to match where the app actually lives on the LMC
-image:
+`create_launcher.py`'s constants are set to the real LMC deployment layout:
 
 ```python
-APP_DIR = Path("/hol/hol-2671/hol_modswitcher")
+APP_DIR = Path("/hol/hol-2740/avi_modswitcher/modswitcher")
 PYTHON_BIN = "/home/holuser/py312venv/bin/python3"
-ENTRYPOINT = APP_DIR / "modswitcher.py"
+ENTRYPOINT = APP_DIR / "app.py"
 ICON_PATH = APP_DIR / "hol-logo.png"
 ```
+
+This assumes `avi_modswitcher/` has two sibling folders — `modswitcher/`
+(this app: `app.py`, `manifest.yaml`, `create_launcher.py`, etc.) and
+`module-scripts/` (the Ansible playbooks) — which is what the manifest's
+`../module-scripts/...` relative paths already expect. **`hol-logo.png`
+needs to live inside `modswitcher/`, alongside `app.py`** — both the app's
+own window/dock icon (`app.py`'s `LOGO_PATH`) and the desktop launcher's
+`Icon=` (`create_launcher.py`'s `ICON_PATH`) resolve it from that same
+directory.
+
+If this path ever changes (e.g. a different lab number, or a directory
+rename), update `APP_DIR` above and re-run `create_launcher.py` — it will
+overwrite the existing `.desktop` file in place with corrected paths and
+won't duplicate the dash pin.
 
 Also worth checking against your actual LMC image before relying on it in
 production:
