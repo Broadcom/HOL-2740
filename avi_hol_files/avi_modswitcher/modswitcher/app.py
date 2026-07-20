@@ -363,6 +363,7 @@ class MainWindow(QMainWindow):
 def main():
     manifest = yaml.safe_load(MANIFEST_PATH.read_text())
     app = QApplication(sys.argv)
+    app.setDesktopFileName("modswitcher")
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
     if LOGO_PATH.exists():

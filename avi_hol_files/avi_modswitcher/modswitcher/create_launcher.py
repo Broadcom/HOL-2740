@@ -35,7 +35,6 @@ Name={APP_NAME}
 Comment=Fast-forward through Hands-on Labs modules
 Exec={PYTHON_BIN} {ENTRYPOINT}
 Icon={ICON_PATH}
-Categories=Education;
 """
 
 
