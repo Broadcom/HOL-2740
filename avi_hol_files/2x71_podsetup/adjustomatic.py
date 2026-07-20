@@ -105,26 +105,26 @@ def main():
     #     lsf.write_output('Adjustomatic failed at avitweaker - avi configuration step') 
     #     lsf.labfail('Adjustomatic failed at avitweaker - avi configuration step')
 
-    # try:
-    #     lsf.write_output("Running final stages playbook")   
-    #     # Playbook to run final config steps
-    #     result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml", 
-    #         "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file", 
-    #         "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-    #     lsf.write_output(result)
-    #     try:
-    #         lsf.write_output(result.stdout)
-    #     except:
-    #         pass
-    # except Exception as e:
-    #     lsf.write_output(e)
-    #     try:
-    #         lsf.write_output(e.stdout)
-    #         lsf.write_output(e.stderr)
-    #     except:
-    #         pass   
-    #     lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step') 
-    #     lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
+    try:
+        lsf.write_output("Running final stages playbook")   
+        # Playbook to run final config steps
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml", 
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file", 
+            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        lsf.write_output(result)
+        try:
+            lsf.write_output(result.stdout)
+        except:
+            pass
+    except Exception as e:
+        lsf.write_output(e)
+        try:
+            lsf.write_output(e.stdout)
+            lsf.write_output(e.stderr)
+        except:
+            pass   
+        lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step') 
+        lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
 
     # try:
     #     stdout = subprocess.run(["/usr/bin/rm", "-rf", "/home/holuser/vaultsecret.txt"], text=True, check=True)
