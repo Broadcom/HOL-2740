@@ -1,0 +1,205 @@
+---
+# Run once to pre-populate demo orders for the chatbot IDOR demo.
+# Safe to re-run — users/orders/order_items use ON CONFLICT DO NOTHING, products use DO UPDATE.
+# Usage: kubectl apply -f database-seed-job.yaml -n avimart
+#        kubectl wait --for=condition=complete job/avimart-db-seed -n avimart --timeout=60s
+#        kubectl delete job avimart-db-seed -n avimart   # clean up after
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: avimart-seed-sql
+  namespace: avimart
+data:
+  seed.sql: |
+    -- Demo users (password: "password123" for all)
+    -- Hash pre-computed with bcrypt cost 10 — no pgcrypto extension needed.
+    -- SERIAL columns accept explicit id values directly — no OVERRIDING clause needed.
+    INSERT INTO users (id, username, email, password, role) VALUES
+      (10, 'alice',   'alice@avimart.demo',   '$2b$10$v66As7zFfskvavUFR6K0a.8WTYAp6vNJ5lRigbN85wUxyDG9JWUHa', 'user'),
+      (11, 'bob',     'bob@avimart.demo',     '$2b$10$v66As7zFfskvavUFR6K0a.8WTYAp6vNJ5lRigbN85wUxyDG9JWUHa', 'user'),
+      (12, 'charlie', 'charlie@avimart.demo', '$2b$10$v66As7zFfskvavUFR6K0a.8WTYAp6vNJ5lRigbN85wUxyDG9JWUHa', 'admin')
+    ON CONFLICT DO NOTHING;
+
+    -- Adjust the sequence so future auto-inserts don't collide
+    SELECT setval('users_id_seq', GREATEST((SELECT MAX(id) FROM users), 20));
+
+    -- Demo products (high IDs to avoid conflicts) — fictional, non-VMware brand names by design
+    -- (the storefront shouldn't literally search/attack Broadcom's own product names).
+    -- Uses DO UPDATE (not DO NOTHING) so re-running this job always syncs name/price/etc to the
+    -- definition below, even against an already-seeded database — DO NOTHING previously let a
+    -- rename silently not apply to a live deployment.
+    INSERT INTO products (id, name, description, price, category, stock, image_color, image_icon)
+    VALUES
+      (100, 'CloudPanda Load Balancer',
+            'Enterprise-grade traffic distribution and load balancing for multi-cloud environments',
+            4999.99, 'Networking', 50, '#0ea5e9', '⚡'),
+      (101, 'FoxGuard Firewall',
+            'East-west micro-segmentation and intrusion detection for containerized workloads',
+            2499.99, 'Firewall', 100, '#ef4444', '🛡️'),
+      (102, 'StackNest Foundation Bundle',
+            'All-in-one private cloud starter — compute, storage, and network in one SKU',
+            9999.99, 'Platform', 25, '#8b5cf6', '☁️'),
+      (103, 'OctoMesh CNI Enterprise',
+            'Advanced container networking with policy enforcement and flow visibility',
+            799.99, 'Networking', 200, '#10b981', '🔌'),
+      (104, 'TurtleShell Container License',
+            'Production-grade managed container platform license',
+            1999.99, 'Platform', 75, '#f59e0b', '⚓'),
+      (105, 'NightOwl Monitoring Suite',
+            'Real-time network monitoring, alerting, and automated anomaly response',
+            2499.99, 'Monitoring', 100, '#06b6d4', '🦉'),
+      (106, 'IronVault Crypto Module',
+            'Hardware security module for key management and encryption, FIPS-ready',
+            8999.99, 'Cryptography', 20, '#64748b', '🔐'),
+      (107, 'KeyKoala MFA Key',
+            'Hardware security key with FIDO2/WebAuthn support — phishing-resistant MFA',
+            89.99, 'Authentication', 500, '#22c55e', '🔑'),
+      (108, 'RedFox PenTest Suite',
+            'All-in-one penetration testing toolkit with automated reporting',
+            1299.99, 'Testing', 60, '#f97316', '🦊'),
+      (109, 'GateKeeper API Shield',
+            'API gateway with rate limiting, schema validation, and bot protection',
+            1999.99, 'API Security', 80, '#a855f7', '🚪')
+    ON CONFLICT (id) DO UPDATE SET
+      name = EXCLUDED.name,
+      description = EXCLUDED.description,
+      price = EXCLUDED.price,
+      category = EXCLUDED.category,
+      stock = EXCLUDED.stock,
+      image_color = EXCLUDED.image_color,
+      image_icon = EXCLUDED.image_icon;
+
+    SELECT setval('products_id_seq', GREATEST((SELECT MAX(id) FROM products), 120));
+
+    -- Demo orders with predictable IDs for IDOR demo
+    -- Order 1: alice bought CloudPanda Load Balancer
+    INSERT INTO orders (id, user_id, session_id, total, status, created_at)
+    VALUES
+      (1, 10, 'sess-alice-001', 4999.99, 'confirmed', NOW() - INTERVAL '5 days')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 1, 100, 1, 4999.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 1);
+
+    -- Order 2: bob bought FoxGuard Firewall + OctoMesh CNI
+    INSERT INTO orders (id, user_id, session_id, total, status, created_at)
+    VALUES
+      (2, 11, 'sess-bob-001', 3299.98, 'confirmed', NOW() - INTERVAL '3 days')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 2, 101, 1, 2499.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 2 AND product_id = 101);
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 2, 103, 1, 799.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 2 AND product_id = 103);
+
+    -- Order 3: charlie bought StackNest Foundation Bundle
+    INSERT INTO orders (id, user_id, session_id, total, status, created_at)
+    VALUES
+      (3, 12, 'sess-charlie-001', 9999.99, 'confirmed', NOW() - INTERVAL '2 days')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 3, 102, 1, 9999.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 3);
+
+    -- Order 4: alice bought TurtleShell Container License
+    INSERT INTO orders (id, user_id, session_id, total, status, created_at)
+    VALUES
+      (4, 10, 'sess-alice-002', 1999.99, 'pending', NOW() - INTERVAL '1 day')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 4, 104, 1, 1999.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 4);
+
+    -- Order 5: bob bought CloudPanda LB + StackNest Bundle (big order — good for demo)
+    INSERT INTO orders (id, user_id, session_id, total, status, created_at)
+    VALUES
+      (5, 11, 'sess-bob-002', 14999.98, 'confirmed', NOW() - INTERVAL '12 hours')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 5, 100, 1, 4999.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 5 AND product_id = 100);
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 5, 102, 1, 9999.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 5 AND product_id = 102);
+
+    -- Order 6: anonymous session order (tests session-based IDOR)
+    INSERT INTO orders (id, user_id, session_id, total, status, created_at)
+    VALUES
+      (6, NULL, 'sess-anon-demo', 799.99, 'pending', NOW() - INTERVAL '2 hours')
+    ON CONFLICT (id) DO NOTHING;
+
+    INSERT INTO order_items (order_id, product_id, quantity, price)
+    SELECT 6, 103, 1, 799.99
+    WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_id = 6);
+
+    SELECT setval('orders_id_seq', GREATEST((SELECT MAX(id) FROM orders), 10));
+
+    -- Fake shipping address + credit card for the exfiltration/IDOR demo.
+    -- Not real PII/PAN — ACME-XXXX-XXXX-XXXX is an obviously-fake card format.
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_address TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS credit_card VARCHAR(20);
+
+    UPDATE orders SET
+      shipping_address = '742 Ocean Drive, Miami, FL 33139',
+      credit_card = 'ACME-4521-8873-0192'
+    WHERE id IN (1, 4) AND shipping_address IS NULL;
+
+    UPDATE orders SET
+      shipping_address = '18 Baker Street, London, NW1 6XE, UK',
+      credit_card = 'ACME-7734-2210-5567'
+    WHERE id IN (2, 5) AND shipping_address IS NULL;
+
+    UPDATE orders SET
+      shipping_address = '500 Market St, San Francisco, CA 94105',
+      credit_card = 'ACME-3390-6642-8815'
+    WHERE id = 3 AND shipping_address IS NULL;
+
+    UPDATE orders SET
+      shipping_address = '1 Market Square, Austin, TX 78701',
+      credit_card = 'ACME-9012-3345-6678'
+    WHERE id = 6 AND shipping_address IS NULL;
+
+    -- Summary
+    SELECT 'Seed complete' AS status,
+           (SELECT COUNT(*) FROM users  WHERE id >= 10) AS demo_users,
+           (SELECT COUNT(*) FROM products WHERE id >= 100) AS demo_products,
+           (SELECT COUNT(*) FROM orders  WHERE id <= 6)   AS demo_orders;
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: avimart-db-seed
+  namespace: avimart
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: seed
+        image: postgres:15-alpine
+        command:
+        - /bin/sh
+        - -c
+        - psql "$DATABASE_URL" -f /seed/seed.sql
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: avimart-db-secret
+              key: DATABASE_URL
+        volumeMounts:
+        - name: sql
+          mountPath: /seed
+      volumes:
+      - name: sql
+        configMap:
+          name: avimart-seed-sql

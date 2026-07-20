@@ -1,0 +1,198 @@
+# HTTPRoutes for vDefend microservices deployment
+# Each /api prefix routes to the responsible microservice.
+# admin-svc is intentionally EXCLUDED — it has no external route (internal only).
+# The lateral movement demo exploits this: vuln-svc can still reach admin-svc east-west
+# until Antrea ClusterNetworkPolicy in antrea-policies.yaml is applied.
+---
+apiVersion: ako.vmware.com/v1alpha2
+kind: L7Rule
+metadata:
+  name: waf-avimart
+spec:
+  wafPolicy:
+    kind: AviRef
+    name: WAF-avimart-policy
+---
+# TODO: switch applicationProfile to avimart-secure-http-mcp (System-Secure-HTTP-MCP
+# clone) once chatbot/mcp-svc are confirmed to talk HTTPS end to end. Using plain
+# System-HTTP for now since the secure MCP profile forces HTTPS-only behavior.
+# Option for HTTPS: chatbot's gateway cert (chris-tkg-gateway) is issued by a private
+# CA (vault-issuer-supervisor), so httpx won't trust it by default. Make trust
+# pluggable instead of hardcoding this CA: add an optional CA-bundle Secret volume
+# mount to chatbot-stack/chatbot.yaml + MCP_CA_BUNDLE env var, and have main.py's
+# httpx.AsyncClient(verify=...) use it if present, else fall back to verify=True.
+# That way it's repeatable for anyone using a different private CA.
+apiVersion: ako.vmware.com/v1alpha2
+kind: L7Rule
+metadata:
+  name: mcp-secure-profile
+spec:
+  wafPolicy:
+    kind: AviRef
+    name: WAF-avimart-policy
+  applicationProfile:
+    kind: AviRef
+    name: System-HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: avimart-shop
+spec:
+  parentRefs:
+  - name: chris-tkg-gateway
+    namespace: default
+  hostnames:
+  - "avimart.k8s.fqdn.nl"
+  rules:
+  - name: products-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /api/products
+    filters:
+    - type: ExtensionRef
+      extensionRef:
+        group: ako.vmware.com
+        kind: L7Rule
+        name: waf-avimart
+    backendRefs:
+    - name: product-svc
+      port: 8080
+
+  - name: auth-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /api/auth
+    filters:
+    - type: ExtensionRef
+      extensionRef:
+        group: ako.vmware.com
+        kind: L7Rule
+        name: waf-avimart
+    backendRefs:
+    - name: auth-svc
+      port: 8080
+
+  - name: cart-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /api/cart
+    filters:
+    - type: ExtensionRef
+      extensionRef:
+        group: ako.vmware.com
+        kind: L7Rule
+        name: waf-avimart
+    backendRefs:
+    - name: order-svc
+      port: 8080
+
+  - name: orders-search-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /api/orders/search
+    filters:
+    - type: ExtensionRef
+      extensionRef:
+        group: ako.vmware.com
+        kind: L7Rule
+        name: waf-avimart
+    backendRefs:
+    - name: order-svc
+      port: 8080
+
+  - name: orders-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /api/orders
+    backendRefs:
+    - name: order-svc
+      port: 8080
+
+  - name: vuln-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /api/ping
+    - path:
+        type: PathPrefix
+        value: /api/file
+    - path:
+        type: PathPrefix
+        value: /api/probe
+    - path:
+        type: PathPrefix
+        value: /api/tcp-probe
+    backendRefs:
+    - name: vuln-svc
+      port: 8080
+
+  - name: chat-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /chat
+    filters:
+    - type: ExtensionRef
+      extensionRef:
+        group: ako.vmware.com
+        kind: L7Rule
+        name: waf-avimart
+    backendRefs:
+    - name: chatbot-svc
+      port: 8000
+
+  - name: mcp-api
+    matches:
+    - path:
+        type: PathPrefix
+        value: /mcp
+    filters:
+    - type: ExtensionRef
+      extensionRef:
+        group: ako.vmware.com
+        kind: L7Rule
+        name: mcp-secure-profile
+    backendRefs:
+    - name: mcp-svc
+      port: 3001
+
+  - name: frontend
+    matches:
+    - path:
+        type: PathPrefix
+        value: /
+    filters:
+    - type: ExtensionRef
+      extensionRef:
+        group: ako.vmware.com
+        kind: L7Rule
+        name: waf-avimart
+    backendRefs:
+    - name: avimart-frontend
+      port: 3000
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: waf-attack-lab
+spec:
+  parentRefs:
+  - name: chris-tkg-gateway
+    namespace: default
+  hostnames:
+  - "waflab.k8s.fqdn.nl"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: waf-attack-lab
+      port: 5001
