@@ -1,3 +1,16 @@
+def retry_io(fn, *args, retries=3, delay=5, **kwargs):
+    """Retry fn on transient I/O errors (errno 5). Re-raises immediately on any other error."""
+    import time
+    for attempt in range(1, retries + 1):
+        try:
+            return fn(*args, **kwargs)
+        except OSError as e:
+            if e.errno == 5 and attempt < retries:
+                time.sleep(delay)
+                continue
+            raise
+
+
 def main():
     # install forgotten pip package
     import subprocess
@@ -106,16 +119,21 @@ def main():
     #     lsf.labfail('Adjustomatic failed at avitweaker - avi configuration step')
 
     try:
-        lsf.write_output("Running final stages playbook")   
+        lsf.write_output("Running final stages playbook")
         # Playbook to run final config steps
-        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml", 
-            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file", 
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml",
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file",
             "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-        lsf.write_output(result)
+        # Playbook already succeeded at this point - don't let a transient I/O error while
+        # logging its output turn a successful run into a lab failure.
         try:
-            lsf.write_output(result.stdout)
-        except:
-            pass
+            retry_io(lsf.write_output, result)
+            retry_io(lsf.write_output, result.stdout)
+        except OSError as log_err:
+            try:
+                lsf.write_output(f"final stage playbook succeeded, but logging its output failed: {log_err}")
+            except OSError:
+                pass
     except Exception as e:
         lsf.write_output(e)
         try:
