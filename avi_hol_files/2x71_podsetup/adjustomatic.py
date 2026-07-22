@@ -127,8 +127,8 @@ def main():
         # Playbook already succeeded at this point - don't let a transient I/O error while
         # logging its output turn a successful run into a lab failure.
         try:
-            retry_io(lsf.write_output, result)
-            retry_io(lsf.write_output, result.stdout)
+            retry_io(lsf.write_output, result, console=False)
+            retry_io(lsf.write_output, result.stdout, console=False)
         except OSError as log_err:
             try:
                 lsf.write_output(f"final stage playbook succeeded, but logging its output failed: {log_err}")
