@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Locks down east-west traffic between the AviMart (vDefend/) services on
+# Locks down east-west traffic between the AviMart (avimart/) services on
 # NSX 9.1's Antrea DFW integration: deny-by-default within the avimart
 # namespace, with explicit ALLOW rules for the flows that are actually needed.
 #

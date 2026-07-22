@@ -1,6 +1,6 @@
 # NSX vDefend DFW Demo
 
-Reconciles the "Antrea" NSX security policy that microsegments AviMart's east-west traffic. This is the live mechanism behind the vDefend part of the demo — see the four-act narrative in [`vDefend/README.md`](vDefend/README.md).
+Reconciles the "Antrea" NSX security policy that microsegments AviMart's east-west traffic. This is the live mechanism behind the vDefend part of the demo — see the four-act narrative in [`avimart/README.md`](avimart/README.md).
 
 ## Prerequisites
 
@@ -72,7 +72,7 @@ The `Antrea` SecurityPolicy itself and its rules are always fully reconciled (PU
 ## Companion scripts
 
 - **`nsx-demo-dfw-reset.sh`** — deletes everything this script manages (the container-cluster-span, the `Antrea` policy, and all 15 groups). Nuclear option, for recovering from a corrupted demo state (e.g. a group with a stray empty condition that silently breaks matching) rather than reconciling against possibly-stale state.
-- **`prepare-demo.sh`** — one-shot environment setup: prompts for Avi/NSX credentials, creates the `nsx-dfw-creds` K8s Secret the attack-lab app reads, and runs this script with `DFW_STAGE=none` plus `avi-demo-reset.sh`, resetting the whole demo to Act 0 (wide open). Must be `source`d, not executed. This is also what bootstraps groups/services/cluster-span on a brand-new cluster — see [`vDefend/README.md`](vDefend/README.md) for the full new-deployment checklist.
+- **`prepare-demo.sh`** — one-shot environment setup: prompts for Avi/NSX credentials, creates the `nsx-dfw-creds` K8s Secret the attack-lab app reads, and runs this script with `DFW_STAGE=none` plus `avi-demo-reset.sh`, resetting the whole demo to Act 0 (wide open). Must be `source`d, not executed. This is also what bootstraps groups/services/cluster-span on a brand-new cluster — see [`avimart/README.md`](avimart/README.md) for the full new-deployment checklist.
 - **`nsx-get-antrea.sh`** — read-only: dumps the current `Antrea` policy, its container-cluster-span, and the NSX enforcement point's cluster-control-planes list (see Prerequisites above).
 
 ## Live control (no CLI needed after bootstrap)

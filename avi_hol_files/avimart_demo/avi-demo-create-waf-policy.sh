@@ -19,10 +19,10 @@ set -euo pipefail
 AVI_DEBUG="${AVI_DEBUG:-0}"
 dbg() { [[ "$AVI_DEBUG" == "1" ]] && echo "$@" >&2 || true; }
 
-AVI_HOST="${AVI_HOST:-sfo-w01-avilb01.sfo.rainpole.io}"
+AVI_HOST="${AVI_HOST:-alb-a.site-a.vcf.lab}"
 AVI_USER="${AVI_USER:-admin}"
 AVI_VERSION="${AVI_VERSION:-32.1.1}"
-AVI_TENANT="${AVI_TENANT:-chrisblog}"
+AVI_TENANT="${AVI_TENANT:-Acme-East-A}"
 POLICY_NAME="WAF-avimart-policy"
 
 WAF_PROFILE_NAME="${WAF_PROFILE_NAME:-System-WAF-Profile}"

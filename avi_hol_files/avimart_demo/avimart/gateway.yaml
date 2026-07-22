@@ -1,0 +1,27 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: hol-tkg-gateway
+  namespace: default
+spec:
+  gatewayClassName: avi-lb
+  listeners:
+  - name: foo-http
+    protocol: HTTP
+    port: 80
+    hostname: "*.site-a.vcf.lab"
+    allowedRoutes:
+      namespaces:
+        from: All
+  - name: foo-https
+    protocol: HTTPS
+    port: 443
+    hostname: "*.site-a.vcf.lab"
+    allowedRoutes:
+      namespaces:
+        from: All
+    tls:
+      certificateRefs:
+      - kind: Secret
+        group: ""
+        name: wildcard.site-a.vcf.lab
