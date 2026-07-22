@@ -159,7 +159,5 @@ def main():
     #     except:
     #         pass
 
-    print("placeholder script, break glass for emergency")
-
 if __name__ == "__main__":
     main()
