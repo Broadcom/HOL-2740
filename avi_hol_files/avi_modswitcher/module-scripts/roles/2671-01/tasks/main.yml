@@ -6,11 +6,11 @@
 - name: Set the default state to present
   set_fact:
     avi_config_state: "{{ avi_config_state|default('present') }}"
-    region_subnet: 172.16.110.0
+    region_subnet: 10.1.13.128
 
 - name: Override Region Subnet for Region B
   set_fact:
-    region_subnet: 172.16.210.0
+    region_subnet: 10.1.14.128
   when:
     region | lower == 'b'
 
@@ -26,21 +26,21 @@
     avi_config:
       pool:
         - name: "{{ 'basic-app-' + region | lower +'-pool'}}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
           default_server_port: 80
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           servers:
             # - ip:
             #   addr: {{ region_subnet[:region_subnet.rfind('.')+1] + '10' }}
             #   type: V4
-            - hostname: "k8smaster-01{{ region }}.vcf.sddc.lab"
+            - hostname: "web1.site-{{ region | lower }}.vcf.lab"
               resolve_server_by_dns: true
           health_monitor_refs:
             - '/api/healthmonitor?name=System-HTTP'
       vsvip:
         - name: "{{ 'basic-app-' + region + '-VsVip' }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
@@ -53,25 +53,25 @@
               avi_allocated_fip: false
               discovered_networks:
                 - subnet:
-                    - mask: 24
+                    - mask: 25
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                  network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               enabled: true
               ipam_network_subnet:
                 subnet:
-                  mask: 24
+                  mask: 25
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
       virtualservice:
         - name: "{{ 'basic-app-' + region }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
           pool_ref: "{{'/api/pool?name=basic-app-' + region +'-pool'}}"
           application_profile_ref: '/api/applicationprofile?name=System-HTTP'
           services:
@@ -98,13 +98,13 @@
     avi_config:
       pool:
         - name: "{{ 'adv-app-' + region | lower +'-pool'}}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           default_server_port: 30001
           servers:
-            - hostname: "k8sworker-01{{ region }}.vcf.sddc.lab"
+            - hostname: "web1.site-{{ region | lower }}.vcf.lab"
               resolve_server_by_dns: true
-            - hostname: "k8sworker-02{{ region }}.vcf.sddc.lab"
+            - hostname: "web2.site-{{ region | lower }}.vcf.lab"
               resolve_server_by_dns: true
           health_monitor_refs:
             - '/api/healthmonitor?name=System-HTTP'
@@ -114,8 +114,8 @@
             type: FAIL_ACTION_HTTP_LOCAL_RSP
       vsvip:
         - name: "{{ 'adv-app-' + region + '-VsVip' }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
@@ -128,25 +128,25 @@
               avi_allocated_fip: false
               discovered_networks:
                 - subnet:
-                    - mask: 24
+                    - mask: 25
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                  network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               enabled: true
               ipam_network_subnet:
                 subnet:
-                  mask: 24
+                  mask: 25
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
       virtualservice:
         - name: "{{ 'adv-app-' + region }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
           pool_ref: "{{'/api/pool?name=adv-app-' + region +'-pool'}}"
           application_profile_ref: '/api/applicationprofile?name=System-HTTP'
           services:
@@ -183,23 +183,23 @@
           monitor_port: 30080
       pool:
         - name: "{{ 'secure-app-' + region | lower +'-pool'}}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           default_server_port: 30443
           sni_enabled: true
           ssl_profile_ref: '/api/sslprofile?name=System-Standard'
           servers:
-            - hostname: "k8sworker-01{{ region }}.vcf.sddc.lab"
+            - hostname: "web1.site-{{ region | lower }}.vcf.lab"
               resolve_server_by_dns: true
-            - hostname: "k8sworker-02{{ region }}.vcf.sddc.lab"
+            - hostname: "web2.site-{{ region | lower }}.vcf.lab"
               resolve_server_by_dns: true
           health_monitor_refs:
             - '/api/healthmonitor?name=System-HTTPS'
             - '/api/healthmonitor?name=Custom-HTTP'
       vsvip:
         - name: "{{ 'secure-app-' + region + '-VsVip' }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
@@ -212,25 +212,25 @@
               avi_allocated_fip: false
               discovered_networks:
                 - subnet:
-                    - mask: 24
+                    - mask: 25
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                  network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               enabled: true
               ipam_network_subnet:
                 subnet:
-                  mask: 24
+                  mask: 25
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
       virtualservice:
         - name: "{{ 'secure-app-' + region }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
           pool_ref: "{{'/api/pool?name=secure-app-' + region +'-pool'}}"
           application_profile_ref: '/api/applicationprofile?name=System-Secure-HTTP'
           ssl_key_and_certificate_refs:
@@ -276,25 +276,25 @@
           monitor_port: 30080
       pool:
         - name: "{{ 'tenant-app-' + region | lower +'-pool'}}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           tenant: engineering
           tenant_ref: /api/tenant?name=engineering
           default_server_port: 30443
           sni_enabled: true
           ssl_profile_ref: '/api/sslprofile?name=System-Standard'
           servers:
-            - hostname: "k8sworker-01{{ region }}.vcf.sddc.lab"
+            - hostname: "web1.site-{{ region | lower }}.vcf.lab"
               resolve_server_by_dns: true
-            - hostname: "k8sworker-02{{ region }}.vcf.sddc.lab"
+            - hostname: "web2.site-{{ region | lower }}.vcf.lab"
               resolve_server_by_dns: true
           health_monitor_refs:
             - '/api/healthmonitor?name=System-HTTPS'
             - '/api/healthmonitor?name=Custom-Engineering-HTTP'
       vsvip:
         - name: "{{ 'tenant-app-' + region + '-VsVip' }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           tenant: engineering
           tenant_ref: /api/tenant?name=engineering
           dns_info:
@@ -309,25 +309,25 @@
               avi_allocated_fip: false
               discovered_networks:
                 - subnet:
-                    - mask: 24
+                    - mask: 25
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                  network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               enabled: true
               ipam_network_subnet:
                 subnet:
-                  mask: 24
+                  mask: 25
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network?name=ls-vmnet-{{ region }}"
+                network_ref: "{{ '/api/network?name=wld01-avi-data' if region | lower == 'a' else '/api/network?name=mgmt-avi-data' }}"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
       virtualservice:
         - name: "{{ 'tenant-app-' + region }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
           tenant: engineering
           tenant_ref: /api/tenant?name=engineering
           pool_ref: "{{'/api/pool?name=tenant-app-' + region +'-pool'}}"

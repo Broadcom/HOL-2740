@@ -28,7 +28,7 @@
     avi_config:
       serviceenginegroup:
         - name: "{{ 'gslb01' + region }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
           se_name_prefix: "{{ 'gslb01' + region }}"
           placement_mode: PLACEMENT_MODE_AUTO
           ha_mode: HA_MODE_SHARED
@@ -43,8 +43,8 @@
           extra_shared_config_memory: 2000
       vsvip:
         - name: "global-dns-vs-01{{region}}-VsVip"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
-          tier1_lr: "/infra/tier-1s/t1-gw-site{{ region }}"
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
+          tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
@@ -63,7 +63,7 @@
                 addr: "{{ region_dns_vsvip_address }}"
       virtualservice:
         - name: "{{ 'global-dns-vs-01' + region }}"
-          cloud_ref: '/api/cloud?name=Site{{region | upper}}_nsx_cloud'
+          cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
           application_profile_ref: '/api/applicationprofile?name=System-DNS'
           network_profile_ref: '/api/networkprofile/?name=System-UDP-Per-Pkt'
           se_group_ref: "{{ '/api/serviceenginegroup/?name=gslb01'+ region }}"
