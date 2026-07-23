@@ -20,16 +20,21 @@
           msg: "Mod switcher has run before, ending the play"
       - meta: end_play
       when: statfile_exists.stat.exists
-
-  tasks:
-    - name: init and push
-      community.general.terraform:
-        project_path: '/hol/hol-2671/migration_files/nsx-t-migration/terraform-nsx-lb-deployment'
-        state: present
-        variables:
-          nsxt_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
-      environment:
-        #http_proxy: http://proxy:3128
-        #https_proxy: http://proxy:3128
-        no_proxy: "nsx-wld01-01a.site-a.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
-        NO_PROXY: "nsx-wld01-01a.site-a.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+      
+  roles:
+    - role: 2671-02
+      vars:
+        region: a
+        avi_config_state: present
+        avi_role_config_log_mode: 'False'
+  vars:
+    avi_creds:
+      controller: 10.1.1.90
+      username: admin
+      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      api_version: 31.1.1
+    cloud_name: wld-a-nsx
+    site_letter: a
+    t1_name: t1-wld-a
+    t1_uuid: 349361ff-2844-4ad3-9f03-6ab52b47f5af
+    avi_t1_name: wld-a-avi-mgmt

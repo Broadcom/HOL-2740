@@ -64,7 +64,7 @@ skus:
         description: "Fast-forwards through modules 1-5 so the student can start on DNS policy and static DNS record management."
         playbook: ../module-scripts/2740-04-module_6.yaml
 
-  - id: HOL-2740-05 (was 2571-03)
+  - id: HOL-2740-05 (was 2671-03)
     title: "HOL-2740-05 - Migrating Legacy Load Balancing using Avi Conversion Tool"
     modules:
       - name: "Module 1 - Import Legacy Config"

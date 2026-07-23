@@ -51,7 +51,7 @@
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network/?name=vip_network_site-a"
+                  network_ref: "/api/network/?name=wld01-avi-data"
               enabled: true
               ipam_network_subnet:
                 subnet:
@@ -59,7 +59,7 @@
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network/?name=vip_network_site-a"
+                network_ref: "/api/network/?name=wld01-avi-data"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
@@ -135,7 +135,7 @@
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network/?name=vip_network_site-a"
+                  network_ref: "/api/network/?name=wld01-avi-data"
               enabled: true
               ipam_network_subnet:
                 subnet:
@@ -143,7 +143,7 @@
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network/?name=vip_network_site-a"
+                network_ref: "/api/network/?name=wld01-avi-data"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
@@ -153,7 +153,7 @@
           pool_ref: "/api/pool?name=secure-app-a-pool"
           application_profile_ref: '/api/applicationprofile/?name=System-Secure-HTTP'
           ssl_key_and_certificate_refs:
-            - "/api/sslkeyandcertificate/?name=HandsOnLabs_Appcert"
+            - "/api/sslkeyandcertificate/?name=hol_wildcard"
           services:
             - enable_ssl: false
               port_range_end: 80
@@ -232,7 +232,7 @@
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network/?name=vip_network_site-a"
+                  network_ref: "/api/network/?name=wld01-avi-data"
               enabled: true
               ipam_network_subnet:
                 subnet:
@@ -240,7 +240,7 @@
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network/?name=vip_network_site-a"
+                network_ref: "/api/network/?name=wld01-avi-data"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
@@ -252,7 +252,7 @@
           pool_ref: "/api/pool/?name=tenant-app-a-pool"
           application_profile_ref: '/api/applicationprofile/?name=System-Secure-HTTP'
           ssl_key_and_certificate_refs:
-            - "/api/sslkeyandcertificate/?name=HandsOnLabs_Appcert"
+            - "/api/sslkeyandcertificate/?name=hol_wildcard"
           services:
             - enable_ssl: false
               port_range_end: 80

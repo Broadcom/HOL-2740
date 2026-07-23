@@ -3,10 +3,6 @@
   connection: local
   gather_facts: false
 
-  environment:
-    no_proxy: "localhost,127.0.0.0/8,::1,.vcf.lab,.vcf.sddc.lab,172.16.0.0/16,192.168.0.0/16"
-    NO_PROXY: "localhost,127.0.0.0/8,::1,.vcf.lab,.vcf.sddc.lab,172.16.0.0/16,192.168.0.0/16"
-
   pre_tasks:
     - name: Have we run before?
       stat:
@@ -24,21 +20,16 @@
           msg: "Mod switcher has run before, ending the play"
       - meta: end_play
       when: statfile_exists.stat.exists
-      
-  roles:
-    - role: 2671-02
-      vars:
-        region: a
-        avi_config_state: present
-        avi_role_config_log_mode: 'False'
-  vars:
-    avi_creds:
-      controller: "alb-a.site-a.vcf.lab"
-      username: admin
-      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
-      api_version: 32.1.1
-    cloud_name: Cloud-nsx-wld01-a
-    site_letter: a
-    t1_name: t1-wld-a
-    t1_uuid: wld01-a-t1
-    avi_t1_name: wld-a-avi-mgmt
+
+  tasks:
+    - name: init and push
+      community.general.terraform:
+        project_path: '/hol/hol-2740/migration_files/nsx-t-migration/terraform-nsx-lb-deployment'
+        state: present
+        variables:
+          nsxt_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      environment:
+        #http_proxy: http://proxy:3128
+        #https_proxy: http://proxy:3128
+        no_proxy: "nsx-wld01-01a.site-a.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+        NO_PROXY: "nsx-wld01-01a.site-a.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 

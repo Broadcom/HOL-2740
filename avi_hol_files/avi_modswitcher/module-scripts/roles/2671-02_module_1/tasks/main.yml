@@ -7,12 +7,12 @@
   set_fact:
     avi_config_state: "{{ avi_config_state|default('present') }}"
     region_subnet: '172.16.110.0/24'
-    region_dns_vsvip_address: '172.16.130.21'
+    region_dns_vsvip_address: '10.1.13.137'
 
 - name: Override variables for Region B
   set_fact:
     region_subnet: '172.16.230.0/24'
-    region_dns_vsvip_address: '172.16.230.21'
+    region_dns_vsvip_address: '10.1.14.137'
   when:
     region | lower == 'b'
 
@@ -48,7 +48,7 @@
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
-              fqdn: "{{ 'global-dns-vs-01' + region | lower +'.region01' + region | lower + '.vcf.sddc.lab' }}"
+              fqdn: "{{ 'global-dns-vs-01' + region | lower +'.lb.site-' + region | lower + '.vcf.lab' }}"
               algorithm: DNS_RECORD_RESPONSE_CONSISTENT_HASH
               ttl: 30
           vip:
