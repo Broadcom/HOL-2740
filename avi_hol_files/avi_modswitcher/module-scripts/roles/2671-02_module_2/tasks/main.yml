@@ -38,7 +38,7 @@
 
 - name: Define GSLB Cluster
   vmware.alb.avi_gslb:
-    avi_credentials: "{{ avi_credentials }}"
+    avi_credentials: "{{ avi_creds_region01a }}"
     name: Default
     is_federated: true
     sites:
@@ -46,7 +46,7 @@
         name: region01a
         ip_addresses:
           - type: V4
-            addr: 10.0.0.87
+            addr: 10.1.1.90
         enabled: true
         member_type: GSLB_ACTIVE_MEMBER
         location:
@@ -65,7 +65,7 @@
         name: region01b
         ip_addresses:
           - type: V4
-            addr: 10.0.1.87
+            addr: 10.1.1.92
         enabled: true
         member_type: GSLB_ACTIVE_MEMBER
         location:
@@ -87,7 +87,7 @@
 
 - name: Define geodb profile
   vmware.alb.avi_gslbgeodbprofile:
-    avi_credentials: "{{ avi_credentials }}"
+    avi_credentials: "{{ avi_creds_region01a }}"
     name: geoprofile1
     is_federated: true
     entries:
