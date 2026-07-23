@@ -9,14 +9,14 @@ spec:
   - name: foo-http
     protocol: HTTP
     port: 80
-    hostname: "*.site-a.vcf.lab"
+    hostname: "*.vks1.site-a.vcf.lab"
     allowedRoutes:
       namespaces:
         from: All
   - name: foo-https
     protocol: HTTPS
     port: 443
-    hostname: "*.site-a.vcf.lab"
+    hostname: "*.vks1.site-a.vcf.lab"
     allowedRoutes:
       namespaces:
         from: All

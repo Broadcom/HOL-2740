@@ -617,9 +617,6 @@ spec:
         env:
         - name: PORT
           value: "8080"
-        resources:
-          requests: { cpu: 50m, memory: 64Mi }
-          limits:   { cpu: 200m, memory: 128Mi }
         readinessProbe:
           httpGet:
             path: /api/health
@@ -655,7 +652,7 @@ metadata:
 data:
   env-config.js: |
     window.__env__ = {
-      attackLabUrl: "https://waflab.site-a.vcf.lab"
+      attackLabUrl: "https://waflab.vks1.site-a.vcf.lab"
     };
   default.conf: |
     server {
@@ -759,11 +756,11 @@ spec:
         - name: AVIMART_TARGET_URL
           value: "http://product-svc.avimart.svc.cluster.local:8080"
         - name: AVIMART_WAF_URL
-          value: "http://avimart.site-a.vcf.lab"
+          value: "http://avimart.vks1.site-a.vcf.lab"
         - name: AVIMART_VULN_SVC_URL
           value: "http://vuln-svc.avimart.svc.cluster.local:8080"
         - name: NSX_HOST
-          value: "nsx-wld01-a.site-a.vcf.lab"
+          value: "nsx-wld01-a.vks1.site-a.vcf.lab"
         - name: NSX_USER
           valueFrom:
             secretKeyRef:
@@ -841,7 +838,7 @@ spec:
   - name: hol-tkg-gateway
     namespace: default
   hostnames:
-  - "avimart.site-a.vcf.lab"
+  - "avimart.vks1.site-a.vcf.lab"
   rules:
   - name: products-api
     matches:
@@ -984,7 +981,7 @@ spec:
   - name: hol-tkg-gateway
     namespace: default
   hostnames:
-  - "waflab.site-a.vcf.lab"
+  - "waflab.vks1.site-a.vcf.lab"
   rules:
   - matches:
     - path:
