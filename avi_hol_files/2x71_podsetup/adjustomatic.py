@@ -34,13 +34,25 @@ def fix_vmsp_gateway_kubevip(lsf):
     step "6/6: harden vmsp-platform kube-vip DaemonSet"), applied here
     against the real VSP cluster instead.
 
-    One-shot fix applied at boot -- no ongoing drift-watcher is installed
-    here. vsp-health-monitor.py's existing checks run on the manager VM
-    specifically because VSP control-plane nodes are CAPI "cattle" that get
-    rolling-replaced; a systemd unit installed on a VSP node would be lost
-    on the next replacement. If ongoing drift protection against Flux
-    re-reconciling this DaemonSet back to chart defaults is needed, that
-    logic belongs in a new vsp-health-monitor.py check instead, not here.
+    UPDATE: a one-shot patch alone does NOT hold. Verified empirically
+    (2026-07-24): both the live DaemonSet and its HelmRelease reverted back
+    to chart defaults within about 3 minutes of this patch running --
+    something (most likely vmsp-operator regenerating the HelmRelease from
+    its own source of truth, then Flux re-syncing the DaemonSet to match)
+    keeps re-asserting the defaults, same as the drift Flux/vmsp-operator
+    already causes on auto-platform-a's own vmsp-platform kube-vip (which
+    is why vcfa-stabilizer.sh installs a 60s systemd drift-watcher there).
+    We don't have write access to Tools/vsp-health/vsp-health-monitor.py to
+    add this as a proper check on the manager VM the way that tool would
+    normally handle ongoing drift protection, so instead this function also
+    installs (idempotently) a holuser crontab entry that re-runs the same
+    patch every minute via vmsp_kvip_keeper.py -- see
+    install_vmsp_kvip_keeper_cron() below. Plain crontab, not systemd: same
+    constraint vsp-health-monitor.py documents (holuser's sudoers cannot
+    install systemd units) and the same reason that tool's own recurring
+    schedule is a crontab entry too. It runs on the manager VM, not any VSP
+    node, so it isn't lost when CAPI rolling-replaces a VSP control-plane
+    node -- vmsp_kvip_keeper.py re-resolves the current CP IP every cycle.
 
     Non-fatal: any failure here is logged as a warning and does not fail
     lab startup (lsf.labfail is never called).
@@ -170,6 +182,59 @@ else:
 
     except Exception as e:
         lsf.write_output(f'  WARNING: vmsp-platform kube-vip hardening failed: {e}')
+
+    install_vmsp_kvip_keeper_cron(lsf)
+
+
+def install_vmsp_kvip_keeper_cron(lsf):
+    """
+    Install/refresh a holuser crontab entry that re-runs
+    vmsp_kvip_keeper.py (the standalone, recurring version of the patch
+    above) every minute. See fix_vmsp_gateway_kubevip()'s docstring for why
+    this is necessary -- the one-shot patch alone was verified not to hold.
+
+    Idempotent: replaces any prior copy of our own cron line (matched via
+    CRON_MARKER) rather than appending a duplicate every boot. Mirrors
+    Tools/vsp-health/vsp-health-monitor.py's own install_timer() pattern,
+    but as a completely independent cron line/marker so this never
+    conflicts with or requires editing that file.
+
+    Non-fatal: any failure here is logged as a warning and does not fail
+    lab startup.
+    """
+    import os
+    import subprocess
+
+    CRON_MARKER = '# vmsp-gateway-kvip-keeper (adjustomatic-installed)'
+    keeper_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'vmsp_kvip_keeper.py'
+    )
+
+    if not os.path.isfile(keeper_script):
+        lsf.write_output(
+            f'  WARNING: {keeper_script} not found -- skipping kvip-keeper cron install'
+        )
+        return
+
+    try:
+        cron_line = f"* * * * * /usr/bin/python3 {keeper_script} {CRON_MARKER}"
+
+        r = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing = r.stdout.splitlines() if r.returncode == 0 else []
+        lines = [l for l in existing if 'vmsp_kvip_keeper.py' not in l]
+        lines.append(cron_line)
+        payload = '\n'.join(lines).rstrip('\n') + '\n'
+
+        wr = subprocess.run(['crontab', '-'], input=payload, capture_output=True, text=True)
+        if wr.returncode == 0:
+            lsf.write_output('  vmsp-gateway-kvip-keeper cron job installed/refreshed (every 1 min)')
+        else:
+            lsf.write_output(
+                f'  WARNING: could not install kvip-keeper cron job (rc={wr.returncode}): '
+                f'{wr.stderr.strip()[:200]}'
+            )
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not install kvip-keeper cron job: {e}')
 
 
 def main():
