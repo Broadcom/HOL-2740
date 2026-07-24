@@ -11,6 +11,167 @@ def retry_io(fn, *args, retries=3, delay=5, **kwargs):
             raise
 
 
+def fix_vmsp_gateway_kubevip(lsf):
+    """
+    Harden the VSP cluster's vmsp-platform kube-vip DaemonSet.
+
+    Root cause: this DaemonSet (3 replicas, one per VSP worker; fronts the
+    vmsp-gateway Service-type-LoadBalancer VIPs -- fleet-01a among them)
+    ships at chart defaults (vip_leaseduration=15, vip_renewdeadline=10,
+    vip_retryperiod=2, vip_preserve_on_leadership_loss=false, liveness
+    timeoutSeconds=5/failureThreshold=3) that are too tight for a
+    resource-constrained nested lab: a brief CPU-scheduling delay makes the
+    healthz probe miss its deadline, kubelet kills the pod, and on every
+    restart kube-vip drops leader election and releases the gateway VIPs
+    for 15-45s -- the "fleet/depot refused, a retry fixes it" symptom.
+
+    This is a DIFFERENT kube-vip instance from the one Tools/vsp-health/
+    kube-fix.py and vsp-health-monitor.py's kvip_manifest check already
+    harden (that one is the static-pod kube-vip managing the K8s API-server
+    VIP, 10.1.1.142). Neither existing tool touches this DaemonSet. The fix
+    below mirrors the identical, already-proven hardening applied to
+    auto-platform-a's own vmsp-platform kube-vip (see vcfa-stabilizer.sh
+    step "6/6: harden vmsp-platform kube-vip DaemonSet"), applied here
+    against the real VSP cluster instead.
+
+    One-shot fix applied at boot -- no ongoing drift-watcher is installed
+    here. vsp-health-monitor.py's existing checks run on the manager VM
+    specifically because VSP control-plane nodes are CAPI "cattle" that get
+    rolling-replaced; a systemd unit installed on a VSP node would be lost
+    on the next replacement. If ongoing drift protection against Flux
+    re-reconciling this DaemonSet back to chart defaults is needed, that
+    logic belongs in a new vsp-health-monitor.py check instead, not here.
+
+    Non-fatal: any failure here is logged as a warning and does not fail
+    lab startup (lsf.labfail is never called).
+    """
+    import base64
+    import re
+
+    lsf.write_output('Checking VSP vmsp-platform kube-vip DaemonSet hardening...')
+    password = lsf.get_password()
+    vsp_user = 'vmware-system-user'
+    vsp_worker_fqdn = 'vsp-01a.site-a.vcf.lab'
+    vsp_vip = '10.1.1.142'
+
+    try:
+        # ---- Resolve the real control-plane node ----
+        # vsp-01a.site-a.vcf.lab is a floating gateway VIP hostname and can
+        # land on any worker currently holding it, not necessarily a node
+        # with a populated admin.conf. Discover the real CP IP the same way
+        # kube-fix.py's resolve_cp_host() does: try the CP VIP directly
+        # first, then fall back to reading a worker's own node-agent.conf.
+        cp_ip = vsp_vip if lsf.test_tcp_port(vsp_vip, 22, timeout=5) else None
+        if not cp_ip:
+            result = lsf.ssh(
+                f"echo '{password}' | sudo -S grep server: /etc/kubernetes/node-agent.conf",
+                f'{vsp_user}@{vsp_worker_fqdn}'
+            )
+            stdout = getattr(result, 'stdout', '') or ''
+            match = re.search(r'https?://([0-9.]+):', stdout)
+            cp_ip = match.group(1) if match else None
+
+        if not cp_ip:
+            lsf.write_output(
+                '  WARNING: could not resolve VSP control-plane IP -- '
+                'skipping vmsp-platform kube-vip hardening'
+            )
+            return
+
+        lsf.write_output(f'  VSP control-plane IP: {cp_ip}')
+        cp_ssh_target = f'{vsp_user}@{cp_ip}'
+
+        # ---- Patch script: run kubectl remotely against admin.conf ----
+        # Built as a standalone python3 script and shipped base64-encoded
+        # so no shell-quoting of the remote command is required at all.
+        patch_py = r"""
+import json, subprocess, sys
+
+K = ['kubectl', '--kubeconfig=/etc/kubernetes/admin.conf']
+WANT_ENV = {
+    'vip_leaseduration': '120',
+    'vip_renewdeadline': '90',
+    'vip_retryperiod': '10',
+    'vip_preserve_on_leadership_loss': 'true',
+}
+
+out = subprocess.run(
+    K + ['-n', 'vmsp-platform', 'get', 'daemonset', 'kube-vip', '-o', 'json'],
+    capture_output=True, text=True,
+)
+if out.returncode != 0:
+    print('DAEMONSET_NOT_FOUND')
+    sys.exit(0)
+
+d = json.loads(out.stdout)
+c = d['spec']['template']['spec']['containers'][0]
+env = c.get('env', []) or []
+changed = False
+seen = set()
+for e in env:
+    n = e.get('name')
+    if n in WANT_ENV:
+        seen.add(n)
+        if e.get('value') != WANT_ENV[n]:
+            e['value'] = WANT_ENV[n]
+            changed = True
+for n, v in WANT_ENV.items():
+    if n not in seen:
+        env.append({'name': n, 'value': v})
+        changed = True
+
+lp = c.get('livenessProbe') or {}
+if str(lp.get('timeoutSeconds')) != '10':
+    lp['timeoutSeconds'] = 10
+    changed = True
+if str(lp.get('failureThreshold')) != '5':
+    lp['failureThreshold'] = 5
+    changed = True
+
+if not changed:
+    print('ALREADY_HARDENED')
+else:
+    patch = json.dumps([
+        {'op': 'replace', 'path': '/spec/template/spec/containers/0/env', 'value': env},
+        {'op': 'replace', 'path': '/spec/template/spec/containers/0/livenessProbe', 'value': lp},
+    ])
+    res = subprocess.run(
+        K + ['-n', 'vmsp-platform', 'patch', 'daemonset', 'kube-vip', '--type=json', '-p', patch],
+        capture_output=True, text=True,
+    )
+    print('PATCHED' if res.returncode == 0 else f'PATCH_FAILED: {res.stderr.strip()}')
+
+# Durable channel: if this DaemonSet is Flux-managed, patch the
+# HelmRelease values too so the next reconcile doesn't revert the
+# live patch above back to chart defaults. No-op if not Flux-managed.
+hr = subprocess.run(
+    K + ['-n', 'vmsp-platform', 'get', 'helmrelease', 'kube-vip'],
+    capture_output=True, text=True,
+)
+if hr.returncode == 0:
+    hr_patch = json.dumps({'spec': {'values': {'env': WANT_ENV}}})
+    hr_res = subprocess.run(
+        K + ['-n', 'vmsp-platform', 'patch', 'helmrelease', 'kube-vip', '--type=merge', '-p', hr_patch],
+        capture_output=True, text=True,
+    )
+    print('HELMRELEASE_PATCHED' if hr_res.returncode == 0 else f'HELMRELEASE_PATCH_FAILED: {hr_res.stderr.strip()}')
+else:
+    print('NO_HELMRELEASE')
+"""
+        patch_b64 = base64.b64encode(patch_py.encode()).decode()
+        remote_cmd = (
+            f"echo {patch_b64} | base64 -d > /tmp/vmsp_kvip_fix.py && "
+            f"echo '{password}' | sudo -S python3 /tmp/vmsp_kvip_fix.py; "
+            f"rm -f /tmp/vmsp_kvip_fix.py"
+        )
+        result = lsf.ssh(remote_cmd, cp_ssh_target)
+        out_text = (getattr(result, 'stdout', '') or '').strip()
+        lsf.write_output(f'  vmsp-platform kube-vip hardening result: {out_text or "(no output)"}')
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: vmsp-platform kube-vip hardening failed: {e}')
+
+
 def main():
     # install forgotten pip package
     import subprocess
@@ -32,6 +193,13 @@ def main():
     os.environ["NO_PROXY"] = "localhost,127.0.0.0/8,::1,site-a.vcf.lab,10.1.1.90,10.0.0.0/8"  
     os.environ["AVICTRL_PASSWORD"] = open(password_file, 'r').read().strip("\n")
     os.environ["TF_VAR_nsxt_password"] = open(password_file, 'r').read().strip("\n")
+
+    # VSP vmsp-platform kube-vip DaemonSet hardening (fleet-01a/vmsp-gateway
+    # VIP flap fix). Independent of the Avi playbooks below; run first so a
+    # flapping gateway VIP doesn't intermittently affect anything later in
+    # this script that happens to depend on fleet/depot reachability.
+    # See fix_vmsp_gateway_kubevip() docstring for full root-cause detail.
+    fix_vmsp_gateway_kubevip(lsf)
 
     # try:
     #     lsf.write_output("Configuring NSX T App profiles")   

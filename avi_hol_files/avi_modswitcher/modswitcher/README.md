@@ -14,7 +14,11 @@ still need updating.
 - **`app.py`** — the GUI application. Reads `manifest.yaml`, shows the SKU
   list, then the module list for the chosen SKU, and runs `ansible-playbook`
   against the selected module's playbook in a dialog that streams output in
-  real time.
+  real time. Calls `app.setDesktopFileName("modswitcher")` on startup —
+  without this, GNOME can't match the *running* window back to the pinned
+  dock icon (it matches by window class, not by which script launched it),
+  and clicking the dock icon appears to open a second, generic, unrelated
+  icon instead of the window merging into the same dock slot.
 - **`manifest.yaml`** — all configuration: which SKUs exist, which modules
   each one has, and where each module's playbook lives. Edit this file to
   add/remove/reorder SKUs and modules — no code changes needed.
@@ -29,6 +33,15 @@ still need updating.
   It is not real lab content — remove the manifest entry that points to it
   once you have real modules to show a failure case with, or leave it as a
   smoke test.
+
+## System prerequisites
+
+Beyond the venv having `PySide6` and `PyYAML` (see "Running it" below), the
+OS itself needs **`libxcb-cursor0`** installed (`sudo apt install -y
+libxcb-cursor0`). Without it, Qt's `xcb` platform plugin fails to load and
+the app can't open any window at all. This bit us once already — it's not
+optional, and it won't show up as a Python error since it fails before any
+Python-level code runs.
 
 ## Configuring SKUs and modules (`manifest.yaml`)
 
@@ -129,6 +142,95 @@ run by GNOME Shell directly — no trust gate, no `chmod +x` needed on the
 Both steps 2 and 3 are idempotent — re-running the script after content
 changes is safe and won't create duplicate dash icons.
 
+**If you edit `create_launcher.py` (or `app.py`) on a pod that's already
+running**, you have to `scp`/pull the change onto that pod and re-run
+`create_launcher.py` yourself. The rsync-on-vApp-startup pipeline only runs
+at boot — it will not retroactively update an already-running pod, and the
+`.desktop` file on disk won't reflect a fix that only exists in git. This
+cost real debugging time twice in a row: a fix looked "applied" because it
+was committed, but the actual file on the test pod was still the old one.
+
+## Troubleshooting: dock icon does nothing when clicked
+
+The `.desktop` file has `Terminal=false`, so if the launched process
+crashes on startup, you see **nothing** — no window, no error, no dialog.
+Don't debug this by staring at the desktop; reproduce it with output you
+can actually read:
+
+```bash
+# Run the exact Exec= line from the .desktop file directly:
+/home/holuser/py312venv/bin/python3 /hol/hol-2740/avi_modswitcher/modswitcher/app.py
+```
+
+If that prints a traceback, you've found it. Two specific causes already
+bit us on this image and are worth checking first:
+
+1. **`libxcb-cursor0` missing** — see "System prerequisites" above. Error
+   looks like `qt.qpa.plugin: Could not load the Qt platform plugin "xcb"`.
+2. **`PyYAML` (or another dependency) missing from the venv itself** —
+   `ModuleNotFoundError: No module named 'yaml'`.
+
+For #2, **do not trust a normal interactive terminal to verify this** on
+this LMC image. `~/.bashrc` and `~/.profile` both export:
+
+```bash
+PYTHONPATH=/usr/lib/python3/dist-packages:/hol:/hol/Tools
+```
+
+`PYTHONPATH` gets prepended to `sys.path` for *any* process launched from
+an interactive shell, regardless of venv isolation (`pyvenv.cfg`'s
+`include-system-site-packages = false` does not block it). This means:
+
+- Running `pip install PyYAML` (or even `python3 -m pip install PyYAML`)
+  from a normal terminal can report "Requirement already satisfied" by
+  finding the **system's** copy in `/usr/lib/python3/dist-packages` —
+  while the venv's own `site-packages` genuinely doesn't have it.
+- `import yaml` tested interactively will "work" the same misleading way,
+  because the leaked system path comes *before* the venv's own
+  `site-packages` in `sys.path`.
+- The `.desktop` launcher never sources `.bashrc`/`.profile`, so it never
+  gets this leaked `PYTHONPATH` — meaning it can fail even when every
+  terminal-based check said everything was fine.
+
+The reliable way to check or install, bypassing the leak entirely:
+
+```bash
+# Check what's REALLY in the venv:
+ssh holuser@<pod> "/home/holuser/py312venv/bin/python3 -c 'import yaml; print(yaml.__file__)'"
+# Should print .../py312venv/lib/python3.12/site-packages/yaml/__init__.py
+# If it prints /usr/lib/python3/dist-packages/... instead, that's the leak.
+
+# Install for real, with PYTHONPATH explicitly removed for the command:
+env -u PYTHONPATH /home/holuser/py312venv/bin/python3 -m pip install PyYAML
+```
+
+Running the check via `ssh holuser@<pod> "command"` (rather than an
+interactive shell) is itself a reliable way to sidestep `.bashrc` entirely,
+since non-interactive SSH commands don't source it.
+
+## Known issue (parked): app doesn't appear in the GNOME app grid
+
+The app is correctly pinned to the GNOME dash and is findable by typing its
+name into GNOME's search — both confirmed working. It has not been made to
+appear when manually paging through the "Show Applications" grid, even
+after a full GNOME Shell session restart (log out/in). This was
+investigated thoroughly and ruled out as a config problem on our end:
+
+- `.desktop` file has no `Categories=`, `NoDisplay`, or `Hidden` issues.
+- `Gio.AppInfo`/`Gio.DesktopAppInfo` (the same library GNOME Shell itself
+  uses) reports `should_show: True`, `NoDisplay: False`, `is_hidden: False`
+  for this entry — by the standard freedesktop.org rules, it should render.
+- Ruled out stale `gnome-shell` cache (full session restart didn't fix it).
+- `org.gnome.shell app-picker-layout` is a curated pin-list of ~21 core
+  GNOME apps only; everything else (including this app) is meant to
+  auto-fill into remaining grid space, which does happen for other
+  third-party apps on this same image — just not (yet) for this one.
+
+Current read: likely a GNOME Shell quirk specific to this heavily
+customized HOL image, not a bug in `modswitcher.desktop` or the app. Since
+the dock pin and search both work, this was parked rather than chased
+further. Revisit if it turns out to matter for students in practice.
+
 ## Moving to production
 
 `create_launcher.py`'s constants are set to the real LMC deployment layout:
@@ -165,3 +267,13 @@ production:
 - Real production playbooks will target actual lab infrastructure (Avi
   Controllers, etc.), not `hosts: localhost` — that's a property of the
   playbooks themselves and isn't something the app needs to know about.
+- `libxcb-cursor0` and `PyYAML` (see "System prerequisites" and
+  "Troubleshooting" above) were fixed by hand on individual test pods via
+  SSH during development. Those fixes live on those specific pods only —
+  they need to be folded into whatever builds the base OS packages and
+  `py312venv` for the real vApp template, or every fresh clone will hit the
+  exact same silent "icon does nothing" failure again.
+- `manifest.yaml` and `module-scripts/` still contain the original sample
+  HOL-2671 content used for development. Real HOL-2740 SKU/module data and
+  the corresponding Ansible playbooks still need to be authored — that's
+  the last remaining piece of actual feature work.
