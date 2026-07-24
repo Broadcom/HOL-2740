@@ -393,8 +393,10 @@
     #     no_proxy: "localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
 
 - hosts: linuxhosts
-  vars:
-    ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
+  # vars:
+  #   ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
+  vars_files:
+    - /vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/secrets.yml
   tasks:
     - name: cleanup
       docker_container:

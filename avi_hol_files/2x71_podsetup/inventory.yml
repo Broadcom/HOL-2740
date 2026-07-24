@@ -21,16 +21,16 @@ all:
         web1.site-a.vcf.lab:
           connection: ssh
           ansible_user: holuser
-          #ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
+          ansible_password: "{{ holuser_webserver_password }}"
         web2.site-a.vcf.lab:
           connection: ssh
           ansible_user: holuser
-          #ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
+          ansible_password: "{{ holuser_webserver_password }}"
         web1.site-b.vcf.lab:
           connection: ssh
           ansible_user: holuser
-          #ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
+          ansible_password: "{{ holuser_webserver_password }}"
         web2.site-b.vcf.lab:
           connection: ssh
           ansible_user: holuser
-          #ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
+          ansible_password: "{{ holuser_webserver_password }}"

@@ -67,17 +67,41 @@ def scale_vks_worker_nodepools(lsf, target_replicas=3):
                 lsf.write_output(f'  {cluster_name}: already at {current_replicas} replicas -- no-op')
                 continue
 
-            patch = (
+            # Ship the JSON patch body base64-encoded rather than embedding
+            # it as a literal '-p '...'' argument. lsf.ssh() wraps whatever
+            # command string we pass it in its OWN outer double quotes; a
+            # raw JSON payload contains unescaped double quotes, which
+            # terminates that outer wrapping early and silently mangles the
+            # command. (Confirmed live 2026-07-24: the patch call returned
+            # rc=0/no-stdout looking like success, but never actually
+            # patched anything -- replicas stayed at 1.) Base64 contains no
+            # shell-special characters at all, so this is safe regardless
+            # of how many quoting layers wrap around it -- same pattern
+            # already used for the kube-vip DaemonSet patch above.
+            import base64
+            patch_json = (
                 '[{"op":"replace",'
                 '"path":"/spec/topology/workers/machineDeployments/0/replicas",'
                 f'"value":{target_replicas}}}]'
             )
+            patch_b64 = base64.b64encode(patch_json.encode()).decode()
             patch_cmd = (
+                f"echo {patch_b64} | base64 -d | "
                 f"kubectl --context Supervisor -n {VKS_SUPERVISOR_NS} patch cluster {cluster_name} "
-                f"--type=json -p '{patch}'"
+                f"--type=json --patch-file=/dev/stdin"
             )
             patch_result = lsf.ssh(patch_cmd, VKS_KUBECTL_HOST, password)
+            rc = getattr(patch_result, 'returncode', None)
             patch_out = (getattr(patch_result, 'stdout', '') or '').strip()
+            patch_err = (getattr(patch_result, 'stderr', '') or '').strip()
+
+            if rc not in (0, None):
+                lsf.write_output(
+                    f'  WARNING: {cluster_name} scale patch failed (rc={rc}): '
+                    f'{patch_err or patch_out or "(no output)"}'
+                )
+                continue
+
             lsf.write_output(
                 f'  {cluster_name}: scale requested {current_replicas} -> {target_replicas} '
                 f'({patch_out or "no output"})'
