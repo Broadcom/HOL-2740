@@ -86,55 +86,7 @@
 
 #  ####################################################
 
-# - hosts: web1
-#   tasks:
-#     - name: cleanup
-#       docker_container:
-#         name: "aviweb"
-#         state: absent
-#         force_kill: yes
-#     - pause:
-#         seconds: 10
-#     - name: start clients
-#       docker_container:
-#         name: "aviweb"
-#         state: started
-#         restart_policy: always
-#         env:
-#           NOLOGO: "yes"
-#         ports:
-#           - "30001:80"
-#         image: avi-alb-docker-virtual.usw1.packages.broadcom.com/nsx_alb/avi_demoweb:v1
-#       register: result
-#       retries: 3
-#       delay: 3
-#       until: result is succeeded
-#     - name: Create a directory for docker override
-#       file:
-#         path: /etc/systemd/system/containerd.service.d
-#         state: directory
-#         mode: '0755'
 
-#     - name: set up docker to use proxies
-#       shell: |
-#         cat > /etc/systemd/system/containerd.service.d/http-proxy.conf <<EOF
-#         [Service]
-#         Environment="HTTP_PROXY=http://10.0.100.1:3128"
-#         Environment="HTTPS_PROXY=http://10.0.100.1:3128"
-#         Environment="NO_PROXY=localhost,127.0.0.0/8,::1,.corp.local,k8smaster-01a,k8smaster-01b,avicon-01a,avicon-01b,172.16.110.10,172.16.210.10,172.16.230.0/24,172.16.130.0/24,172.16.0.0/16"
-#         EOF
-
-#     - name: Restart containerd
-#       service:
-#         name: containerd
-#         daemon_reload: yes
-#         state: restarted
-
-#     - name: Restart kubelet
-#       service:
-#         name: kubelet
-#         daemon_reload: yes
-#         state: restarted
 
 - hosts: lmc
   vars_files:
@@ -156,17 +108,17 @@
         dest: /etc/ansible/hosts/inventory.yml
       become: yes
 
-    ###  Use readme in the root folder of git repo
-    # - name: Update readme on desktop
-    #   copy:
-    #     src: /vpodrepo/2027-labs/2740/avi_hol_files/README.txt
-    #     dest: /home/holuser/Desktop/README.txt
-    #     force: true
+    ##  Use readme in the root folder of git repo
+    - name: Update readme on desktop
+      copy:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/README.txt
+        dest: /home/holuser/Desktop/README.txt
+        force: true
 
-    # - name: Remove buildchecklist
-    #   ansible.builtin.file:
-    #     path: /home/holuser/Desktop/BuildChecklist.txt
-    #     state: absent
+    - name: Remove buildchecklist
+      ansible.builtin.file:
+        path: /home/holuser/Desktop/BuildChecklist.txt
+        state: absent
 
     - name: Creates directory
       file:
@@ -440,34 +392,63 @@
     #     https_proxy: http://proxy:3128
     #     no_proxy: "localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
 
-# - hosts: k8s_masters
-#   vars:
-#     ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}
-#   tasks:
-#     - name: cleanup
-#       docker_container:
-#         name: "{{old_web_container}}"
-#         state: absent
-#         force_kill: yes
-#         container_default_behavior: no_defaults
-#       become: yes
-#       ignore_errors: yes
+- hosts: linuxhosts
+  vars:
+    ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}
+  tasks:
+    - name: cleanup
+      docker_container:
+        name: "hackazon"
+        state: absent
+        force_kill: yes
+        container_default_behavior: no_defaults
+      become: yes
+      ignore_errors: yes
 
-#     - pause:
-#         seconds: 10
+    - pause:
+        seconds: 10
 
-#     - name: start clients
-#       docker_container:
-#         name: "demoweb"
-#         state: started
-#         restart_policy: always
-#         container_default_behavior: no_defaults
-#         env:
-#           NOLOGO: "yes"
-#         image: projects.registry.vmware.com/nsx_alb/avi_demoweb:v1
-#         ports:
-#           - "80:80"
-#       register: result
-#       retries: 3
-#       delay: 3
-#       become: yes
+    - name: start clients
+      docker_container:
+        name: "demoweb"
+        state: started
+        restart_policy: always
+        container_default_behavior: no_defaults
+        env:
+          NOLOGO: "yes"
+        image: harbor.site-a.vcf.lab/library/hackazon:latest
+        ports:
+          - "80:30080"
+          - "443:30443"
+      register: result
+      retries: 3
+      delay: 3
+      become: yes
+
+    - name: cleanup
+      docker_container:
+        name: "demoweb"
+        state: absent
+        force_kill: yes
+        container_default_behavior: no_defaults
+      become: yes
+      ignore_errors: yes
+
+    - pause:
+        seconds: 10
+
+    - name: start clients
+      docker_container:
+        name: "demoweb"
+        state: started
+        restart_policy: always
+        container_default_behavior: no_defaults
+        env:
+          NOLOGO: "yes"
+        image: harbor.site-a.vcf.lab/library/avi_demoweb:v1
+        ports:
+          - "80:30001"
+      register: result
+      retries: 3
+      delay: 3
+      become: yes
