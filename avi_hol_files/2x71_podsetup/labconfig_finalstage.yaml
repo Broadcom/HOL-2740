@@ -394,7 +394,7 @@
 
 - hosts: linuxhosts
   vars:
-    ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}
+    ansible_password: "{{ lookup('ansible.builtin.env', 'AVICTRL_PASS') }}"
   tasks:
     - name: cleanup
       docker_container:
