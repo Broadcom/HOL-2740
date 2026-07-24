@@ -11,6 +11,161 @@ def retry_io(fn, *args, retries=3, delay=5, **kwargs):
             raise
 
 
+# manager.site-a.vcf.lab (where adjustomatic runs) does NOT have the
+# Supervisor / workload-cluster-* kubectl contexts configured -- verified
+# 2026-07-24. console.site-a.vcf.lab does (same host used throughout the
+# rest of this codebase -- see lsfunctions.py's own console_host-taking
+# helpers, and prelim.py's CONSOLE_HOST usage). Same "SSH to whichever host
+# actually has the right kubeconfig/context, run kubectl there" pattern
+# used everywhere else (kube-fix.py, vsp-health-monitor.py, VCFfinal.py's
+# VSP/VCFA checks) -- just targeting console instead of a VSP/VCFA node.
+VKS_KUBECTL_HOST = 'holuser@console.site-a.vcf.lab'
+VKS_SUPERVISOR_NS = 'acme-east-prod-wrp4h'
+VKS_WORKLOAD_CLUSTERS = ('workload-cluster-1', 'workload-cluster-2')
+
+
+def scale_vks_worker_nodepools(lsf, target_replicas=3):
+    """
+    Scale the worker node pool of both VKS workload clusters up to
+    target_replicas, via a JSON patch on the Supervisor Cluster resource's
+    spec.topology.workers.machineDeployments[0].replicas field --
+    equivalent to `kubectl edit cluster <name>`, just non-interactive.
+    Idempotent: no-ops any cluster already at or above target_replicas.
+
+    Call this FIRST, at the very start of adjustomatic's main(), so the
+    scale-up has the maximum amount of time to converge in the background
+    while everything else in this script runs. Pair with
+    wait_for_vks_nodepool_scaleup() at the very end to confirm it actually
+    finished before the lab is declared ready.
+
+    Non-fatal here: a failure to even issue the scale request is logged as
+    a warning, not a lab failure (lsf.labfail is never called from this
+    function -- that only happens in the wait function below, if the
+    scale-up doesn't converge in time).
+    """
+    lsf.write_output(f'Scaling VKS worker node pools to {target_replicas} replicas...')
+    password = lsf.get_password()
+
+    for cluster_name in VKS_WORKLOAD_CLUSTERS:
+        try:
+            get_cmd = (
+                f"kubectl --context Supervisor -n {VKS_SUPERVISOR_NS} get cluster {cluster_name} "
+                f"-o jsonpath='{{.spec.topology.workers.machineDeployments[0].replicas}}'"
+            )
+            result = lsf.ssh(get_cmd, VKS_KUBECTL_HOST, password)
+            current = (getattr(result, 'stdout', '') or '').strip()
+
+            if not current.isdigit():
+                lsf.write_output(
+                    f'  {cluster_name}: could not read current replica count '
+                    f'(got: {current!r}) -- skipping'
+                )
+                continue
+
+            current_replicas = int(current)
+            if current_replicas >= target_replicas:
+                lsf.write_output(f'  {cluster_name}: already at {current_replicas} replicas -- no-op')
+                continue
+
+            patch = (
+                '[{"op":"replace",'
+                '"path":"/spec/topology/workers/machineDeployments/0/replicas",'
+                f'"value":{target_replicas}}}]'
+            )
+            patch_cmd = (
+                f"kubectl --context Supervisor -n {VKS_SUPERVISOR_NS} patch cluster {cluster_name} "
+                f"--type=json -p '{patch}'"
+            )
+            patch_result = lsf.ssh(patch_cmd, VKS_KUBECTL_HOST, password)
+            patch_out = (getattr(patch_result, 'stdout', '') or '').strip()
+            lsf.write_output(
+                f'  {cluster_name}: scale requested {current_replicas} -> {target_replicas} '
+                f'({patch_out or "no output"})'
+            )
+
+        except Exception as e:
+            lsf.write_output(f'  WARNING: could not scale {cluster_name}: {e}')
+
+
+def wait_for_vks_nodepool_scaleup(lsf, start_time, target_replicas=3,
+                                   timeout_seconds=600, poll_interval=30):
+    """
+    Poll both VKS workload clusters until each has target_replicas worker
+    (non-control-plane) nodes in Ready state, or timeout_seconds elapses.
+
+    timeout_seconds=600 (10 min): measured 352s for both clusters to
+    converge on a real pod-deploy test (2026-07-24, 1->3 workers each,
+    one cluster with a pre-existing worker that briefly flapped
+    NotReady mid-scale-up, the other a clean addition) -- ~70% headroom
+    over that single data point. Still only one sample; keep logging
+    actual elapsed time on every run so this can be tightened or loosened
+    with more data.
+
+    Fails the lab (lsf.labfail) if the timeout is hit without every
+    cluster reaching target_replicas Ready workers.
+    """
+    import json
+    import time
+
+    lsf.write_output(
+        f'Waiting for VKS worker node pools to reach {target_replicas} Ready workers each '
+        f'(timeout={timeout_seconds}s)...'
+    )
+    password = lsf.get_password()
+    pending = set(VKS_WORKLOAD_CLUSTERS)
+
+    while pending and (time.time() - start_time) < timeout_seconds:
+        for cluster_name in list(pending):
+            try:
+                cmd = f"kubectl --context {cluster_name} get nodes -o json"
+                result = lsf.ssh(cmd, VKS_KUBECTL_HOST, password)
+                stdout = getattr(result, 'stdout', '') or ''
+                data = json.loads(stdout)
+
+                ready_workers = 0
+                for node in data.get('items', []):
+                    labels = node.get('metadata', {}).get('labels', {}) or {}
+                    if 'node-role.kubernetes.io/control-plane' in labels:
+                        continue
+                    conditions = node.get('status', {}).get('conditions', []) or []
+                    is_ready = any(
+                        c.get('type') == 'Ready' and c.get('status') == 'True'
+                        for c in conditions
+                    )
+                    if is_ready:
+                        ready_workers += 1
+
+                if ready_workers >= target_replicas:
+                    elapsed = time.time() - start_time
+                    lsf.write_output(
+                        f'  {cluster_name}: reached {ready_workers} Ready workers '
+                        f'after {elapsed:.1f}s'
+                    )
+                    pending.discard(cluster_name)
+
+            except Exception as e:
+                lsf.write_output(f'  {cluster_name}: check failed ({e}), will retry')
+
+        if pending:
+            time.sleep(poll_interval)
+
+    elapsed = time.time() - start_time
+    if not pending:
+        lsf.write_output(
+            f'VKS worker node pool scale-up: ALL clusters reached {target_replicas} '
+            f'Ready workers, total elapsed {elapsed:.1f}s'
+        )
+    else:
+        lsf.write_output(
+            f'WARNING: VKS worker node pool scale-up timed out after {elapsed:.1f}s '
+            f'(timeout was {timeout_seconds}s) -- still waiting on: {sorted(pending)}'
+        )
+        lsf.labfail(
+            f'VKS worker node pool scale-up did not reach {target_replicas} Ready workers '
+            f'within {timeout_seconds}s (still waiting on: {sorted(pending)})'
+        )
+
+
 def fix_vmsp_gateway_kubevip(lsf):
     """
     Harden the VSP cluster's vmsp-platform kube-vip DaemonSet.
@@ -259,6 +414,17 @@ def main():
     os.environ["AVICTRL_PASSWORD"] = open(password_file, 'r').read().strip("\n")
     os.environ["TF_VAR_nsxt_password"] = open(password_file, 'r').read().strip("\n")
 
+    # Kick off VKS worker node pool scale-up (1 -> 3) right away, before
+    # anything else in this script. This just issues the Supervisor Cluster
+    # patch and returns immediately -- the actual node provisioning happens
+    # in the background over the next several minutes, in parallel with
+    # everything else adjustomatic does below. wait_for_vks_nodepool_scaleup()
+    # at the very end of main() confirms it actually finished (and fails the
+    # lab if it doesn't) before returning control to the rest of startup.
+    import time as _time
+    _vks_scale_start = _time.time()
+    scale_vks_worker_nodepools(lsf, target_replicas=3)
+
     # VSP vmsp-platform kube-vip DaemonSet hardening (fleet-01a/vmsp-gateway
     # VIP flap fix). Independent of the Avi playbooks below; run first so a
     # flapping gateway VIP doesn't intermittently affect anything later in
@@ -374,8 +540,14 @@ def main():
             lsf.write_output(e.stderr)
         except:
             pass   
-        lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step') 
+        lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step')
         lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
+
+    # Confirm the VKS worker node pool scale-up kicked off at the very top
+    # of this function actually finished (fails the lab if it didn't) --
+    # run last so it's had the full runtime of everything above to converge
+    # in the background first.
+    wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
 
     # try:
     #     stdout = subprocess.run(["/usr/bin/rm", "-rf", "/home/holuser/vaultsecret.txt"], text=True, check=True)
