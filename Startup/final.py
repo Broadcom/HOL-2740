@@ -137,6 +137,39 @@ def main(lsf=None, standalone=False, dry_run=False):
                         if expected_text:
                              lsf.write_output(f'  Expected: {expected_text}')
 
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+    ## Moved here (2026-07-25) from after TASK 9, at the very end of this
+    ## file. It ran there for a long time, but TASK 4 (Signal Router) below
+    ## fires lsf.signal_router('ready') -- which the router's getrules.sh
+    ## treats as the signal to switch squid from the permissive
+    ## startup-only allowlist (merged with the lab's startlist, e.g.
+    ## powershellgallery.com) to the final restrictive one. With
+    ## adjustomatic running AFTER that signal, anything it does that needs
+    ## startlist-only destinations (e.g. installing the PowerCLI
+    ## VMware.vSphere.SsoAdmin module) was silently failing because the
+    ## router had already locked down proxy access before adjustomatic
+    ## even started. Running it here, before the ready signal, fixes that.
+    ##=========================================================================
+
+    lsf.write_vpodprogress('Running adjustomatic', 'GOOD-9')
+    lsf.write_output('Running adjustomatic')
+    if not lsf.labcheck:
+        try:
+            sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
+            import adjustomatic
+            adjustomatic.main()
+        except Exception as e:
+            lsf.write_output(e)
+            lsf.write_output("could not import or an error occured with adjustomatic script")
+            lsf.labfail('Adjustomatic script failed')
+            exit(1)
+
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
+
     #==========================================================================
     # TASK 3: Lab Ready Recording
     #==========================================================================
@@ -340,27 +373,6 @@ def main(lsf=None, standalone=False, dry_run=False):
 
     ##=========================================================================
     ## End Core Team code
-    ##=========================================================================
-
-    ##=========================================================================
-    ## CUSTOM - Insert your code here using the file in your vPod_repo
-    ##=========================================================================
-
-    lsf.write_vpodprogress('Running adjustomatic', 'GOOD-9')
-    lsf.write_output('Running adjustomatic')
-    if not lsf.labcheck:
-        try:
-            sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
-            import adjustomatic
-            adjustomatic.main()
-        except Exception as e:
-            lsf.write_output(e)
-            lsf.write_output("could not import or an error occured with adjustomatic script")
-            lsf.labfail('Adjustomatic script failed')
-            exit(1)
-
-    ##=========================================================================
-    ## End CUSTOM section
     ##=========================================================================
 
     lsf.write_output(f'{MODULE_NAME} completed successfully')

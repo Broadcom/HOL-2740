@@ -802,6 +802,19 @@ def resync_nsxt_alb_cloud_connector_credentials(lsf):
     autoRotatePolicy on the vCenter/Avi SSO credentials in their intended
     state, since both are cheap to verify.
 
+    Known residual gap: the health check tests whether SDDC Manager's
+    *currently vaulted* password authenticates to NSX -- it does not (and
+    can't cheaply, since Avi always masks stored credentials as
+    "<sensitive>") verify that Avi's cloud connector holds that same
+    value. If _rotate_and_resync_cloud_connector's NSX-side ROTATE
+    succeeds but the push into Avi doesn't complete in the same run (the
+    exact race hit live on 2026-07-25, when one domain's ROTATE task took
+    just over the polling window that existed at the time), a later boot's
+    health check would see SDDC's password now matching NSX and
+    conclude "healthy", never noticing Avi is still stale. The polling
+    window below was widened specifically to make that race rare, but it
+    isn't eliminated by construction.
+
     Non-fatal: any failure here is logged as a warning and does not fail
     lab startup.
     """
@@ -878,7 +891,15 @@ def _rotate_and_resync_cloud_connector(lsf, d, sddc_headers, admin_password):
         lsf.write_output(f"    WARNING: rotate request rejected: {rotate_resp}")
         return
 
-    for _ in range(12):  # up to ~60s
+    # 36 x 5s = 180s. Manual testing (2026-07-24, quiet system) saw ROTATE
+    # finish in ~50s; live on a freshly-booted pod (2026-07-25, 23 VCF
+    # components initializing concurrently) one domain's ROTATE took just
+    # over 60s and the original 12-attempt/60s window here missed it --
+    # SDDC Manager's vault genuinely finished the rotation a bit later,
+    # but this function had already given up and returned without ever
+    # pushing the new password into Avi, leaving it stale until caught
+    # manually. 180s gives real margin for a busy-boot scenario like that.
+    for _ in range(36):
         status = requests.get(
             f'https://sddcmanager-a.site-a.vcf.lab/v1/tasks/{task_id}',
             headers=sddc_headers, verify=False, timeout=15,
@@ -913,11 +934,19 @@ def _rotate_and_resync_cloud_connector(lsf, d, sddc_headers, admin_password):
         cred_ref, timeout=15,
         json={'replace': {'nsxt_credentials': {'username': d['nsx_svc_user'], 'password': new_password}}},
     )
+    # Bump then immediately restore metrics_polling_interval to force a
+    # reconnect (a byte-identical PUT is deduped server-side -- Avi won't
+    # re-attempt the connection at all without an actual field change).
+    # Restoring the original value afterward matters: an earlier version
+    # of this left it at current+1 permanently, which would silently
+    # creep upward by 1 every time this repair path runs -- over this
+    # vApp's 18-month save/resume lifecycle that's real, accumulating
+    # drift in actual monitoring-poll behavior, not just a cosmetic
+    # counter.
+    cloud_url = f"https://{d['avi_host']}/api/cloud/{cloud['uuid']}"
     current_interval = cloud.get('metrics_polling_interval', 300)
-    avi_session.patch(
-        f"https://{d['avi_host']}/api/cloud/{cloud['uuid']}", timeout=15,
-        json={'replace': {'metrics_polling_interval': current_interval + 1}},
-    )
+    avi_session.patch(cloud_url, timeout=15, json={'replace': {'metrics_polling_interval': current_interval + 1}})
+    avi_session.patch(cloud_url, timeout=15, json={'replace': {'metrics_polling_interval': current_interval}})
     lsf.write_output(f"    {d['domain']}: rotated on NSX and pushed new password into Avi cloud connector")
 
 
@@ -1132,14 +1161,29 @@ def main():
     os.environ["AVICTRL_PASSWORD"] = open(password_file, 'r').read().strip("\n")
     os.environ["TF_VAR_nsxt_password"] = open(password_file, 'r').read().strip("\n")
 
-    # Kick off VKS worker node pool scale-up (1 -> 3) right away, before
-    # anything else in this script. This just issues the Supervisor Cluster
-    # patch and returns immediately -- the actual node provisioning happens
-    # in the background over the next several minutes, in parallel with
-    # everything else adjustomatic does below. wait_for_vks_nodepool_scaleup()
-    # at the very end of main() confirms it actually finished (and fails the
-    # lab if it doesn't) before returning control to the rest of startup.
+    # One-time settling buffer before the VKS scale-out request below (added
+    # 2026-07-25). On a fresh/busy pod boot, NSX Manager can still be working
+    # through a backlog from bringing up the rest of the infrastructure right
+    # as adjustomatic starts -- hitting it immediately with a new scale-out
+    # (which needs fresh SubnetPort realization per new node) risks landing
+    # in the worst possible window. Confirmed once already: a scale-out that
+    # hit this exact situation left 4 worker VMs permanently stuck
+    # (SubnetPortReady=True but kubelet never registered) and cycling through
+    # CAPI's MachineHealthCheck all night without ever succeeding. This delay
+    # is a simple mitigation for that one risky window, not a real readiness
+    # check -- fine since scale-out to 3 workers is only needed once, to be
+    # captured into the saved vApp template; ok to remove once that's done.
     import time as _time
+    _time.sleep(180)
+
+    # Kick off VKS worker node pool scale-up (1 -> 3) right away (after the
+    # settling buffer above), before anything else in this script. This just
+    # issues the Supervisor Cluster patch and returns immediately -- the
+    # actual node provisioning happens in the background over the next
+    # several minutes, in parallel with everything else adjustomatic does
+    # below. wait_for_vks_nodepool_scaleup() at the very end of main()
+    # confirms it actually finished (and fails the lab if it doesn't) before
+    # returning control to the rest of startup.
     _vks_scale_start = _time.time()
     scale_vks_worker_nodepools(lsf, target_replicas=3)
 
