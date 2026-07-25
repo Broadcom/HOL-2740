@@ -5,8 +5,8 @@ config:
   python_bin: null
 
 skus:
-  - id: HOL-2740-01 (was 2740-01)
-    title: "HOL-2740-01 - VKS"
+  - id: HOL-2740-01
+    title: "HOL-2740-01 - Integrate VMware Avi Load Balancer with VKS."
     modules:
       - name: "Module 1 - Add name"
         description: "Add description"
@@ -29,7 +29,7 @@ skus:
   #       playbook: ../module-scripts/placeholder.yaml
 
 
-  - id: HOL-2740-03 (was 2671-02)
+  - id: HOL-2740-03
     title: "HOL-2740-03 - Load balancing VCF apps with Avi"
     modules:
       - name: "Module 1 - No Pre-Provisioning Required"
@@ -42,7 +42,7 @@ skus:
         description: "Deploys the adv-app-a, secure-app-a (SSL), and tenant-app-a virtual services for region a. NOTE: identical to Module 2 above — needs real distinct content."
         playbook: ../module-scripts/2740-03-module_3.yaml
 
-  - id: HOL-2740-04 (was 2571-02)
+  - id: HOL-2740-04
     title: "HOL-2740-04 - Increase app resiliency with VMware Avi load balancer"
     modules:
       - name: "Module 1 - GSLB Infrastructure Dependencies"
@@ -64,23 +64,23 @@ skus:
         description: "Fast-forwards through modules 1-5 so the student can start on DNS policy and static DNS record management."
         playbook: ../module-scripts/2740-04-module_6.yaml
 
-  - id: HOL-2740-05 (was 2671-03)
+  - id: HOL-2740-05
     title: "HOL-2740-05 - Migrating Legacy Load Balancing using Avi Conversion Tool"
     modules:
       - name: "Module 1 - Import Legacy Config"
         description: "Imports an example legacy load balancer configuration for migration."
         playbook: ../module-scripts/2740-05-module_1.yaml
 
-  - id: HOL-2740-06 (was 2571-06)
-    title: "HOL-2740-06 - Introduction to Avi load balancer automation"
-    modules:
-      - name: "Module 1 - Add name"
-        description: "Add description"
-        playbook: ../module-scripts/placeholder.yaml
+  # - id: HOL-2740-06
+  #   title: "HOL-2740-06 - Introduction to Avi load balancer automation"
+  #   modules:
+  #     - name: "Module 1 - Add name"
+  #       description: "Add description"
+  #       playbook: ../module-scripts/placeholder.yaml
 
-  - id: HOL-2740-07 (was 2571-03)
-    title: "HOL-2740-07 - Boost app security with VMware Avi load balancer WAF"
-    modules:
-      - name: "Module 1 - Add name"
-        description: "Add description"
-        playbook: ../module-scripts/placeholder.yaml
+  # - id: HOL-2740-07
+  #   title: "HOL-2740-07 - Boost app security with VMware Avi load balancer WAF"
+  #   modules:
+  #     - name: "Module 1 - Add name"
+  #       description: "Add description"
+  #       playbook: ../module-scripts/placeholder.yaml
