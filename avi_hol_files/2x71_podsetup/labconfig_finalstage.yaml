@@ -425,7 +425,7 @@
       register: result
       retries: 3
       delay: 3
-      become: yes
+      #become: yes
 
     - name: cleanup
       docker_container:
@@ -433,7 +433,7 @@
         state: absent
         force_kill: yes
         container_default_behavior: no_defaults
-      become: yes
+      #become: yes
       ignore_errors: yes
 
     - pause:
@@ -453,4 +453,4 @@
       register: result
       retries: 3
       delay: 3
-      become: yes
+      #become: yes
