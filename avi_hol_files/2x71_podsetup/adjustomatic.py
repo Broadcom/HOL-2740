@@ -21,13 +21,19 @@ def retry_io(fn, *args, retries=3, delay=5, **kwargs):
 # VSP/VCFA checks) -- just targeting console instead of a VSP/VCFA node.
 VKS_KUBECTL_HOST = 'holuser@console.site-a.vcf.lab'
 VKS_SUPERVISOR_NS = 'acme-east-prod-wrp4h'
-VKS_WORKLOAD_CLUSTERS = ('workload-cluster-1', 'workload-cluster-2')
+# Scoped down to just workload-cluster-1 (2026-07-27) -- workload-cluster-2
+# isn't expected to need the extra capacity, and every worker added here is
+# another SubnetPort NSX has to realize during an already-slow scale-out
+# (one 2026-07-27 run took 74-101 minutes for 4 new nodes across both
+# clusters -- see wait_for_vks_nodepool_scaleup()'s docstring). Halving the
+# node count halves that realization work.
+VKS_WORKLOAD_CLUSTERS = ('workload-cluster-1',)
 
 
 def scale_vks_worker_nodepools(lsf, target_replicas=3):
     """
-    Scale the worker node pool of both VKS workload clusters up to
-    target_replicas, via a JSON patch on the Supervisor Cluster resource's
+    Scale the worker node pool of each cluster in VKS_WORKLOAD_CLUSTERS up
+    to target_replicas, via a JSON patch on the Supervisor Cluster resource's
     spec.topology.workers.machineDeployments[0].replicas field --
     equivalent to `kubectl edit cluster <name>`, just non-interactive.
     Idempotent: no-ops any cluster already at or above target_replicas.
@@ -114,16 +120,27 @@ def scale_vks_worker_nodepools(lsf, target_replicas=3):
 def wait_for_vks_nodepool_scaleup(lsf, start_time, target_replicas=3,
                                    timeout_seconds=600, poll_interval=30):
     """
-    Poll both VKS workload clusters until each has target_replicas worker
-    (non-control-plane) nodes in Ready state, or timeout_seconds elapses.
+    Poll every cluster in VKS_WORKLOAD_CLUSTERS until each has
+    target_replicas worker (non-control-plane) nodes in Ready state, or
+    timeout_seconds elapses.
 
-    timeout_seconds=600 (10 min): measured 352s for both clusters to
-    converge on a real pod-deploy test (2026-07-24, 1->3 workers each,
-    one cluster with a pre-existing worker that briefly flapped
-    NotReady mid-scale-up, the other a clean addition) -- ~70% headroom
-    over that single data point. Still only one sample; keep logging
-    actual elapsed time on every run so this can be tightened or loosened
-    with more data.
+    timeout_seconds=600 (10 min) history -- convergence time has been very
+    inconsistent across pod deploys, likely tracking how backlogged NSX
+    Manager's realization queue is on a given busy fresh boot (see
+    resync_nsxt_alb_cloud_connector_credentials()'s docstring for the same
+    root cause showing up as a slow ROTATE task):
+      - 2026-07-24: 352s for both clusters (1->3 workers each, one cluster
+        had a pre-existing worker briefly flap NotReady mid-scale-up).
+      - 2026-07-25: one cluster's replacement nodes never converged at all
+        (stuck in an endless CAPI MachineHealthCheck remediation loop all
+        night); a second attempt on a fresh pod that same day took
+        74-101 minutes across the 4 new nodes, succeeding well past this
+        timeout (that run had a 3-minute pre-scale-out settling delay --
+        see main() -- and still ran long).
+    VKS_WORKLOAD_CLUSTERS was scoped down to just workload-cluster-1 on
+    2026-07-27 specifically to cut this realization workload in half and
+    see if that materially improves convergence time -- still an open
+    question as of this writing.
 
     Fails the lab (lsf.labfail) if the timeout is hit without every
     cluster reaching target_replicas Ready workers.
@@ -495,6 +512,392 @@ def install_vmsp_kvip_keeper_cron(lsf):
             )
     except Exception as e:
         lsf.write_output(f'  WARNING: could not install kvip-keeper cron job: {e}')
+
+
+def fix_firefox_remote_settings_bypass(lsf):
+    """
+    Disable Firefox's Remote Settings network calls on the console jump
+    host, so opening the "Not Secure" identity panel (and any other UI
+    path that triggers a Remote Settings freshness check) doesn't hang.
+
+    Root cause (found 2026-07-27 via live tcpdump on a pod reporting
+    "Firefox is extremely slow to load pages / open modals"):
+    /etc/firefox/policies/policies.json already locks down the classic
+    causes of that symptom -- Safe Browsing, telemetry, DoH, and prefetch
+    are all disabled there, and the configured HTTP/SSL proxy
+    (proxy.site-a.vcf.lab:3128) answers every blocked external
+    destination with an instant 403, so it can't be the source of a
+    multi-second hang either. But Remote Settings
+    (firefox.settings.services.mozilla.com -- syncs Nimbus/tracking-
+    protection config, polled when the identity panel opens) resolves
+    fine via the internal DNS resolver, then opens a TCP connection
+    *directly* to the real Fastly IP it resolved to -- bypassing the
+    configured proxy entirely. This pod has no route to the real
+    internet on that direct path, so the SYN is silently dropped (no
+    SYN-ACK, no RST) and Firefox sits retrying with exponential backoff
+    for 60+ seconds before giving up and rendering -- the "stalls, then
+    pops open" symptom.
+
+    Fix attempted here: add "services.settings.server": "" to the
+    policy's existing Preferences block -- the same mechanism already
+    used there for Safe Browsing/telemetry/etc.
+
+    UPDATE (2026-07-27): verified via live tcpdump immediately after a
+    full Firefox restart that this fix is NOT sufficient on its own --
+    the identical DNS query + direct-to-Fastly SYN still fired. Root
+    cause of *that*: Mozilla deliberately ignores any override of
+    services.settings.server on Release/ESR channel builds (this
+    pod runs Release) unless Firefox is launched with the
+    MOZ_REMOTE_SETTINGS_DEVTOOLS=1 environment variable -- see
+    services/settings/Utils.sys.mjs's SERVER_URL getter (falls back to
+    the hardcoded AppConstants.REMOTE_SETTINGS_SERVER_URLS[0] whenever
+    the override isn't "allowed") and Mozilla bug 1598562,
+    https://bugzilla.mozilla.org/show_bug.cgi?id=1598562, "Prevent
+    Remote Settings server URL to be modified in release". This is
+    intentional hardening on Mozilla's part -- Remote Settings delivers
+    security-relevant data (cert revocation, malicious-extension kill
+    switches), so they don't want a compromised/malicious policy able to
+    silently redirect or disable it. There's no supported pref/policy
+    path around this from our side; see
+    fix_firefox_remote_settings_dns_block() below for the actual fix
+    (block the domain at the pod's own DNS server instead, where
+    Firefox has no equivalent override to fall back from).
+
+    Left in place anyway as harmless defense-in-depth (e.g. in case a
+    future Firefox update on this image ships on a channel where the
+    override *is* honored) -- it just doesn't fully solve this on its
+    own on the current Release build.
+
+    Idempotent: no-ops (ALREADY_APPLIED) once the pref is already set to
+    the desired value, so safe to run on every pod boot even though the
+    saved vApp template should already have it applied -- this also
+    self-heals it if a future template rebuild drops it. Writes via a
+    temp file + atomic replace on the remote host so a mid-write failure
+    can't leave policies.json truncated/invalid (which would silently
+    disable every other policy in the file, including the proxy lock).
+
+    Non-fatal: any failure here is logged as a warning and does not fail
+    lab startup (lsf.labfail is never called) -- this is a UX papercut
+    fix, not something worth blocking the lab on.
+    """
+    import base64
+
+    lsf.write_output('Checking Firefox Remote Settings proxy-bypass fix on console...')
+    password = lsf.get_password()
+    console_host = 'holuser@console.site-a.vcf.lab'
+
+    patch_py = r"""
+import json, os
+
+PATH = '/etc/firefox/policies/policies.json'
+KEY = 'services.settings.server'
+WANT = ''
+
+try:
+    with open(PATH) as f:
+        data = json.load(f)
+
+    prefs = data.setdefault('policies', {}).setdefault('Preferences', {})
+
+    if prefs.get(KEY) == WANT:
+        print('ALREADY_APPLIED')
+    else:
+        prefs[KEY] = WANT
+        tmp_path = PATH + '.tmp'
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.write('\n')
+        os.replace(tmp_path, PATH)
+        print('PATCHED')
+except Exception as e:
+    print(f'FAILED: {e}')
+"""
+    try:
+        patch_b64 = base64.b64encode(patch_py.encode()).decode()
+        remote_cmd = (
+            f"echo {patch_b64} | base64 -d > /tmp/firefox_policy_fix.py && "
+            f"echo '{password}' | sudo -S python3 /tmp/firefox_policy_fix.py; "
+            f"rm -f /tmp/firefox_policy_fix.py"
+        )
+        result = lsf.ssh(remote_cmd, console_host)
+        out_text = (getattr(result, 'stdout', '') or '').strip()
+        lsf.write_output(f'  firefox remote-settings proxy-bypass fix result: {out_text or "(no output)"}')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not apply firefox remote-settings proxy-bypass fix: {e}')
+
+
+def fix_firefox_remote_settings_dns_block(lsf):
+    """
+    Block firefox.settings.services.mozilla.com at the pod's own
+    Technitium DNS server (holorouter, 10.1.10.129) so Firefox's Remote
+    Settings sync fails instantly (NXDOMAIN) instead of hanging for 60+
+    seconds. This is the actual fix for the identity-panel/page-load
+    stall fix_firefox_remote_settings_bypass() above documents and
+    attempts (and, per that function's 2026-07-27 UPDATE, does not fully
+    solve on its own on Release-channel Firefox).
+
+    Verified live 2026-07-27 via Technitium's REST API on the reported
+    pod:
+      - Technitium's zone-type API rejects "Blocked" as a zone type in
+        this version (14.3) -- blocking domains is a separate feature
+        with its own API namespace, /api/blocked/*, distinct from
+        /api/zones/*.
+      - /api/blocked/add?domain=<fqdn> is idempotent by itself (re-adding
+        an already-blocked domain returns a plain {"status":"ok"}, no
+        error, no duplicate) -- confirmed live by calling it twice.
+      - The block is scoped to the exact FQDN, not its parent domain:
+        after blocking firefox.settings.services.mozilla.com,
+        addons.mozilla.org (a different mozilla.com subdomain) still
+        resolved normally. Technitium's /api/blocked/list groups its
+        summary view by registrable domain (e.g. shows a "mozilla.com"
+        bucket), which looks like a whole-domain block at a glance but
+        isn't one -- drilling in with /api/blocked/list?domain=<fqdn>
+        confirms the NS/SOA records Technitium synthesizes for the block
+        live exactly at the blocked FQDN, not at the registrable-domain
+        apex.
+      - Firefox has no equivalent override to fall back from here the
+        way it does for the app-level services.settings.server pref
+        (see fix_firefox_remote_settings_bypass()'s UPDATE) -- DNS is
+        DNS regardless of which internal Firefox subsystem is asking, so
+        this fix doesn't care whether a future Firefox version answers
+        this particular request from the JS Remote Settings client, a
+        Rust-based one, or something else entirely.
+
+    Deliberately narrow: only blocks this one FQDN, confirmed via live
+    packet capture to be the actual cause of this pod's reported hang --
+    not a speculative list of other Mozilla background-service domains
+    (push/contile/pocket/merino/etc.) that haven't actually been observed
+    causing a problem here. Add more entries the same way if a future
+    investigation turns up another offender.
+
+    Idempotent: checks /api/blocked/list for this exact domain first and
+    no-ops (logs "already blocked") if present, so safe to run on every
+    pod boot -- also self-heals it if Technitium's config is ever reset.
+
+    Non-fatal: any failure here is logged as a warning and does not fail
+    lab startup (lsf.labfail is never called) -- this is a UX papercut
+    fix, not something worth blocking the lab on.
+    """
+    import requests
+
+    lsf.write_output('Checking Technitium DNS block for Firefox Remote Settings...')
+    technitium_url = 'http://10.1.10.129:5380'
+    domain = 'firefox.settings.services.mozilla.com'
+    password = lsf.get_password()
+
+    try:
+        login = requests.get(
+            f'{technitium_url}/api/user/login',
+            params={'user': 'admin', 'pass': password},
+            timeout=10,
+        ).json()
+        if login.get('status') != 'ok':
+            lsf.write_output(
+                f'  WARNING: could not log into Technitium DNS server -- {login}'
+            )
+            return
+        token = login['token']
+
+        check = requests.get(
+            f'{technitium_url}/api/blocked/list',
+            params={'token': token, 'domain': domain},
+            timeout=10,
+        ).json()
+        already_blocked = bool(check.get('response', {}).get('records'))
+
+        if already_blocked:
+            lsf.write_output(f'  {domain}: already blocked -- no-op')
+            return
+
+        add = requests.get(
+            f'{technitium_url}/api/blocked/add',
+            params={'token': token, 'domain': domain},
+            timeout=10,
+        ).json()
+        if add.get('status') == 'ok':
+            lsf.write_output(f'  {domain}: blocked (NXDOMAIN) at pod DNS server')
+        else:
+            lsf.write_output(f'  WARNING: could not block {domain}: {add}')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not apply firefox remote-settings DNS block: {e}')
+
+
+# global.vcf.lab's NS delegation was found pointing at a stale GSLB DNS VS
+# name/IP pair (dns-vs-01a.site-a.vcf.lab/10.1.13.135,
+# dns-vs-01b.site-b.vcf.lab/10.1.14.135) that no longer matches the pod's
+# actual Avi GSLB DNS Virtual Service deployment -- confirmed live
+# 2026-07-27 that the correct VSes now answer on 10.1.13.137 (site-a) and
+# 10.1.14.137 (site-b) under the renamed hostnames below (verified each
+# answers authoritatively, `aa` flag set, for a direct SOA query at its new
+# IP). Fixed manually once already on the live Technitium server (same
+# pattern documented in fix_firefox_remote_settings_dns_block() above,
+# just against /api/zones/records/* instead of /api/blocked/*); this
+# function makes that fix durable and self-healing across pod
+# save/resume, the same reasoning as resync_nsxt_alb_enforcement_point_tokens()
+# above.
+GLOBAL_DNS_NS_DELEGATIONS = (
+    {
+        'old_nameserver': 'dns-vs-01a.site-a.vcf.lab',
+        'new_nameserver': 'global-dns-vs-01a.site-a.vcf.lab',
+        'glue_ip': '10.1.13.137',
+        'a_record_zone': 'site-a.vcf.lab',
+    },
+    {
+        'old_nameserver': 'dns-vs-01b.site-b.vcf.lab',
+        'new_nameserver': 'global-dns-vs-01b.site-b.vcf.lab',
+        'glue_ip': '10.1.14.137',
+        'a_record_zone': 'site-b.vcf.lab',
+    },
+)
+GLOBAL_DNS_NS_OWNER = 'global.vcf.lab'
+GLOBAL_DNS_NS_ZONE = 'vcf.lab'
+
+
+def fix_global_dns_ns_delegation(lsf):
+    """
+    Ensure global.vcf.lab's NS delegation (used for Avi GSLB) points at the
+    current GSLB DNS VS hostnames/glue IPs, per GLOBAL_DNS_NS_DELEGATIONS
+    above -- see that constant's comment for the root cause this fixes.
+
+    For each delegation: first ensures the new glue-target A record exists
+    with the desired IP (creates/overwrites it in a_record_zone), then
+    ensures the global.vcf.lab NS record for that delegation points at the
+    new hostname with the new glue IP -- updating the stale record in
+    place if found under old_nameserver, or adding a fresh NS record if
+    no matching old record exists (e.g. after a from-scratch Technitium
+    reset).
+
+    Idempotent: no-ops each delegation already found with the desired NS
+    hostname and glue IP, so safe to run on every pod boot.
+
+    Non-fatal: any failure here is logged as a warning and does not fail
+    lab startup (matches every other Technitium-touching fix in this
+    file).
+    """
+    import requests
+
+    lsf.write_output('Checking global.vcf.lab NS delegation (GSLB DNS VS glue records)...')
+    technitium_url = 'http://10.1.10.129:5380'
+    password = lsf.get_password()
+
+    try:
+        login = requests.get(
+            f'{technitium_url}/api/user/login',
+            params={'user': 'admin', 'pass': password},
+            timeout=10,
+        ).json()
+        if login.get('status') != 'ok':
+            lsf.write_output(
+                f'  WARNING: could not log into Technitium DNS server -- {login}'
+            )
+            return
+        token = login['token']
+
+        ns_recs = requests.get(
+            f'{technitium_url}/api/zones/records/get',
+            params={'token': token, 'domain': GLOBAL_DNS_NS_OWNER, 'zone': GLOBAL_DNS_NS_ZONE},
+            timeout=10,
+        ).json()
+        current_ns_records = [
+            r for r in ns_recs.get('response', {}).get('records', [])
+            if r.get('type') == 'NS' and r.get('name', '').lower() == GLOBAL_DNS_NS_OWNER.lower()
+        ]
+
+        for deleg in GLOBAL_DNS_NS_DELEGATIONS:
+            # ---- ensure the new glue-target A record exists ----
+            a_recs = requests.get(
+                f'{technitium_url}/api/zones/records/get',
+                params={'token': token, 'domain': deleg['new_nameserver'], 'zone': deleg['a_record_zone']},
+                timeout=10,
+            ).json()
+            existing_a = next(
+                (r for r in a_recs.get('response', {}).get('records', [])
+                 if r.get('type') == 'A' and r.get('name', '').lower() == deleg['new_nameserver'].lower()),
+                None,
+            )
+            if existing_a and existing_a.get('rData', {}).get('ipAddress') == deleg['glue_ip']:
+                lsf.write_output(f"  {deleg['new_nameserver']}: A record already {deleg['glue_ip']} -- no-op")
+            else:
+                add = requests.get(
+                    f'{technitium_url}/api/zones/records/add',
+                    params={
+                        'token': token,
+                        'domain': deleg['new_nameserver'],
+                        'zone': deleg['a_record_zone'],
+                        'type': 'A',
+                        'ipAddress': deleg['glue_ip'],
+                        'ttl': 3600,
+                        'overwrite': 'true',
+                    },
+                    timeout=10,
+                ).json()
+                if add.get('status') == 'ok':
+                    lsf.write_output(f"  {deleg['new_nameserver']}: A record created -> {deleg['glue_ip']}")
+                else:
+                    lsf.write_output(f"  WARNING: could not create A record {deleg['new_nameserver']}: {add}")
+                    continue
+
+            # ---- ensure the global.vcf.lab NS record delegates to it ----
+            already_correct = any(
+                r.get('rData', {}).get('nameServer', '').lower() == deleg['new_nameserver'].lower()
+                and r.get('glueRecords') == [deleg['glue_ip']]
+                for r in current_ns_records
+            )
+            if already_correct:
+                lsf.write_output(
+                    f"  {GLOBAL_DNS_NS_OWNER}: NS already delegates to "
+                    f"{deleg['new_nameserver']} ({deleg['glue_ip']}) -- no-op"
+                )
+                continue
+
+            stale = next(
+                (r for r in current_ns_records
+                 if r.get('rData', {}).get('nameServer', '').lower() == deleg['old_nameserver'].lower()),
+                None,
+            )
+            if stale:
+                result = requests.get(
+                    f'{technitium_url}/api/zones/records/update',
+                    params={
+                        'token': token,
+                        'domain': GLOBAL_DNS_NS_OWNER,
+                        'zone': GLOBAL_DNS_NS_ZONE,
+                        'type': 'NS',
+                        'nameServer': deleg['old_nameserver'],
+                        'newNameServer': deleg['new_nameserver'],
+                        'glue': deleg['glue_ip'],
+                    },
+                    timeout=10,
+                ).json()
+                verb = 'updated'
+            else:
+                result = requests.get(
+                    f'{technitium_url}/api/zones/records/add',
+                    params={
+                        'token': token,
+                        'domain': GLOBAL_DNS_NS_OWNER,
+                        'zone': GLOBAL_DNS_NS_ZONE,
+                        'type': 'NS',
+                        'nameServer': deleg['new_nameserver'],
+                        'glue': deleg['glue_ip'],
+                    },
+                    timeout=10,
+                ).json()
+                verb = 'added'
+
+            if result.get('status') == 'ok':
+                lsf.write_output(
+                    f"  {GLOBAL_DNS_NS_OWNER}: NS record {verb} -> "
+                    f"{deleg['new_nameserver']} (glue {deleg['glue_ip']})"
+                )
+            else:
+                lsf.write_output(
+                    f"  WARNING: could not {verb} NS record for {GLOBAL_DNS_NS_OWNER} "
+                    f"-> {deleg['new_nameserver']}: {result}"
+                )
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not fix global.vcf.lab NS delegation: {e}')
 
 
 def configure_nsxt_app_profiles(lsf):
@@ -1194,6 +1597,20 @@ def main():
     # See fix_vmsp_gateway_kubevip() docstring for full root-cause detail.
     fix_vmsp_gateway_kubevip(lsf)
 
+    # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
+    # page-load hang). Independent of everything else here; see
+    # fix_firefox_remote_settings_bypass() docstring for full root-cause
+    # detail -- and see fix_firefox_remote_settings_dns_block() for why
+    # that fix alone isn't sufficient and what actually closes the gap.
+    fix_firefox_remote_settings_bypass(lsf)
+    fix_firefox_remote_settings_dns_block(lsf)
+
+    # global.vcf.lab GSLB NS delegation -- keeps the NS/glue records pointed
+    # at the pod's actual Avi GSLB DNS VS hostnames/IPs. See
+    # fix_global_dns_ns_delegation() and GLOBAL_DNS_NS_DELEGATIONS' comment
+    # for full root-cause detail.
+    fix_global_dns_ns_delegation(lsf)
+
     # NSX-T LB app profiles (custom-fast-tcp/custom-fast-udp) + HTTP
     # monitor (http-30001). See configure_nsxt_app_profiles() docstring --
     # this used to be inline here, PUT unconditionally, and errored out on
@@ -1236,26 +1653,55 @@ def main():
     #     lsf.write_output('Adjustomatic failed at avitweaker - first stage playbook step') 
     #     lsf.labfail('Adjustomatic failed at avitweaker - first stage playbook step')
 
-    # try:
-    #     lsf.write_output("Running avi configuration playbook")   
-    #     # Playbook to run final config steps
-    #     result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/avi_config.yml", 
-    #         "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/inv_sitea.yml", "--vault-password-file", 
-    #         "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-    #     lsf.write_output(result)
-    #     try:
-    #         lsf.write_output(result.stdout)
-    #     except:
-    #         pass
-    # except Exception as e:
-    #     lsf.write_output(e)
-    #     try:
-    #         lsf.write_output(e.stdout)
-    #         lsf.write_output(e.stderr)
-    #     except:
-    #         pass   
-    #     lsf.write_output('Adjustomatic failed at avitweaker - avi configuration step') 
-    #     lsf.labfail('Adjustomatic failed at avitweaker - avi configuration step')
+    try:
+        lsf.write_output("Running avi configuration playbook - workload domain")
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
+            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        # Playbook already succeeded at this point - don't let a transient I/O error while
+        # logging its output turn a successful run into a lab failure.
+        try:
+            retry_io(lsf.write_output, result, console=False)
+            retry_io(lsf.write_output, result.stdout, console=False)
+        except OSError as log_err:
+            try:
+                lsf.write_output(f"avi workload-domain configuration succeeded, but logging its output failed: {log_err}")
+            except OSError:
+                pass
+    except Exception as e:
+        lsf.write_output(e)
+        try:
+            lsf.write_output(e.stdout)
+            lsf.write_output(e.stderr)
+        except:
+            pass
+        lsf.write_output('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
+        lsf.labfail('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
+
+    try:
+        lsf.write_output("Running avi configuration playbook - management domain")
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
+            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        # Playbook already succeeded at this point - don't let a transient I/O error while
+        # logging its output turn a successful run into a lab failure.
+        try:
+            retry_io(lsf.write_output, result, console=False)
+            retry_io(lsf.write_output, result.stdout, console=False)
+        except OSError as log_err:
+            try:
+                lsf.write_output(f"avi management-domain configuration succeeded, but logging its output failed: {log_err}")
+            except OSError:
+                pass
+    except Exception as e:
+        lsf.write_output(e)
+        try:
+            lsf.write_output(e.stdout)
+            lsf.write_output(e.stderr)
+        except:
+            pass
+        lsf.write_output('Adjustomatic failed at avitweaker - avi management-domain configuration step')
+        lsf.labfail('Adjustomatic failed at avitweaker - avi management-domain configuration step')
 
     try:
         lsf.write_output("Running final stages playbook")

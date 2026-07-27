@@ -1,0 +1,58 @@
+# Inventory / vars for the workload-domain Avi Controller (alb-a.site-a.vcf.lab).
+#
+# Captured directly from the live controller via the Avi REST API on 2026-07-27.
+# This is a point-in-time snapshot for documentation/drift-repair purposes, not a
+# guess or a copy of the original podsetup template's intended values — some of
+# these differ from avi_configs/inv_sitea.yml because the live pod evolved after
+# initial buildout (VKS/Supervisor workloads registered their own LB objects,
+# some "tweaks" from avi_tweaks.yml were never actually applied, etc).
+all:
+  hosts:
+    localhost:
+      ansible_python_interpreter: "{{ansible_playbook_python}}"
+
+      cloud_name: Cloud-nsx-wld01-a
+      site_letter: a
+
+      # NSX Tier-1 gateway backing this cloud. Unlike the original template's
+      # t1_uuid (a GUID), this pod's NSX Policy IDs are the human-readable
+      # segment/T1 IDs seen directly in Avi's tier1_lr path.
+      t1_id: wld01-a-t1
+      t1_segment_id: wld01-avi-data
+
+      avi_controller: 10.1.1.90          # cluster VIP
+      avi_controller_fqdn: alb-a.site-a.vcf.lab
+      avi_controller_node: alb-01a.site-a.vcf.lab   # single-node cluster; this is the node NSX actually talks to
+      api_version: 32.1.1
+
+      # NSX Manager backing this cloud
+      nsxt_url: nsx-wld01-a.site-a.vcf.lab
+
+      # Networks known to this cloud
+      mgmt_network_name: ans-mgmt
+      mgmt_network_subnet: 10.1.0.0
+      mgmt_network_mask: 24
+      mgmt_se_range_begin: 10.1.0.200
+      mgmt_se_range_end: 10.1.0.225
+
+      vip_network_name: wld01-avi-data
+      vip_network_subnet: 10.1.13.128
+      vip_network_mask: 25
+      vip_se_range_begin: 10.1.13.150     # STATIC_IPS_FOR_VIP_AND_SE - shared VIP+SE pool,
+      vip_se_range_end: 10.1.13.199       # not a VIP-only range like the original template used
+
+      ipam_profile_name: avi_ipam
+      dns_profile_name: avi_dns
+      dns_service_domains:
+        - lb.site-a.vcf.lab
+        - vks1.site-a.vcf.lab
+        - vks2.site-a.vcf.lab
+
+      # demo_vs / dns-vs-01a application VIPs
+      dns_vs_ip: 10.1.13.135
+      dns_vs_fqdn: dns-vs-01a.site-a.vcf.lab
+      demo_vs_ip: 10.1.13.136
+      demo_vs_fqdn: demo_vs.site-a.vcf.lab
+      worker1: 10.1.13.11
+      worker2: 10.1.13.12
+      worker_port: 30001

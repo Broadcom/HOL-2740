@@ -1,0 +1,526 @@
+# Self-documenting playbook for the workload-domain Avi Controller
+# (alb-a.site-a.vcf.lab / cloud "Cloud-nsx-wld01-a"). Originally captured as a
+# live-config snapshot on 2026-07-27, then reconciled against the intended
+# state in avi_configs/avi_config.yml/avi_tweaks.yml task by task - this is
+# now meant to run every time the pod starts, same as the original template,
+# not just as a passive reference.
+#
+# Every field below reflects a deliberate decision, not just "whatever the
+# controller happened to have": some fields match the original template's
+# intent (controller properties, true-client-IP/HSTS tweaks, SE self-election,
+# demo_vs/dns-vs-01a analytics_policy - all of these were live gaps, now
+# closed), others deliberately preserve current live values over the
+# template's stale intent (SE group memory/disk/max_vs_per_se sizing,
+# state_based_dns_registration, the portal's SSL cert). See inline comments
+# on each task for which case applies.
+#
+# WHAT THIS DELIBERATELY DOES NOT COVER:
+#   - Licensing: this controller is on a Broadcom-issued subscription license
+#     applied automatically by VCF Operations, not a static serial key. There
+#     is no "Apply License Key" task here (unlike the original template) —
+#     reapplying an old eval-style serial would be wrong for this build.
+#   - system config bootstrap (DNS/NTP/welcome_workflow/sddcmanager_fqdn) and
+#     the portal's SSL cert: these were set once during initial VCF bring-up
+#     (portal cert specifically is provisioned by VCF on this 9.1+ build) and
+#     are shown below as commented reference only, never applied. The one
+#     active systemconfiguration task in this file (registering
+#     dns_virtualservice_refs) is scoped to that single field only and does
+#     not touch portal_configuration or anything else in this bucket.
+#   - Supervisor/VKS-managed objects: this cloud carries several pools,
+#     VsVips, and VirtualServices whose names are content hashes (e.g.
+#     "5dcb84b1-dbd--kube-system-kube-apiserver-lb-svc..."). Those are
+#     created/deleted automatically by the Supervisor cluster's own load
+#     balancer integration (NCP/Avi) — do not manage them here. See the
+#     "Observed but unmanaged" note near the bottom.
+#   - Uploading the actual private key material for the "hol_wildcard" /
+#     "vcf_lab_root" certs: Avi never returns private keys via the API
+#     (they always read back as "<sensitive>"), so this playbook cannot
+#     recover them. The sslkeyandcertificate tasks below assume the same
+#     PEM files used at initial buildout are still available locally.
+---
+- hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - inv_wld_a.yml
+  vars:
+    avi_credentials:
+      controller: "{{ avi_controller }}"
+      username: admin
+      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      api_version: "{{ api_version }}"
+
+  collections:
+    - vmware.alb
+
+  tasks:
+    - name: "Wait for the portal to become active"
+      uri:
+        url: "https://{{ avi_controller_fqdn }}/api/initial-data"
+        validate_certs: no
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 300
+      delay: 10
+
+    # -----------------------------------------------------------------
+    # Reference only — set once by VCF at initial bring-up. Not replayed.
+    # -----------------------------------------------------------------
+    # - name: Basic system configuration (REFERENCE ONLY - do not run)
+    #   vmware.alb.avi_systemconfiguration:
+    #     avi_credentials: "{{ avi_credentials }}"
+    #     welcome_workflow_complete: true
+    #     default_license_tier: ENTERPRISE
+    #     dns_configuration:
+    #       server_list:
+    #         - addr: 10.1.1.1
+    #           type: V4
+    #     ntp_configuration:
+    #       ntp_servers:
+    #         - server:
+    #             addr: 10.1.1.1
+    #             type: V4
+    #     # sddcmanager_fqdn: sddcmanager-a.site-a.vcf.lab   (set by VCF, not user-settable here)
+
+    - name: "Controller properties (template intent - was missing live, now enforced)"
+      vmware.alb.avi_controllerproperties:
+        avi_credentials: "{{ avi_credentials }}"
+        shared_ssl_certificates: true
+        api_idle_timeout: 1440
+
+    - name: "Backup configuration - SFTP to SDDC Manager's NFS-backed backup share"
+      vmware.alb.avi_backupconfiguration:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "Backup-Configuration"
+        save_local: true
+        upload_to_remote_host: true
+        remote_file_transfer_protocol: SFTP
+        remote_hostname: sddcmanager-a.site-a.vcf.lab
+        remote_directory: "/nfs/vmware/vcf/nfs-mount/backup/avi_backup/alb-a.site-a.vcf.lab-0ddd4408-b633-4b3c-8ab2-0abe82f90182"
+        maximum_backups_stored: 4
+        # ssh_user_ref points at a cloudconnectoruser object holding the SFTP
+        # credential for sddcmanager-a - its password reads back as
+        # "<sensitive>" and can't be captured here. If this ever needs to be
+        # recreated, the credential is the same one SDDC Manager vends for
+        # its own backup share.
+        backup_passphrase: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+
+    - name: "VIP/SE data network - {{ vip_network_name }}"
+      vmware.alb.avi_network:
+        avi_credentials: "{{ avi_credentials }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        name: "{{ vip_network_name }}"
+        dhcp_enabled: true
+        exclude_discovered_subnets: false
+        ip6_autocfg_enabled: false
+        configured_subnets:
+          - prefix:
+              ip_addr:
+                addr: "{{ vip_network_subnet }}"
+                type: V4
+              mask: "{{ vip_network_mask }}"
+            static_ip_ranges:
+              - range:
+                  begin:
+                    addr: "{{ vip_se_range_begin }}"
+                    type: V4
+                  end:
+                    addr: "{{ vip_se_range_end }}"
+                    type: V4
+                type: "STATIC_IPS_FOR_VIP_AND_SE"
+        vrf_context_ref: "/api/vrfcontext?name={{ t1_id }}"
+
+    - name: "IPAM profile for {{ cloud_name }}"
+      vmware.alb.avi_ipamdnsproviderprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "{{ ipam_profile_name }}"
+        type: IPAMDNS_TYPE_INTERNAL
+        internal_profile:
+          ttl: 30
+          usable_networks:
+            - nw_ref: "/api/network?name={{ vip_network_name }}"
+
+    - name: "DNS profile for {{ cloud_name }} - serves lb.site-a.vcf.lab, vks1.site-a.vcf.lab, vks2.site-a.vcf.lab"
+      vmware.alb.avi_ipamdnsproviderprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "{{ dns_profile_name }}"
+        type: IPAMDNS_TYPE_INTERNAL_DNS
+        internal_profile:
+          ttl: 30
+          dns_service_domain:
+            - domain_name: lb.site-a.vcf.lab
+              pass_through: true
+            - domain_name: vks1.site-a.vcf.lab
+              pass_through: true
+            - domain_name: vks2.site-a.vcf.lab
+              pass_through: true
+        tenant: admin
+
+    - name: "Wire IPAM/DNS profiles into the cloud"
+      vmware.alb.avi_cloud:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: "{{ cloud_name }}"
+        dns_provider_ref: "/api/ipamdnsproviderprofile?name={{ dns_profile_name }}"
+        ipam_provider_ref: "/api/ipamdnsproviderprofile?name={{ ipam_profile_name }}"
+
+    # self_se_election is the only field changed here (false -> true, per
+    # instruction). Every other field is left at its current live value -
+    # do NOT revert disk/memory/max_vs_per_se/deprovision_delay to the
+    # original template's sizing.
+    - name: "Default-Group SE group sizing for {{ cloud_name }}"
+      vmware.alb.avi_serviceenginegroup:
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        avi_credentials: "{{ avi_credentials }}"
+        name: Default-Group
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        se_name_prefix: "Avi"
+        disk_per_se: 15
+        cpu_reserve: false
+        mem_reserve: true
+        vcpus_per_se: 1
+        memory_per_se: 2048
+        max_vs_per_se: 100
+        self_se_election: true
+        se_deprovision_delay: 120
+
+    # gslb01a is a separate, dedicated GSLB SE group on this cloud (missed
+    # entirely in the original snapshot - it doesn't exist in avi_config.yml
+    # at all). Same rule: only self_se_election changes (false -> true);
+    # its memory_per_se is already correctly at 8GB and is left untouched.
+    - name: "gslb01a SE group sizing for {{ cloud_name }}"
+      vmware.alb.avi_serviceenginegroup:
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        avi_credentials: "{{ avi_credentials }}"
+        name: gslb01a
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        se_name_prefix: "gslb01a"
+        disk_per_se: 25
+        cpu_reserve: false
+        mem_reserve: false
+        vcpus_per_se: 1
+        memory_per_se: 8192
+        extra_shared_config_memory: 2000
+        max_vs_per_se: 10
+        self_se_election: true
+        se_deprovision_delay: 120
+
+    # True-Client-IP / HSTS tweak from avi_tweaks.yml, applied here as
+    # template-intended (this was missing live - hsts_enabled was true and
+    # use_true_client_ip was false on both profiles before this).
+    - name: "System-Secure-HTTP application profile - true-client-IP + HSTS tweak"
+      vmware.alb.avi_applicationprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: System-Secure-HTTP
+        type: APPLICATION_PROFILE_TYPE_HTTP
+        http_profile:
+          hsts_enabled: false
+          true_client_ip:
+            direction: LEFT
+            headers:
+              - X-Forwarded-For
+            index_in_header: 1
+          use_true_client_ip: true
+
+    - name: "System-HTTP application profile - true-client-IP tweak"
+      vmware.alb.avi_applicationprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: System-HTTP
+        type: APPLICATION_PROFILE_TYPE_HTTP
+        http_profile:
+          true_client_ip:
+            direction: LEFT
+            headers:
+              - X-Forwarded-For
+            index_in_header: 1
+          use_true_client_ip: true
+
+    # -----------------------------------------------------------------
+    # System-DNS is a system-default object but has been heavily
+    # customized here, and this is the piece that was actually BROKEN and
+    # manually fixed on this pod: each dns_zones entry's name_server had
+    # been left as the bare domain_name (e.g. "lb.site-a.vcf.lab"), which
+    # is wrong - name_server needs to be the FQDN of the DNS virtual
+    # service actually answering for that zone. It's now
+    # "dns-vs-01a.site-a.vcf.lab" for the site/VKS zones, and
+    # "global-dns-vs-01a.site-a.vcf.lab" for global.vcf.lab specifically.
+    # The mgmt-domain controller's System-DNS (avi_config_mgmt_a.yml) was
+    # NOT affected by this and is documented there with its original,
+    # still-correct values.
+    # -----------------------------------------------------------------
+    - name: "System-DNS application profile (current live state - authoritative zones for dns-vs-01a)"
+      vmware.alb.avi_applicationprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: System-DNS
+        type: APPLICATION_PROFILE_TYPE_DNS
+        dns_service_profile:
+          aaaa_empty_response: true
+          admin_email: hostmaster
+          client_dns_tcp_request_timeout: 10000
+          close_tcp_connection_post_response: false
+          dns_over_tcp_enabled: true
+          ecs_stripping_enabled: true
+          edns: true
+          error_response: DNS_ERROR_RESPONSE_NONE
+          negative_caching_ttl: 30
+          num_dns_ip: 1
+          ttl: 30
+          domain_names:
+            - lb.site-a.vcf.lab
+            - global.vcf.lab
+            - vks1.site-a.vcf.lab
+            - vks1.vcf.lab
+            - vks2.vcf.lab
+            - vks2.site-a.vcf.lab
+          dns_zones:
+            - domain_name: lb.site-a.vcf.lab
+              name_server: dns-vs-01a.site-a.vcf.lab
+              admin_email: hostmaster
+            - domain_name: global.vcf.lab
+              name_server: global-dns-vs-01a.site-a.vcf.lab
+              admin_email: hostmaster
+            - domain_name: vks1.site-a.vcf.lab
+              name_server: dns-vs-01a.site-a.vcf.lab
+              admin_email: hostmaster
+            - domain_name: vks1.vcf.lab
+              name_server: dns-vs-01a.site-a.vcf.lab
+              admin_email: hostmaster
+            - domain_name: vks2.site-a.vcf.lab
+              name_server: dns-vs-01a.site-a.vcf.lab
+              admin_email: hostmaster
+            - domain_name: vks2.vcf.lab
+              name_server: dns-vs-01a.site-a.vcf.lab
+              admin_email: hostmaster
+
+    # Two proxy-protocol L4 app profiles exist on this cloud named after
+    # object hashes (e.g. "8c8c72b5-66f-proxy-applicationprofile"). They're
+    # auto-created by the Supervisor's LB integration for its own services
+    # (proxy_protocol_enabled: true, version 1) - not user-managed, not
+    # included here.
+
+    - name: "System-Standard SSL profile"
+      vmware.alb.avi_sslprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: System-Standard
+        accepted_versions:
+          - type: SSL_VERSION_TLS1_2
+          - type: SSL_VERSION_TLS1_3
+        cipher_enums:
+          - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+          - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+          - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+          - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+          - TLS_AES_128_GCM_SHA256
+          - TLS_CHACHA20_POLY1305_SHA256
+          - TLS_AES_256_GCM_SHA384
+        ciphersuites: "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256"
+
+    # sslkeyandcertificate: private keys never read back from the API
+    # ("<sensitive>"). These tasks re-upload from the same local PEM files
+    # used originally - adjust the lookup() paths if those files moved.
+    - name: "CA cert - vcf_lab_root"
+      vmware.alb.avi_sslkeyandcertificate:
+        avi_credentials: "{{ avi_credentials }}"
+        certificate:
+          certificate: "{{ lookup('file', '/lmchol/hol/ca/ca.crt') }}"
+        type: SSL_CERTIFICATE_TYPE_CA
+        name: vcf_lab_root
+        tenant: admin
+
+    - name: "App cert - hol_wildcard (used by demo_vs)"
+      vmware.alb.avi_sslkeyandcertificate:
+        avi_credentials: "{{ avi_credentials }}"
+        key: "{{ lookup('file', '/lmchol/hol/sslcerts/avi_wildcardcert_key.pem') }}"
+        key_passphrase: ""
+        certificate:
+          certificate: "{{ lookup('file', '/lmchol/hol/sslcerts/avi_wildcardcert.pem') }}"
+        type: SSL_CERTIFICATE_TYPE_VIRTUALSERVICE
+        name: hol_wildcard
+        tenant: admin
+
+    - name: "Pool: demo_vs-Pool"
+      vmware.alb.avi_pool:
+        avi_credentials: "{{ avi_credentials }}"
+        name: demo_vs-Pool
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        health_monitor_refs:
+          - /api/healthmonitor?name=System-HTTP
+        lb_algorithm: LB_ALGORITHM_LEAST_CONNECTIONS
+        tier1_lr: "/infra/tier-1s/{{ t1_id }}"
+        default_server_port: "{{ worker_port }}"
+        servers:
+          - ip:
+              addr: "{{ worker1 }}"
+              type: V4
+          - ip:
+              addr: "{{ worker2 }}"
+              type: V4
+        tenant: admin
+
+    - name: "VsVip: dns-vs-01a-VsVip"
+      vmware.alb.avi_vsvip:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "dns-vs-01{{ site_letter }}-VsVip"
+        vrf_context_ref: "/api/vrfcontext/?name={{ t1_id }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        tier1_lr: "/infra/tier-1s/{{ t1_id }}"
+        vip:
+          - vip_id: '1'
+            ip_address:
+              addr: "{{ dns_vs_ip }}"
+              type: V4
+            enabled: true
+            auto_allocate_ip: false
+            auto_allocate_floating_ip: false
+            avi_allocated_vip: false
+            avi_allocated_fip: false
+            auto_allocate_ip_type: V4_ONLY
+            prefix_length: 32
+        dns_info:
+          - fqdn: "{{ dns_vs_fqdn }}"
+            ttl: 30
+            type: DNS_RECORD_A
+            algorithm: DNS_RECORD_RESPONSE_CONSISTENT_HASH
+        tenant: admin
+
+    - name: "VsVip: demo_vs-VsVip"
+      vmware.alb.avi_vsvip:
+        avi_credentials: "{{ avi_credentials }}"
+        name: demo_vs-VsVip
+        vrf_context_ref: "/api/vrfcontext?name={{ t1_id }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        tier1_lr: "/infra/tier-1s/{{ t1_id }}"
+        vip:
+          - vip_id: '1'
+            ip_address:
+              addr: "{{ demo_vs_ip }}"
+              type: V4
+            enabled: true
+            auto_allocate_ip: false
+            auto_allocate_floating_ip: false
+            avi_allocated_vip: false
+            avi_allocated_fip: false
+            auto_allocate_ip_type: V4_ONLY
+            prefix_length: 32
+        dns_info:
+          - fqdn: "{{ demo_vs_fqdn }}"
+            ttl: 30
+            type: DNS_RECORD_A
+            algorithm: DNS_RECORD_RESPONSE_CONSISTENT_HASH
+        tenant: admin
+
+    - name: "VirtualService: dns-vs-01a"
+      vmware.alb.avi_virtualservice:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "dns-vs-01{{ site_letter }}"
+        application_profile_ref: /api/applicationprofile?name=System-DNS
+        network_profile_ref: /api/networkprofile?name=System-UDP-Per-Pkt
+        se_group_ref: /api/serviceenginegroup?name=Default-Group
+        vrf_context_ref: "/api/vrfcontext?name={{ t1_id }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        analytics_profile_ref: /api/analyticsprofile?name=System-Analytics-Profile
+        vsvip_ref: "/api/vsvip?name=dns-vs-01{{ site_letter }}-VsVip"
+        services:
+          - port: 53
+            port_range_end: 53
+            enable_ssl: false
+          - port: 53
+            port_range_end: 53
+            enable_ssl: false
+            override_network_profile_ref: /api/networkprofile?name=System-TCP-Proxy
+        analytics_policy:
+          full_client_logs:
+            enabled: true
+            duration: 0
+            throttle: 10
+          client_insights: NO_INSIGHTS
+          all_headers: false
+          metrics_realtime_update:
+            enabled: false
+            duration: 0
+          udf_log_throttle: 10
+          significant_log_throttle: 10
+          learning_log_policy:
+            enabled: false
+        tenant: admin
+
+    # demo_vs is intentionally site-A only (workload domain) - there is no
+    # equivalent task in avi_config_mgmt_a.yml, and there shouldn't be one.
+    - name: "VirtualService: demo_vs"
+      vmware.alb.avi_virtualservice:
+        avi_credentials: "{{ avi_credentials }}"
+        name: demo_vs
+        enabled: true
+        application_profile_ref: /api/applicationprofile?name=System-Secure-HTTP
+        se_group_ref: /api/serviceenginegroup?name=Default-Group
+        vrf_context_ref: "/api/vrfcontext?name={{ t1_id }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        analytics_profile_ref: /api/analyticsprofile?name=System-Analytics-Profile
+        vsvip_ref: /api/vsvip?name=demo_vs-VsVip
+        services:
+          - port: 80
+            enable_ssl: false
+            port_range_end: 80
+          - port: 443
+            enable_ssl: true
+            port_range_end: 443
+        analytics_policy:
+          full_client_logs:
+            enabled: true
+            duration: 0
+            throttle: 10
+          client_insights: NO_INSIGHTS
+          all_headers: false
+          metrics_realtime_update:
+            enabled: true
+            duration: 0
+          udf_log_throttle: 10
+          significant_log_throttle: 10
+          learning_log_policy:
+            enabled: false
+        network_profile_ref: /api/networkprofile?name=System-TCP-Proxy
+        pool_ref: /api/pool?name=demo_vs-Pool
+        ssl_key_and_certificate_refs:
+          - /api/sslkeyandcertificate?name=hol_wildcard
+          - /api/sslkeyandcertificate?name=System-Default-Cert-EC
+        ssl_profile_ref: /api/sslprofile?name=System-Standard
+        tenant: admin
+
+    # Registers dns-vs-01a as this controller's DNS virtualservice. Scoped to
+    # ONLY this field (avi_api_patch_op: add, matching the original template) -
+    # does not touch portal_configuration or any other systemconfiguration
+    # field. The portal's own SSL cert is provisioned by VCF on this
+    # (9.1+) build and must NOT be overwritten here.
+    - name: "Register dns-vs-01a as the DNS virtualservice"
+      vmware.alb.avi_systemconfiguration:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: add
+        avi_api_update_method: patch
+        dns_virtualservice_refs:
+          - "/api/virtualservice?name=dns-vs-01{{ site_letter }}"
+
+    # -----------------------------------------------------------------
+    # Observed but unmanaged (Supervisor/VKS-owned, recreated automatically
+    # if deleted - listed here purely so a human reading this file knows
+    # they're expected, not orphaned config):
+    #   Pools/VsVips/VirtualServices prefixed "5dcb84b1-dbd--..." and
+    #   "8c8c72b5-66f-..." backing:
+    #     - kube-system/kube-apiserver-lb-svc  (6443, 443)
+    #     - kube-system/kube-dns-lb            (53 udp/tcp)
+    #     - kube-system/docker-registry        (5000)
+    #     - kube-system/mgmt-image-proxy       (443)
+    #     - svc-harbor-*/harbor-nginx          (443)
+    #     - svc-metrics-aggregator-*/workload-metrics-loadbalancer (10093)
+    # -----------------------------------------------------------------

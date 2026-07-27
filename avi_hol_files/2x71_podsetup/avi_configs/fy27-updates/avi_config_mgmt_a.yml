@@ -1,0 +1,325 @@
+# Self-documenting playbook for the management-domain Avi Controller
+# (alb-b.site-a.vcf.lab, cluster "mgmt-avi" / cloud "Cloud-nsx-mgmt-a").
+# Meant to run every time the pod starts, same as avi_config_wld_a.yml - see
+# that file's header for the full rationale on what's template-intent vs.
+# preserved-live-value and why. Same exclusions apply here: no licensing
+# task (VCF-managed subscription license), no full systemconfiguration
+# bootstrap replay (only the scoped dns_virtualservice_refs registration),
+# no portal-cert changes (VCF-provisioned on this 9.1+ build), and
+# sslkeyandcertificate tasks assume the original local PEM files still exist.
+#
+# This controller is much simpler than the workload-domain one: no demo_vs,
+# no pool, no Supervisor/VKS-managed objects - just the DNS virtual service
+# (dns-vs-01b) and the cloud/network/SE-group plumbing underneath it.
+---
+- hosts: localhost
+  connection: local
+  gather_facts: no
+  vars_files:
+    - inv_mgmt_a.yml
+  vars:
+    avi_credentials:
+      controller: "{{ avi_controller }}"
+      username: admin
+      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      api_version: "{{ api_version }}"
+
+  collections:
+    - vmware.alb
+
+  tasks:
+    - name: "Wait for the portal to become active"
+      uri:
+        url: "https://{{ avi_controller_fqdn }}/api/initial-data"
+        validate_certs: no
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 300
+      delay: 10
+
+    - name: "Controller properties (template intent - was missing live, now enforced)"
+      vmware.alb.avi_controllerproperties:
+        avi_credentials: "{{ avi_credentials }}"
+        shared_ssl_certificates: true
+        api_idle_timeout: 1440
+
+    - name: "Backup configuration - SFTP to SDDC Manager's NFS-backed backup share"
+      vmware.alb.avi_backupconfiguration:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "Backup-Configuration"
+        save_local: true
+        upload_to_remote_host: true
+        remote_file_transfer_protocol: SFTP
+        remote_hostname: sddcmanager-a.site-a.vcf.lab
+        remote_directory: "/nfs/vmware/vcf/nfs-mount/backup/avi_backup/alb-02a.site-a.vcf.lab"
+        maximum_backups_stored: 4
+        # ssh_user_ref's password is a cloudconnectoruser credential managed
+        # by SDDC Manager; it reads back "<sensitive>" and can't be captured.
+        backup_passphrase: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+
+    - name: "VIP/SE data network - {{ vip_network_name }}"
+      vmware.alb.avi_network:
+        avi_credentials: "{{ avi_credentials }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        name: "{{ vip_network_name }}"
+        dhcp_enabled: true
+        exclude_discovered_subnets: false
+        ip6_autocfg_enabled: false
+        configured_subnets:
+          - prefix:
+              ip_addr:
+                addr: "{{ vip_network_subnet }}"
+                type: V4
+              mask: "{{ vip_network_mask }}"
+            static_ip_ranges:
+              - range:
+                  begin:
+                    addr: "{{ vip_se_range_begin }}"
+                    type: V4
+                  end:
+                    addr: "{{ vip_se_range_end }}"
+                    type: V4
+                type: "STATIC_IPS_FOR_VIP_AND_SE"
+
+    - name: "IPAM profile for {{ cloud_name }}"
+      vmware.alb.avi_ipamdnsproviderprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "{{ ipam_profile_name }}"
+        type: IPAMDNS_TYPE_INTERNAL
+        internal_profile:
+          ttl: 30
+          usable_networks:
+            - nw_ref: "/api/network?name={{ vip_network_name }}"
+
+    - name: "DNS profile for {{ cloud_name }} - serves lb.site-b.vcf.lab"
+      vmware.alb.avi_ipamdnsproviderprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "{{ dns_profile_name }}"
+        type: IPAMDNS_TYPE_INTERNAL_DNS
+        internal_profile:
+          ttl: 30
+          dns_service_domain:
+            - domain_name: lb.site-b.vcf.lab
+              pass_through: true
+        tenant: admin
+
+    - name: "Wire IPAM/DNS profiles into the cloud"
+      vmware.alb.avi_cloud:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: "{{ cloud_name }}"
+        dns_provider_ref: "/api/ipamdnsproviderprofile?name={{ dns_profile_name }}"
+        ipam_provider_ref: "/api/ipamdnsproviderprofile?name={{ ipam_profile_name }}"
+
+    # self_se_election is the only field changed here (false -> true, per
+    # instruction). Every other field is left at its current live value -
+    # do NOT revert disk/memory/max_vs_per_se/deprovision_delay to the
+    # original template's sizing.
+    - name: "Default-Group SE group sizing for {{ cloud_name }}"
+      vmware.alb.avi_serviceenginegroup:
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        avi_credentials: "{{ avi_credentials }}"
+        name: Default-Group
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        se_name_prefix: "Avi"
+        disk_per_se: 15
+        cpu_reserve: false
+        mem_reserve: true
+        vcpus_per_se: 1
+        memory_per_se: 2048
+        max_vs_per_se: 100
+        self_se_election: true
+        se_deprovision_delay: 120
+
+    # gslb01b is a separate, dedicated GSLB SE group on this cloud (missed
+    # entirely in the original snapshot, same as gslb01a on the workload
+    # domain - it doesn't exist in avi_config.yml at all). Same rule: only
+    # self_se_election changes (false -> true); its memory_per_se is already
+    # correctly at 8GB and is left untouched.
+    - name: "gslb01b SE group sizing for {{ cloud_name }}"
+      vmware.alb.avi_serviceenginegroup:
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        avi_credentials: "{{ avi_credentials }}"
+        name: gslb01b
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        se_name_prefix: "gslb01b"
+        disk_per_se: 25
+        cpu_reserve: false
+        mem_reserve: false
+        vcpus_per_se: 1
+        memory_per_se: 8192
+        extra_shared_config_memory: 2000
+        max_vs_per_se: 10
+        self_se_election: true
+        se_deprovision_delay: 120
+
+    # True-Client-IP / HSTS tweak from avi_tweaks.yml, applied here as
+    # template-intended (was missing live on this controller too -
+    # hsts_enabled was true and use_true_client_ip was false on both
+    # profiles before this).
+    - name: "System-Secure-HTTP application profile - true-client-IP + HSTS tweak"
+      vmware.alb.avi_applicationprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: System-Secure-HTTP
+        type: APPLICATION_PROFILE_TYPE_HTTP
+        http_profile:
+          hsts_enabled: false
+          true_client_ip:
+            direction: LEFT
+            headers:
+              - X-Forwarded-For
+            index_in_header: 1
+          use_true_client_ip: true
+
+    - name: "System-HTTP application profile - true-client-IP tweak"
+      vmware.alb.avi_applicationprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: System-HTTP
+        type: APPLICATION_PROFILE_TYPE_HTTP
+        http_profile:
+          true_client_ip:
+            direction: LEFT
+            headers:
+              - X-Forwarded-For
+            index_in_header: 1
+          use_true_client_ip: true
+
+    # System-DNS here got the same DNS-delegation fix as the workload-domain
+    # controller (see avi_config_wld_a.yml): each zone's name_server now
+    # points at the real DNS VS FQDN - "dns-vs-01b.site-b.vcf.lab" for the
+    # site zone, "global-dns-vs-01b.site-b.vcf.lab" for global.vcf.lab -
+    # instead of repeating the bare domain_name.
+    - name: "System-DNS application profile (current live state - authoritative zones for dns-vs-01b)"
+      vmware.alb.avi_applicationprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        name: System-DNS
+        type: APPLICATION_PROFILE_TYPE_DNS
+        dns_service_profile:
+          aaaa_empty_response: true
+          admin_email: hostmaster
+          client_dns_tcp_request_timeout: 10000
+          close_tcp_connection_post_response: false
+          dns_over_tcp_enabled: true
+          ecs_stripping_enabled: true
+          edns: true
+          error_response: DNS_ERROR_RESPONSE_NONE
+          negative_caching_ttl: 30
+          num_dns_ip: 1
+          ttl: 30
+          domain_names:
+            - lb.site-b.vcf.lab
+            - global.vcf.lab
+          dns_zones:
+            - domain_name: lb.site-b.vcf.lab
+              name_server: dns-vs-01b.site-b.vcf.lab
+              admin_email: hostmaster
+            - domain_name: global.vcf.lab
+              name_server: global-dns-vs-01b.site-b.vcf.lab
+              admin_email: hostmaster
+
+    # sslkeyandcertificate: private keys never read back from the API
+    # ("<sensitive>"). These tasks re-upload from the same local PEM files
+    # used originally - adjust the lookup() paths if those files moved.
+    - name: "CA cert - vcf_root_ca"
+      vmware.alb.avi_sslkeyandcertificate:
+        avi_credentials: "{{ avi_credentials }}"
+        certificate:
+          certificate: "{{ lookup('file', '/lmchol/hol/ca/ca.crt') }}"
+        type: SSL_CERTIFICATE_TYPE_CA
+        name: vcf_root_ca
+        tenant: admin
+
+    - name: "App cert - hol_wildcard"
+      vmware.alb.avi_sslkeyandcertificate:
+        avi_credentials: "{{ avi_credentials }}"
+        key: "{{ lookup('file', '/lmchol/hol/sslcerts/avi_wildcardcert_key.pem') }}"
+        key_passphrase: ""
+        certificate:
+          certificate: "{{ lookup('file', '/lmchol/hol/sslcerts/avi_wildcardcert.pem') }}"
+        type: SSL_CERTIFICATE_TYPE_VIRTUALSERVICE
+        name: hol_wildcard
+        tenant: admin
+
+    - name: "VsVip: dns-vs-01b-VsVip"
+      vmware.alb.avi_vsvip:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "dns-vs-01{{ site_letter }}-VsVip"
+        vrf_context_ref: "/api/vrfcontext?name={{ t1_id }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        tier1_lr: "/infra/tier-1s/{{ t1_id }}"
+        vip:
+          - vip_id: '1'
+            ip_address:
+              addr: "{{ dns_vs_ip }}"
+              type: V4
+            enabled: true
+            auto_allocate_ip: false
+            auto_allocate_floating_ip: false
+            avi_allocated_vip: false
+            avi_allocated_fip: false
+            auto_allocate_ip_type: V4_ONLY
+            prefix_length: 32
+        dns_info:
+          - fqdn: "{{ dns_vs_fqdn }}"
+            ttl: 30
+            type: DNS_RECORD_A
+            algorithm: DNS_RECORD_RESPONSE_CONSISTENT_HASH
+        tenant: admin
+
+    - name: "VirtualService: dns-vs-01b"
+      vmware.alb.avi_virtualservice:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "dns-vs-01{{ site_letter }}"
+        application_profile_ref: /api/applicationprofile?name=System-DNS
+        network_profile_ref: /api/networkprofile?name=System-UDP-Per-Pkt
+        se_group_ref: /api/serviceenginegroup?name=Default-Group
+        vrf_context_ref: "/api/vrfcontext?name={{ t1_id }}"
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        analytics_profile_ref: /api/analyticsprofile?name=System-Analytics-Profile
+        vsvip_ref: "/api/vsvip?name=dns-vs-01{{ site_letter }}-VsVip"
+        services:
+          - port: 53
+            port_range_end: 53
+            enable_ssl: false
+          - port: 53
+            port_range_end: 53
+            enable_ssl: false
+            override_network_profile_ref: /api/networkprofile?name=System-TCP-Proxy
+        analytics_policy:
+          full_client_logs:
+            enabled: true
+            duration: 0
+            throttle: 10
+          client_insights: NO_INSIGHTS
+          all_headers: false
+          metrics_realtime_update:
+            enabled: false
+            duration: 0
+          udf_log_throttle: 10
+          significant_log_throttle: 10
+          learning_log_policy:
+            enabled: false
+        tenant: admin
+
+    # Registers dns-vs-01b as this controller's DNS virtualservice. Scoped to
+    # ONLY this field (avi_api_patch_op: add, matching the original template) -
+    # does not touch portal_configuration or any other systemconfiguration
+    # field. The portal's own SSL cert is provisioned by VCF on this
+    # (9.1+) build and must NOT be overwritten here.
+    - name: "Register dns-vs-01b as the DNS virtualservice"
+      vmware.alb.avi_systemconfiguration:
+        avi_credentials: "{{ avi_credentials }}"
+        avi_api_patch_op: add
+        avi_api_update_method: patch
+        dns_virtualservice_refs:
+          - "/api/virtualservice?name=dns-vs-01{{ site_letter }}"
