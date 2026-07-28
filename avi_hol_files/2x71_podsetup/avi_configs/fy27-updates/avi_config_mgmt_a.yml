@@ -229,20 +229,22 @@
               admin_email: hostmaster
 
     # sslkeyandcertificate: private keys never read back from the API
-    # ("<sensitive>"). These tasks re-upload from local PEM files on the
-    # jump host.
+    # ("<sensitive>"). These tasks re-upload from local PEM files.
     #
-    # NOTE: the "/lmchol/..." paths in the original pre-fy27 template were
-    # never valid here - /lmchol only exists on the LAB MANAGER's view of
-    # the Console VM's filesystem (see lab-update.sh's comment), a bind
-    # mount used by the old register_wrapper.py workflow, which ran from
-    # the lab manager. This playbook runs directly on the jump host/console
-    # via adjustomatic.py, so it needs the console's own local paths.
+    # NOTE: adjustomatic.py (which runs these playbooks) executes on the LAB
+    # MANAGER, not the jump host/console - confirmed by actually running it.
+    # /lmchol on manager is a bind mount of the Console VM's root filesystem
+    # (see lab-update.sh's comment), so "/lmchol/hol/..." IS the right way
+    # to reach the console's real /hol/... files from here. An earlier
+    # revision of this playbook "fixed" these paths to drop the /lmchol
+    # prefix on the theory that this ran on the console directly - that
+    # theory was wrong; confirmed by actually running adjustomatic.py end
+    # to end and watching this exact task fail without the prefix.
     - name: "CA cert - vcf_root_ca"
       vmware.alb.avi_sslkeyandcertificate:
         avi_credentials: "{{ avi_credentials }}"
         certificate:
-          certificate: "{{ lookup('file', '/hol/ssl/ca.crt') }}"
+          certificate: "{{ lookup('file', '/lmchol/hol/ssl/ca.crt') }}"
         type: SSL_CERTIFICATE_TYPE_CA
         name: vcf_root_ca
         tenant: admin
@@ -254,10 +256,10 @@
     - name: "App cert - hol_wildcard"
       vmware.alb.avi_sslkeyandcertificate:
         avi_credentials: "{{ avi_credentials }}"
-        key: "{{ lookup('file', '/home/holuser/certificates/wildcard_key.pem') }}"
+        key: "{{ lookup('file', '/lmchol/home/holuser/certificates/wildcard_key.pem') }}"
         key_passphrase: ""
         certificate:
-          certificate: "{{ lookup('file', '/home/holuser/certificates/wildcard_cert.pem') }}"
+          certificate: "{{ lookup('file', '/lmchol/home/holuser/certificates/wildcard_cert.pem') }}"
         type: SSL_CERTIFICATE_TYPE_VIRTUALSERVICE
         name: hol_wildcard
         tenant: admin
