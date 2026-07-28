@@ -48,11 +48,17 @@ all:
         - vks1.site-a.vcf.lab
         - vks2.site-a.vcf.lab
 
-      # demo_vs / dns-vs-01a application VIPs
+      # demo_vs / dns-vs-01a application VIPs. Must be sub-domains of one of
+      # the DNS profile's dns_service_domain entries above (lb.site-a.vcf.lab
+      # here) - Avi rejects creating a VsVip whose dns_info fqdn doesn't
+      # match any configured sub-domain. The bare "...site-a.vcf.lab" forms
+      # (no ".lb.") seen on some already-existing pods don't recreate
+      # cleanly under the current DNS profile; confirmed by actually running
+      # this against a fresh pod.
       dns_vs_ip: 10.1.13.135
-      dns_vs_fqdn: dns-vs-01a.site-a.vcf.lab
+      dns_vs_fqdn: dns-vs-01a.lb.site-a.vcf.lab
       demo_vs_ip: 10.1.13.136
-      demo_vs_fqdn: demo_vs.site-a.vcf.lab
+      demo_vs_fqdn: demo_vs.lb.site-a.vcf.lab
       worker1: 10.1.13.11
       worker2: 10.1.13.12
       worker_port: 30001

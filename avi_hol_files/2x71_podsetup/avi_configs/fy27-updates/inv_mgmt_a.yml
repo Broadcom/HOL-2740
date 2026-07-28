@@ -39,8 +39,11 @@ all:
       dns_service_domains:
         - lb.site-b.vcf.lab   # yes, "site-b" — that's what's actually configured on this mgmt-domain (site-a) controller
 
+      # Must be a sub-domain of the DNS profile's dns_service_domain entry
+      # above (lb.site-b.vcf.lab) - see the matching comment in
+      # inv_wld_a.yml for why (confirmed by running against a fresh pod).
       dns_vs_ip: 10.1.14.135
-      dns_vs_fqdn: dns-vs-01b.site-b.vcf.lab
+      dns_vs_fqdn: dns-vs-01b.lb.site-b.vcf.lab
 
       # No demo_vs / pool / workers on this controller — mgmt domain Avi only
       # hosts the DNS virtual service today.

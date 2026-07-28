@@ -66,10 +66,14 @@ against a specific pod, that jump-host split is the most likely reason.
   integration — managing them here would fight the platform. They're listed
   in a comment at the bottom of `avi_config_wld_a.yml` for reference.
 - **Cert private key material.** Avi never returns private keys via the API
-  (`"<sensitive>"` on every read). The `sslkeyandcertificate` tasks assume the
-  same local PEM files used at initial buildout (`/lmchol/hol/...`) are still
-  present; if those are gone, this playbook can't recreate the certs from
-  what's on the controller alone.
+  (`"<sensitive>"` on every read). The `sslkeyandcertificate` tasks read the
+  vault-created wildcard cert/key from `/home/holuser/certificates/` and the
+  root CA cert from `/hol/ssl/ca.crt` on the jump host itself (these
+  playbooks run directly on the console via `adjustomatic.py`, not from a
+  lab manager with `/lmchol` bind-mounted — the original pre-fy27 template's
+  `/lmchol/hol/...` paths never applied here and were a real bug, caught by
+  actually running this against a live pod). If those files are gone, this
+  playbook can't recreate the certs from what's on the controller alone.
 
 ## Usage
 
