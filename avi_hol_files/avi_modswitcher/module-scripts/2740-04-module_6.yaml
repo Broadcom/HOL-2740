@@ -26,42 +26,42 @@
       when: statfile_exists.stat.exists
 
   roles:
-    - role: 2671-01 
+    - role: 2740-03 
       vars:
         region: 'b'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-01
+    - role: 2740-03
       vars:
         region: 'a'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-02_module_1
+    - role: 2740-04_module_1
       vars:
         region: 'b'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-02_module_1
+    - role: 2740-04_module_1
       vars:
         region: 'a'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-02_module_2
+    - role: 2740-04_module_2
       vars:
         region: 'a'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-02_module_3
+    - role: 2740-04_module_3
       vars:
         region: 'a'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-02_module_4
+    - role: 2740-04_module_4
       vars:
         region: 'a'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-02_module_5
+    - role: 2740-04_module_5
       vars:
         region: 'a'
         file_name: "GeoLite2-City-CSV_20190924.zip"

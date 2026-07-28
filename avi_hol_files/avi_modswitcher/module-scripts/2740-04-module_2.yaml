@@ -26,22 +26,22 @@
       when: statfile_exists.stat.exists
       
   roles:
-    - role: 2671-01 
+    - role: 2740-03
       vars:
         region: 'b'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-01
+    - role: 2740-03
       vars:
         region: 'a'
         avi_role_config_log_mode: 'False'
 
-    - role: 2671-02_module_1
+    - role: 2740-04_module_1
       vars:
         region: 'b'
         avi_role_config_log_mode: 'False'
         
-    - role: 2671-02_module_1
+    - role: 2740-04_module_1
       vars:
         region: 'a'
         avi_role_config_log_mode: 'False'
