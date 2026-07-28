@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: avimart-backend-secret
+  namespace: avimart
+type: Opaque
+data:
+  JWT_SECRET: Y2hhbmdlLW1lLWluLXByb2R1Y3Rpb24=
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-svc
+  namespace: avimart
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-svc
+  template:
+    metadata:
+      labels:
+        app: auth-svc
+        tier: app
+    spec:
+      containers:
+      - name: auth-svc
+        image: chrismentjox/avimart:auth-svc-v1
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: avimart-db-secret
+              key: DATABASE_URL
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: avimart-backend-secret
+              key: JWT_SECRET
+        resources:
+          requests: { cpu: 100m, memory: 128Mi }
+          limits:   { cpu: 300m, memory: 256Mi }
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-svc
+  namespace: avimart
+spec:
+  selector:
+    app: auth-svc
+  ports:
+  - port: 8080
+    targetPort: 8080

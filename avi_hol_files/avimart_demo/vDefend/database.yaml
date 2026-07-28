@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: avimart-db-secret
+  namespace: avimart
+type: Opaque
+data:
+  POSTGRES_USER: YXZpbWFydA==
+  POSTGRES_PASSWORD: YXZpbWFydDEyMw==
+  POSTGRES_DB: YXZpbWFydA==
+  DATABASE_URL: cG9zdGdyZXM6Ly9hdmltYXJ0OmF2aW1hcnQxMjNAYXZpbWFydC1kYjo1NDMyL2F2aW1hcnQ=
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: avimart-db-pvc
+  namespace: avimart
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: vsan-default-storage-policy
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: avimart-db-init
+  namespace: avimart
+data:
+  init.sql: |
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL,
+      email VARCHAR(100) UNIQUE NOT NULL, password VARCHAR(255) NOT NULL,
+      role VARCHAR(20) DEFAULT 'user', created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS products (
+      id SERIAL PRIMARY KEY, name VARCHAR(200) NOT NULL, description TEXT,
+      price DECIMAL(10,2) NOT NULL, category VARCHAR(50), stock INTEGER DEFAULT 100,
+      image_color VARCHAR(20) DEFAULT '#0ea5e9', image_icon VARCHAR(10) DEFAULT '🛡️',
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS reviews (
+      id SERIAL PRIMARY KEY, product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+      username VARCHAR(50), rating INTEGER CHECK (rating BETWEEN 1 AND 5),
+      comment TEXT, created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS cart_items (
+      id SERIAL PRIMARY KEY, session_id VARCHAR(100),
+      product_id INTEGER REFERENCES products(id) ON DELETE CASCADE,
+      quantity INTEGER DEFAULT 1, created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id),
+      session_id VARCHAR(100), total DECIMAL(10,2),
+      status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP DEFAULT NOW(),
+      shipping_address TEXT, credit_card VARCHAR(20)
+    );
+    CREATE TABLE IF NOT EXISTS order_items (
+      id SERIAL PRIMARY KEY, order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+      product_id INTEGER REFERENCES products(id),
+      quantity INTEGER, price DECIMAL(10,2)
+    );
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: avimart-db
+  namespace: avimart
+spec:
+  serviceName: avimart-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: avimart-db
+  template:
+    metadata:
+      labels:
+        app: avimart-db
+        tier: database
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        envFrom:
+        - secretRef:
+            name: avimart-db-secret
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: init-sql
+          mountPath: /docker-entrypoint-initdb.d
+        resources:
+          requests: { cpu: 200m, memory: 256Mi }
+          limits:   { cpu: 1000m, memory: 1Gi }
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "avimart"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: avimart-db-pvc
+      - name: init-sql
+        configMap:
+          name: avimart-db-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: avimart-db
+  namespace: avimart
+spec:
+  selector:
+    app: avimart-db
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None

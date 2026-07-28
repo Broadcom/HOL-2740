@@ -1,0 +1,8 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Enable SSL termination
+      ansible.builtin.fail:
+        msg: "cert 'lab-demo.pem' not found"

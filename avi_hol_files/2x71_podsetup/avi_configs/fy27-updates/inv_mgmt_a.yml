@@ -1,0 +1,49 @@
+# Inventory / vars for the management-domain Avi Controller (alb-b.site-a.vcf.lab).
+#
+# Captured directly from the live controller via the Avi REST API on 2026-07-27.
+all:
+  hosts:
+    localhost:
+      ansible_python_interpreter: "{{ansible_playbook_python}}"
+
+      cloud_name: Cloud-nsx-mgmt-a
+      # NOTE: this is physically the "site-a" mgmt domain, but its Avi VS/DNS
+      # objects are named/suffixed "...01b" / "site-b.vcf.lab" - that's the
+      # live naming convention (mgmt domain = "b"), not a typo.
+      site_letter: b
+
+      t1_id: mgmt-a-t1
+      t1_segment_id: avi-data
+
+      avi_controller: 10.1.1.92          # cluster VIP ("mgmt-avi" cluster)
+      avi_controller_fqdn: alb-b.site-a.vcf.lab
+      avi_controller_node: 10.1.1.93     # single-node cluster
+      api_version: 32.1.1
+
+      nsxt_url: nsx-mgmt-a.site-a.vcf.lab
+
+      mgmt_network_name: ans-mgmt
+      mgmt_network_subnet: 10.1.0.0
+      mgmt_network_mask: 24
+      mgmt_se_range_begin: 10.1.0.150
+      mgmt_se_range_end: 10.1.0.199
+
+      vip_network_name: mgmt-avi-data
+      vip_network_subnet: 10.1.14.128
+      vip_network_mask: 25
+      vip_se_range_begin: 10.1.14.150     # STATIC_IPS_FOR_VIP_AND_SE
+      vip_se_range_end: 10.1.14.199
+
+      ipam_profile_name: avi_ipam
+      dns_profile_name: avi_dns
+      dns_service_domains:
+        - lb.site-b.vcf.lab   # yes, "site-b" — that's what's actually configured on this mgmt-domain (site-a) controller
+
+      # Must be a sub-domain of the DNS profile's dns_service_domain entry
+      # above (lb.site-b.vcf.lab) - see the matching comment in
+      # inv_wld_a.yml for why (confirmed by running against a fresh pod).
+      dns_vs_ip: 10.1.14.135
+      dns_vs_fqdn: dns-vs-01b.lb.site-b.vcf.lab
+
+      # No demo_vs / pool / workers on this controller — mgmt domain Avi only
+      # hosts the DNS virtual service today.

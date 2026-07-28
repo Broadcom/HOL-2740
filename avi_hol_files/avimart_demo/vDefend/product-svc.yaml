@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-svc
+  namespace: avimart
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: product-svc
+  template:
+    metadata:
+      labels:
+        app: product-svc
+        tier: app
+    spec:
+      containers:
+      - name: product-svc
+        image: chrismentjox/avimart:product-svc-v1
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: avimart-db-secret
+              key: DATABASE_URL
+        resources:
+          requests: { cpu: 100m, memory: 128Mi }
+          limits:   { cpu: 500m, memory: 512Mi }
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 25
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-svc
+  namespace: avimart
+spec:
+  selector:
+    app: product-svc
+  ports:
+  - port: 8080
+    targetPort: 8080
