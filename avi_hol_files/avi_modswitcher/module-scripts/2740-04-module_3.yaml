@@ -1,0 +1,71 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  environment:
+    no_proxy: "localhost,127.0.0.0/8,::1,.vcf.lab,.vcf.sddc.lab,172.16.0.0/16,192.168.0.0/16"
+    NO_PROXY: "localhost,127.0.0.0/8,::1,.vcf.lab,.vcf.sddc.lab,172.16.0.0/16,192.168.0.0/16"
+
+  pre_tasks:
+    - name: Have we run before?
+      stat:
+        path: /hol/modswitcher_status.txt
+      register: statfile_exists
+    - name: Add a file in /hol with the command of playbook if we haven't run before
+      ansible.builtin.lineinfile:
+        path: /hol/modswitcher_status.txt
+        line: "{{ lookup('file', '/proc/self/cmdline') | regex_replace('\u0000',' ') }}"
+        create: yes
+      when: not statfile_exists.stat.exists
+    - block:
+      - name: "Mod switcher has run before, ending the play"
+        debug:
+          msg: "Mod switcher has run before, ending the play"
+      - meta: end_play
+      when: statfile_exists.stat.exists
+      
+  roles:
+    - role: 2671-01 
+      vars:
+        region: 'b'
+        avi_role_config_log_mode: 'False'
+
+    - role: 2671-01
+      vars:
+        region: 'a'
+        avi_role_config_log_mode: 'False'
+
+    - role: 2671-02_module_1
+      vars:
+        region: 'b'
+        avi_role_config_log_mode: 'False'
+
+    - role: 2671-02_module_1
+      vars:
+        region: 'a'
+        avi_role_config_log_mode: 'False'
+
+    - role: 2671-02_module_2
+      vars:
+        region: 'a'
+        avi_role_config_log_mode: 'False'
+
+
+
+  vars:
+    avi_creds:
+      controller: "{{ 'alb-' + region | lower + '.site-a.vcf.lab'}}"
+      username: "admin"
+      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      api_version: "32.1.1"
+    avi_creds_region01a:
+      controller: "{{ 'alb-a.site-a.vcf.lab'}}"
+      username: "admin"
+      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      api_version: "32.1.1"
+    avi_creds_region01b:
+      controller: "{{ 'alb-b.site-a.vcf.lab'}}"
+      username: "admin"
+      password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      api_version: "32.1.1"

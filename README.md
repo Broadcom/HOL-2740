@@ -9,16 +9,6 @@
 \_| |_/\__,_|_| |_|\__,_||___/ \___/|_| |_| \_____/\__,_||_.__/|___/
 ```
 
-## REMOVE THIS BLOCK BEFORE PUBLISHING
-
-THIS IS AN EXAMPLE. REPLACE THIS WITH YOUR OWN README.md using the pattern below.
-
-This is customer facing so please make it look professional. Thanks.
-
-This file can be updated and will be copied to the console desktop at startup.
-
-> **NOTE:** this file is public so NEVER include passwords. The official HOL Password is stored in the PASSWORD.txt that is copied to the console at boot.
-
 ## Lab Details
 
 ```plain
@@ -29,45 +19,33 @@ This file can be updated and will be copied to the console desktop at startup.
 
 ###  Primary benefits of your lab
 
-Provide information about the lab here
+This lab introduces VMware Avi Load Balancer 32.1.1 and demonstrates how to deliver load balancing, application acceleration, and application-aware security across VMware Cloud Foundation (VCF 9.1) environments.  This collection of labs will cover all aspects of Avi's integration with VCF, including how to use VCF Automation and how to use Avi with VKS clusters to load balance container based apps.
 
 ### Featured Product(s)
 
-More detail about your lab: Products/Features covered in this lab.
+Products/Features covered in this lab.
 
-* Product 1
-* Product 2
-* Feature 1
-* Feature 2
+* Avi Load Balancer
+* vDefend Firewall
+* VCF Automation
+* VMware Kubernetes Service
 
-Additional notes and "interesting" facts about your lab. (pre-release code, simulated data, etc.)
+## Labs available in this pod
 
-## Modules
-
-Please record account names for this lab. All acccounts use the standard Hands-on Labs password.
-
-### === Module 1 ===
-
-Credentials for all vCenter Operations Manager Instances:
-User name: admin
-
-For vCenter Server Administration Console:
-User name: root
-
-For the vSphere Client, use:
-User name: administrator@vsphere.local
-
-### === Module 2 ===
-
-big long command line that nobody wants to type
+HOL-2740-01-ANS-L - Avi and vDefend for VKS container security
+HOL-2740-02-ANS-L - Getting started with Avi and VCF
+HOL-2740-03-ANS-L - Getting started with applcation load balancing
+HOL-2740-04-ANS-L - Application resiliency with Avi global server load balancing
+HOL-2740-05-ANS-L - Migrate to Avi load balancer with the Avi Conversion Tool
 
 ## Lab Authors
 
 ### Principal
 
-* Principal Name:
+* Principal Name: Nick Robbins
 
 ### Captain(s)
 
-* Captain:
-* Captain:
+* Captain: Brandon Andersen
+* Captain: Brandon Fulton
+* Captain: Chris Mentjox

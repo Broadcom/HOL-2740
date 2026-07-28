@@ -1,0 +1,105 @@
+# Antrea ClusterNetworkPolicy — vDefend East-West DFW Demo
+#
+# DEMO FLOW:
+#   BEFORE: Deploy without these policies → lateral movement attacks SUCCEED
+#           (vuln-svc can probe admin-svc, reach the DB, enumerate all services)
+#   AFTER:  Apply these policies → lateral movement attacks are BLOCKED
+#           (probe returns ECONNREFUSED, tcp-probe returns "blocked")
+#
+# Apply:  kubectl apply -f antrea-policies.yaml
+# Remove: kubectl delete -f antrea-policies.yaml  (restores "before" state)
+#
+# Requires: Antrea CNI with ClusterNetworkPolicy feature gate enabled (default in TKG).
+
+---
+# Policy 1: Block vuln-svc from reaching admin-svc (the crown jewel)
+# This is the primary lateral movement prevention rule.
+apiVersion: crd.antrea.io/v1beta1
+kind: ClusterNetworkPolicy
+metadata:
+  name: block-vuln-to-admin
+spec:
+  priority: 5
+  appliedTo:
+  - podSelector:
+      matchLabels:
+        app: vuln-svc
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: avimart
+  egress:
+  - action: Drop
+    to:
+    - podSelector:
+        matchLabels:
+          app: admin-svc
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: avimart
+    ports:
+    - protocol: TCP
+      port: 8080
+
+---
+# Policy 2: Block vuln-svc from reaching the database directly
+# Prevents data exfiltration via DB port pivot.
+apiVersion: crd.antrea.io/v1beta1
+kind: ClusterNetworkPolicy
+metadata:
+  name: block-vuln-to-db
+spec:
+  priority: 5
+  appliedTo:
+  - podSelector:
+      matchLabels:
+        app: vuln-svc
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: avimart
+  egress:
+  - action: Reject
+    to:
+    - podSelector:
+        matchLabels:
+          app: avimart-db
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: avimart
+    ports:
+    - protocol: TCP
+      port: 5432
+
+---
+# Policy 3 (OPTIONAL — stricter zero-trust): Block ALL cross-service east-west
+# Uncomment to demonstrate full microsegmentation: each service can only reach the DB,
+# not other application services.
+#
+# apiVersion: crd.antrea.io/v1beta1
+# kind: ClusterNetworkPolicy
+# metadata:
+#   name: block-service-to-service
+# spec:
+#   priority: 6
+#   appliedTo:
+#   - namespaceSelector:
+#       matchLabels:
+#         kubernetes.io/metadata.name: avimart
+#   egress:
+#   - action: Drop
+#     to:
+#     - namespaceSelector:
+#         matchLabels:
+#           kubernetes.io/metadata.name: avimart
+#       podSelector:
+#         matchExpressions:
+#         - key: app
+#           operator: In
+#           values:
+#           - product-svc
+#           - auth-svc
+#           - order-svc
+#           - admin-svc
+#           - vuln-svc
+#     ports:
+#     - protocol: TCP
+#       port: 8080
