@@ -27,7 +27,7 @@
       pool:
         - name: "{{ 'basic-app-' + region | lower +'-pool'}}"
           cloud_ref: "{{ '/api/cloud?name=Cloud-nsx-wld01-a' if region | lower == 'a' else '/api/cloud?name=Cloud-nsx-mgmt-a' }}"
-          default_server_port: 80
+          default_server_port: 30001
           tier1_lr: "{{ '/infra/tier-1s/wld01-a-t1' if region | lower == 'a' else '/infra/tier-1s/mgmt-a-t1' }}"
           servers:
             # - ip:

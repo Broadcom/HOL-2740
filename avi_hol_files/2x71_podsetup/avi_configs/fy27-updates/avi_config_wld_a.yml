@@ -187,23 +187,23 @@
     # entirely in the original snapshot - it doesn't exist in avi_config.yml
     # at all). Same rule: only self_se_election changes (false -> true);
     # its memory_per_se is already correctly at 8GB and is left untouched.
-    - name: "gslb01a SE group sizing for {{ cloud_name }}"
-      vmware.alb.avi_serviceenginegroup:
-        avi_api_patch_op: replace
-        avi_api_update_method: patch
-        avi_credentials: "{{ avi_credentials }}"
-        name: gslb01a
-        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
-        se_name_prefix: "gslb01a"
-        disk_per_se: 25
-        cpu_reserve: false
-        mem_reserve: false
-        vcpus_per_se: 1
-        memory_per_se: 8192
-        extra_shared_config_memory: 2000
-        max_vs_per_se: 10
-        self_se_election: true
-        se_deprovision_delay: 120
+    # - name: "gslb01a SE group sizing for {{ cloud_name }}"
+    #   vmware.alb.avi_serviceenginegroup:
+    #     avi_api_patch_op: replace
+    #     avi_api_update_method: patch
+    #     avi_credentials: "{{ avi_credentials }}"
+    #     name: gslb01a
+    #     cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+    #     se_name_prefix: "gslb01a"
+    #     disk_per_se: 25
+    #     cpu_reserve: false
+    #     mem_reserve: false
+    #     vcpus_per_se: 1
+    #     memory_per_se: 8192
+    #     extra_shared_config_memory: 2000
+    #     max_vs_per_se: 10
+    #     self_se_election: true
+    #     se_deprovision_delay: 120
 
     # True-Client-IP / HSTS tweak from avi_tweaks.yml, applied here as
     # template-intended (this was missing live - hsts_enabled was true and
