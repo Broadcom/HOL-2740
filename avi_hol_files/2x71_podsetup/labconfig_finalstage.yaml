@@ -404,7 +404,13 @@
         state: absent
         force_kill: yes
         container_default_behavior: no_defaults
-      become: yes
+      # become: yes removed (2026-07-28) - holuser doesn't need sudo for
+      # docker on these hosts, same as every other docker task in this
+      # block. With no ansible_become_pass configured for the linuxhosts
+      # group, this always failed with "Missing sudo password" - harmless
+      # since ignore_errors masked it, but pointless. Matches the pattern
+      # already used (commented-out become) on the demoweb/avi_demoweb
+      # tasks below.
       ignore_errors: yes
 
     - pause:
@@ -412,7 +418,7 @@
 
     - name: start clients
       docker_container:
-        name: "demoweb"
+        name: "hackazon"
         state: started
         restart_policy: always
         container_default_behavior: no_defaults
@@ -420,8 +426,8 @@
           NOLOGO: "yes"
         image: harbor.site-a.vcf.lab/library/hackazon:latest
         ports:
-          - "80:30080"
-          - "443:30443"
+          - "30080:80"
+          - "30443:443"
       register: result
       retries: 3
       delay: 3
@@ -449,8 +455,41 @@
           NOLOGO: "yes"
         image: harbor.site-a.vcf.lab/library/avi_demoweb:v1
         ports:
-          - "80:30001"
+          # was "80:30001" (backwards) - the demo_vs-Pool in the Avi
+          # playbooks targets workers on port 30001, so the HOST-published
+          # port must be 30001 (mapping to the app's actual port 80
+          # inside the container), not the other way around. Confirmed via
+          # a live pod: the container this produced was only reachable on
+          # host port 80, not 30001, meaning Avi's pool traffic to it
+          # would fail. Fixed 2026-07-28.
+          - "30001:80"
       register: result
       retries: 3
       delay: 3
       #become: yes
+
+    - name: cleanup
+      docker_container:
+        name: "dvwa"
+        state: absent
+        force_kill: yes
+        container_default_behavior: no_defaults
+      ignore_errors: yes
+
+    - pause:
+        seconds: 10
+
+    - name: start clients
+      docker_container:
+        name: "dvwa"
+        state: started
+        restart_policy: always
+        container_default_behavior: no_defaults
+        env:
+          NOLOGO: "yes"
+        image: harbor.site-a.vcf.lab/library/dvwaserver:v1
+        ports:
+          - "30081:80"
+      register: result
+      retries: 3
+      delay: 3
