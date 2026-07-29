@@ -5,6 +5,26 @@ healthy, as one JSON object per run in a GCS bucket, so a fleet of
 concurrently-running HOL pods can be checked from one place -- viewed by
 regenerating a local HTML summary on demand, not a live-hosted dashboard.
 
+**2026-07-29 additions:**
+- **Critical fix:** `lsf.labfail()` was confirmed (against the real
+  HOLFY27-MGR-HOLUSER source -- see this project's `CLAUDE.md`) to call
+  `sys.exit(1)` and never return. Without `_labfail_uploads_telemetry()`
+  wrapping it for the duration of `main()`, a mid-run failure would exit
+  before ever reaching the upload at the end of the function -- silently
+  producing zero telemetry on exactly the runs where it matters most.
+  Fixed: any `labfail()` call now uploads whatever telemetry was
+  collected so far (forced `overall_status='failed'`) before the real
+  exit happens.
+- `write_labstartup_log_summary()` / `summarize_labstartup_log()`: a new
+  step reads `~/hol/labstartup.log` (the pod's overall boot log, shared
+  across every startup-stage script, not just this one) and logs/uploads
+  a real per-section breakdown, using the exact `Starting module: X` /
+  `Completed module: X` / `Module X failed: ...` framing confirmed
+  against the actual HOLFY27-MGR-HOLUSER `lsfunctions.py`/`labstartup.py`
+  source (this lab's own `Startup/final.py` is what actually invokes
+  `adjustomatic.main()` -- see `CLAUDE.md`'s new section on that
+  framework for the full picture).
+
 ## Architecture
 
 ```

@@ -2,6 +2,8 @@ import contextlib  # needed at module load time for the @contextlib.contextmanag
                     # decorator below (track_step) -- everything else in this file
                     # imports locally per-function, but a decorator runs at def-time,
                     # too early for a local import inside that same function's body.
+import re  # needed at module load time for the compiled LABSTARTUP_LOG_TIMESTAMP_RE
+           # constant below -- same reasoning as contextlib above.
 
 
 def retry_io(fn, *args, retries=3, delay=5, **kwargs):
@@ -1597,6 +1599,32 @@ foreach ($d in $domains) {{
 TELEMETRY_POD_ID_FILE = '/home/holuser/pod_telemetry_id.txt'
 TELEMETRY_VAULT_FILE = '/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/secrets.yml'
 TELEMETRY_VAULT_PASSWORD_FILE = '/home/holuser/vaultsecret.txt'
+
+# ~/hol/labstartup.log summary: the pod's overall boot-time log, shared
+# across every startup-stage script (not just adjustomatic.py) -- see
+# summarize_labstartup_log()'s docstring. Format verified 2026-07-29
+# directly against the real HOLFY27-MGR-HOLUSER source (public repo,
+# see CLAUDE.md): lsf.write_output() formats every line as
+# '[YYYY-MM-DD HH:MM:SS] {msg}', and lsf.startup(module_name, ...) --
+# what actually runs each named Startup/ module, including this lab's
+# own Startup/final.py override that in turn calls adjustomatic.main()
+# -- wraps each one with an exact 'Starting module: X from Y' /
+# 'Completed module: X' / 'Module X reported failure' / 'Module X
+# failed: <exc>' framing. That's real ground truth for section
+# boundaries, not a guess -- see LABSTARTUP_MODULE_*_RE below.
+LABSTARTUP_LOG_FILE = '/home/holuser/hol/labstartup.log'
+LABSTARTUP_LOG_MAX_BYTES = 50 * 1024 * 1024  # skip rather than risk a slow/huge parse
+LABSTARTUP_LOG_TIMESTAMP_RE = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(.*)$')
+LABSTARTUP_MODULE_START_RE = re.compile(r'^Starting module: (\S+) from (.+)$')
+LABSTARTUP_MODULE_COMPLETE_RE = re.compile(r'^Completed module: (\S+)$')
+LABSTARTUP_MODULE_REPORTED_FAILURE_RE = re.compile(r'^Module (\S+) reported failure$')
+LABSTARTUP_MODULE_FAILED_RE = re.compile(r'^Module (\S+) failed: (.*)$')
+LABSTARTUP_LOG_NOTABLE_KEYWORDS = ('WARNING', 'ERROR', 'FAIL', 'TRACEBACK', 'EXCEPTION')
+LABSTARTUP_LOG_TOP_GAPS = 5  # secondary/supplementary to module_sections below -- catches
+                             # slow stretches not attributed to any named module (e.g. time
+                             # between labstartup.py's own prelim steps, before the first
+                             # 'Starting module:' line)
+LABSTARTUP_LOG_TOP_NOTABLE = 30
 TELEMETRY_GCS_BUCKET = 'lans001-avi-demo-labs-hol-telemetry'  # TODO: paste the bucket name here once created
 
 
@@ -1634,7 +1662,7 @@ def _get_or_create_pod_id():
 
 
 @contextlib.contextmanager
-def track_step(lsf, results, name):
+def track_step(lsf, results, name, scan_for_warnings=True):
     """
     Time one main() step and classify it ok/degraded/failed for the
     end-of-run telemetry summary, WITHOUT changing any existing
@@ -1644,7 +1672,17 @@ def track_step(lsf, results, name):
     convention:
       - lsf.write_output(...) -- watched for the literal string
         'WARNING' every non-fatal failure path in this file already
-        logs -> classified 'degraded'.
+        logs -> classified 'degraded'. Pass scan_for_warnings=False to
+        skip this for steps that dump large blocks of *third-party* tool
+        output through write_output (the three ansible-playbook blocks
+        in main() do this via retry_io(lsf.write_output, result.stdout,
+        ...)) -- Ansible itself routinely emits its own benign
+        '[WARNING]:' lines (deprecations, module notices) on completely
+        successful, unchanged runs, which would otherwise false-positive
+        every single run regardless of whether anything was actually
+        wrong. Their real status is already fully determined by whether
+        lsf.labfail gets called, so nothing is lost by skipping the
+        keyword scan for just those steps.
       - lsf.labfail(...) -- the one call every genuinely lab-failing
         path in this file already makes -> classified 'failed'.
     Both are restored in the finally block regardless of outcome.
@@ -1661,11 +1699,12 @@ def track_step(lsf, results, name):
     saw_labfail = []
 
     def _tracking_write_output(msg, *args, **kwargs):
-        try:
-            if 'WARNING' in str(msg):
-                saw_warning.append(True)
-        except Exception:
-            pass
+        if scan_for_warnings:
+            try:
+                if 'WARNING' in str(msg):
+                    saw_warning.append(True)
+            except Exception:
+                pass
         return orig_write_output(msg, *args, **kwargs)
 
     def _tracking_labfail(msg, *args, **kwargs):
@@ -1696,6 +1735,60 @@ def track_step(lsf, results, name):
             'status': status,
             'detail': exc_repr or (saw_labfail[0] if saw_labfail else None),
         })
+
+
+@contextlib.contextmanager
+def _labfail_uploads_telemetry(lsf, telemetry_results, run_started_at_iso, run_start):
+    """
+    For the duration of this context, wrap lsf.labfail so that calling it
+    also uploads whatever telemetry has been collected so far (forced
+    overall_status='failed', via a synthetic 'labfail' entry) BEFORE
+    delegating to the real labfail(), which calls sys.exit(1) and never
+    returns control to its caller (confirmed against the real
+    HOLFY27-MGR-HOLUSER source, 2026-07-29 -- see CLAUDE.md).
+
+    Without this, send_telemetry_summary() at the end of main() would
+    simply never be reached on any run that calls labfail() anywhere (the
+    three ansible-playbook steps, or wait_for_vks_nodepool_scaleup's
+    timeout) -- meaning the exact runs where telemetry matters most (a
+    real failure) would silently produce zero telemetry.
+
+    Restores the original lsf.labfail on exit (including on exception) --
+    lsfunctions is a shared, process-wide singleton module (the
+    lab-specific Startup/final.py that imports and calls
+    adjustomatic.main() holds the SAME lsf module object, not a copy), so
+    leaving this monkeypatch in place beyond adjustomatic's own run would
+    make final.py's own later, unrelated labfail() calls (e.g. its
+    lab-update.py failure handling, well after adjustomatic.main()
+    returns) incorrectly re-upload adjustomatic's already-finished
+    telemetry using stale closure state.
+
+    track_step()'s own per-call monkeypatching of lsf.labfail layers on
+    top of this and correctly restores back down to this wrapper (not
+    further down to the true original) at the end of each `with
+    track_step(...)` block, since it always saves/restores whatever
+    lsf.labfail was at that block's own entry/exit.
+    """
+    import time
+
+    orig_labfail = lsf.labfail
+
+    def _wrapped(reason, *_a, **_kw):
+        try:
+            telemetry_results.append({
+                'name': 'labfail', 'duration_s': round(time.time() - run_start, 1),
+                'status': 'failed', 'detail': str(reason),
+            })
+            send_telemetry_summary(lsf, telemetry_results, run_started_at_iso, time.time() - run_start)
+        except Exception:
+            pass
+        return orig_labfail(reason, *_a, **_kw)
+
+    lsf.labfail = _wrapped
+    try:
+        yield
+    finally:
+        lsf.labfail = orig_labfail
 
 
 def _get_telemetry_access_token():
@@ -1747,7 +1840,203 @@ def _get_telemetry_access_token():
         return None
 
 
-def send_telemetry_summary(lsf, results, run_started_at_iso, total_duration_s):
+def summarize_labstartup_log(lsf):
+    """
+    Best-effort summary of ~/hol/labstartup.log (the pod's overall
+    boot-time log, shared across every startup-stage script -- not just
+    this one).
+
+    Primary signal: real named sections. lsf.startup(module_name, ...) --
+    what actually runs each Startup/<module>.py, including this lab's own
+    Startup/final.py override that calls adjustomatic.main() -- wraps
+    every module with an exact 'Starting module: X from Y' / 'Completed
+    module: X' / 'Module X reported failure' / 'Module X failed: <exc>'
+    framing (verified 2026-07-29 directly against the real
+    HOLFY27-MGR-HOLUSER source -- see CLAUDE.md). This pairs those lines
+    by module name to get a real per-section duration, not a guess.
+
+    Secondary signal: the top LABSTARTUP_LOG_TOP_GAPS longest gaps between
+    ANY two consecutive timestamped lines, for slowness not attributed to
+    a named module (e.g. time spent before the very first module starts).
+
+    Also collects notable WARNING/ERROR/FAIL/etc lines throughout,
+    regardless of whether they fall inside a named module or not.
+
+    Returns a dict with 'total_span_s', 'module_sections' (in
+    chronological start order: name, status
+    ok/reported_failure/failed/unclosed, duration_s, detail), 'slow_gaps'
+    (top LABSTARTUP_LOG_TOP_GAPS gaps between consecutive lines),
+    'notable_messages' (up to LABSTARTUP_LOG_TOP_NOTABLE most recent
+    lines matching LABSTARTUP_LOG_NOTABLE_KEYWORDS), and
+    'notable_messages_truncated' -- or None if the log is missing,
+    unreadable, unexpectedly huge, or contains no parseable timestamped
+    lines at all. Never raises.
+    """
+    import datetime
+    import os
+
+    try:
+        if not os.path.isfile(LABSTARTUP_LOG_FILE):
+            return None
+        if os.path.getsize(LABSTARTUP_LOG_FILE) > LABSTARTUP_LOG_MAX_BYTES:
+            lsf.write_output(
+                f'  labstartup.log summary skipped -- file is over '
+                f'{LABSTARTUP_LOG_MAX_BYTES // (1024 * 1024)}MB, too large to '
+                f'safely parse inline'
+            )
+            return None
+
+        entries = []
+        notable = []
+        module_starts = {}  # name -> (start_ts, start_ts_str)
+        module_sections = []
+        with open(LABSTARTUP_LOG_FILE, 'r', errors='replace') as f:
+            for line in f:
+                match = LABSTARTUP_LOG_TIMESTAMP_RE.match(line.rstrip('\n'))
+                if not match:
+                    continue
+                ts_str, message = match.groups()
+                try:
+                    ts = datetime.datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    continue
+                entries.append((ts, message))
+                if any(kw in message.upper() for kw in LABSTARTUP_LOG_NOTABLE_KEYWORDS):
+                    notable.append(f'[{ts_str}] {message}')
+
+                start_match = LABSTARTUP_MODULE_START_RE.match(message)
+                if start_match:
+                    module_starts[start_match.group(1)] = ts
+                    continue
+                complete_match = LABSTARTUP_MODULE_COMPLETE_RE.match(message)
+                if complete_match:
+                    name = complete_match.group(1)
+                    if name in module_starts:
+                        module_sections.append({
+                            'name': name, 'status': 'ok',
+                            'duration_s': round((ts - module_starts.pop(name)).total_seconds(), 1),
+                            'detail': None,
+                        })
+                    continue
+                reported_failure_match = LABSTARTUP_MODULE_REPORTED_FAILURE_RE.match(message)
+                if reported_failure_match:
+                    name = reported_failure_match.group(1)
+                    if name in module_starts:
+                        module_sections.append({
+                            'name': name, 'status': 'reported_failure',
+                            'duration_s': round((ts - module_starts.pop(name)).total_seconds(), 1),
+                            'detail': None,
+                        })
+                    continue
+                failed_match = LABSTARTUP_MODULE_FAILED_RE.match(message)
+                if failed_match:
+                    name, detail = failed_match.groups()
+                    if name in module_starts:
+                        module_sections.append({
+                            'name': name, 'status': 'failed',
+                            'duration_s': round((ts - module_starts.pop(name)).total_seconds(), 1),
+                            'detail': detail,
+                        })
+                    continue
+
+        if not entries:
+            return None
+
+        # Modules that started but never saw a matching completion line
+        # (still running when this snapshot was taken, or the log was
+        # truncated) -- approximate duration against the last timestamp
+        # seen anywhere in the log, clearly marked as an approximation.
+        last_ts = entries[-1][0]
+        for name, start_ts in module_starts.items():
+            module_sections.append({
+                'name': name, 'status': 'unclosed',
+                'duration_s': round((last_ts - start_ts).total_seconds(), 1),
+                'detail': 'no matching Completed/failed line found (still running, or log truncated)',
+            })
+
+        gaps = []
+        for (t1, m1), (t2, m2) in zip(entries, entries[1:]):
+            gaps.append({'from': m1, 'to': m2, 'duration_s': round((t2 - t1).total_seconds(), 1)})
+        gaps.sort(key=lambda g: g['duration_s'], reverse=True)
+
+        total_span_s = (entries[-1][0] - entries[0][0]).total_seconds()
+
+        return {
+            'total_span_s': round(total_span_s, 1),
+            'module_sections': module_sections,
+            'slow_gaps': gaps[:LABSTARTUP_LOG_TOP_GAPS],
+            'notable_messages': notable[-LABSTARTUP_LOG_TOP_NOTABLE:],
+            'notable_messages_truncated': len(notable) > LABSTARTUP_LOG_TOP_NOTABLE,
+        }
+    except Exception:
+        return None
+
+
+def write_labstartup_log_summary(lsf):
+    """
+    Log a human-readable summary of ~/hol/labstartup.log via
+    lsf.write_output -- see summarize_labstartup_log()'s docstring for
+    what this covers. Returns the same dict summarize_labstartup_log()
+    returns (or None), so main() can also fold a compact version into the
+    uploaded telemetry JSON.
+
+    Non-fatal: any failure here is logged as a warning and never calls
+    lsf.labfail. This step is registered with track_step(...,
+    scan_for_warnings=False) in main() -- it deliberately reproduces
+    WARNING/ERROR/etc. substrings from elsewhere in the log as DATA, which
+    would otherwise falsely mark this step itself 'degraded' on every run
+    that has any notable message at all.
+    """
+    lsf.write_output('Summarizing ~/hol/labstartup.log...')
+    try:
+        summary = summarize_labstartup_log(lsf)
+        if summary is None:
+            lsf.write_output(
+                f'  {LABSTARTUP_LOG_FILE}: not found, unreadable, too large, '
+                f'or no parseable timestamped lines -- skipping'
+            )
+            return None
+
+        hours, rem = divmod(summary['total_span_s'], 3600)
+        minutes, seconds = divmod(rem, 60)
+        lsf.write_output(
+            f"  Total span: {int(hours)}h{int(minutes)}m{int(seconds)}s "
+            f"({summary['total_span_s']}s)"
+        )
+
+        sections = summary['module_sections']
+        if sections:
+            lsf.write_output(f'  Startup module sections (in order, {len(sections)} found):')
+            for sec in sections:
+                detail_note = f" -- {sec['detail']}" if sec['detail'] else ''
+                lsf.write_output(f"    {sec['name']}: {sec['status']} in {sec['duration_s']}s{detail_note}")
+        else:
+            lsf.write_output(
+                "  No 'Starting module:'/'Completed module:' sections found -- either "
+                "this ran outside the normal labstartup.py sequence, or the log doesn't "
+                "cover a full run."
+            )
+
+        lsf.write_output(f"  Other slow gaps between log lines, not tied to a named module (top {len(summary['slow_gaps'])}):")
+        for gap in summary['slow_gaps']:
+            lsf.write_output(f"    {gap['duration_s']}s -- \"{gap['from'][:80]}\" -> \"{gap['to'][:80]}\"")
+
+        notable = summary['notable_messages']
+        if notable:
+            trunc_note = ' (showing most recent -- log has more)' if summary['notable_messages_truncated'] else ''
+            lsf.write_output(f'  Notable messages{trunc_note}:')
+            for msg in notable:
+                lsf.write_output(f'    {msg[:200]}')
+        else:
+            lsf.write_output('  No notable (WARNING/ERROR/FAIL/etc) messages found.')
+
+        return summary
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not summarize labstartup.log (non-fatal): {e}')
+        return None
+
+
+def send_telemetry_summary(lsf, results, run_started_at_iso, total_duration_s, labstartup_log_summary=None):
     """
     Best-effort upload of this run's timing/health summary as one JSON
     object per run to a GCS bucket (no Sheets/Drive/Apps Script/BigQuery
@@ -1796,6 +2085,7 @@ def send_telemetry_summary(lsf, results, run_started_at_iso, total_duration_s):
             'total_duration_s': round(total_duration_s, 1),
             'overall_status': overall_status,
             'steps': results,
+            'labstartup_log': labstartup_log_summary,
         }
         # One object per run, grouped by pod under runs/ -- object names
         # can't collide across concurrent pods (pod_id) or across repeated
@@ -1859,190 +2149,215 @@ def main():
     _run_started_at_iso = _datetime.datetime.now(_datetime.timezone.utc).isoformat()
     _telemetry_results = []
 
-    with track_step(lsf, _telemetry_results, 'settling_sleep'):
-        _time.sleep(180)
+    # CRITICAL: lsf.labfail() calls sys.exit(1) (confirmed against the real
+    # HOLFY27-MGR-HOLUSER source, 2026-07-29 -- see CLAUDE.md) -- it does NOT
+    # return control to the caller. _labfail_uploads_telemetry() wraps
+    # lsf.labfail for the rest of this function so a mid-run failure still
+    # uploads whatever telemetry was collected before the process exits --
+    # see that context manager's docstring for why this is essential (without
+    # it, the exact runs where telemetry matters most -- a real failure --
+    # would silently produce zero telemetry) and why it must be restored
+    # afterward (lsfunctions is a shared, process-wide module).
+    with _labfail_uploads_telemetry(lsf, _telemetry_results, _run_started_at_iso, _run_start):
+        with track_step(lsf, _telemetry_results, 'settling_sleep'):
+            _time.sleep(180)
 
-    # Kick off VKS worker node pool scale-up (1 -> 3) right away (after the
-    # settling buffer above), before anything else in this script. This just
-    # issues the Supervisor Cluster patch and returns immediately -- the
-    # actual node provisioning happens in the background over the next
-    # several minutes, in parallel with everything else adjustomatic does
-    # below. wait_for_vks_nodepool_scaleup() at the very end of main()
-    # confirms it actually finished (and fails the lab if it doesn't) before
-    # returning control to the rest of startup.
-    _vks_scale_start = _time.time()
-    with track_step(lsf, _telemetry_results, 'vks_scale_request'):
-        scale_vks_worker_nodepools(lsf, target_replicas=3)
+        # Kick off VKS worker node pool scale-up (1 -> 3) right away (after the
+        # settling buffer above), before anything else in this script. This just
+        # issues the Supervisor Cluster patch and returns immediately -- the
+        # actual node provisioning happens in the background over the next
+        # several minutes, in parallel with everything else adjustomatic does
+        # below. wait_for_vks_nodepool_scaleup() at the very end of main()
+        # confirms it actually finished (and fails the lab if it doesn't) before
+        # returning control to the rest of startup.
+        _vks_scale_start = _time.time()
+        with track_step(lsf, _telemetry_results, 'vks_scale_request'):
+            scale_vks_worker_nodepools(lsf, target_replicas=3)
 
-    # VSP vmsp-platform kube-vip DaemonSet hardening (fleet-01a/vmsp-gateway
-    # VIP flap fix). Independent of the Avi playbooks below; run first so a
-    # flapping gateway VIP doesn't intermittently affect anything later in
-    # this script that happens to depend on fleet/depot reachability.
-    # See fix_vmsp_gateway_kubevip() docstring for full root-cause detail.
-    with track_step(lsf, _telemetry_results, 'vmsp_kubevip_hardening'):
-        fix_vmsp_gateway_kubevip(lsf)
+        # VSP vmsp-platform kube-vip DaemonSet hardening (fleet-01a/vmsp-gateway
+        # VIP flap fix). Independent of the Avi playbooks below; run first so a
+        # flapping gateway VIP doesn't intermittently affect anything later in
+        # this script that happens to depend on fleet/depot reachability.
+        # See fix_vmsp_gateway_kubevip() docstring for full root-cause detail.
+        with track_step(lsf, _telemetry_results, 'vmsp_kubevip_hardening'):
+            fix_vmsp_gateway_kubevip(lsf)
 
-    # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
-    # page-load hang). Independent of everything else here; see
-    # fix_firefox_remote_settings_bypass() docstring for full root-cause
-    # detail -- and see fix_firefox_remote_settings_dns_block() for why
-    # that fix alone isn't sufficient and what actually closes the gap.
-    with track_step(lsf, _telemetry_results, 'firefox_remote_settings_fix'):
-        fix_firefox_remote_settings_bypass(lsf)
-        fix_firefox_remote_settings_dns_block(lsf)
+        # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
+        # page-load hang). Independent of everything else here; see
+        # fix_firefox_remote_settings_bypass() docstring for full root-cause
+        # detail -- and see fix_firefox_remote_settings_dns_block() for why
+        # that fix alone isn't sufficient and what actually closes the gap.
+        with track_step(lsf, _telemetry_results, 'firefox_remote_settings_fix'):
+            fix_firefox_remote_settings_bypass(lsf)
+            fix_firefox_remote_settings_dns_block(lsf)
 
-    # global.vcf.lab GSLB NS delegation -- keeps the NS/glue records pointed
-    # at the pod's actual Avi GSLB DNS VS hostnames/IPs. See
-    # fix_global_dns_ns_delegation() and GLOBAL_DNS_NS_DELEGATIONS' comment
-    # for full root-cause detail.
-    with track_step(lsf, _telemetry_results, 'global_dns_ns_delegation'):
-        fix_global_dns_ns_delegation(lsf)
+        # global.vcf.lab GSLB NS delegation -- keeps the NS/glue records pointed
+        # at the pod's actual Avi GSLB DNS VS hostnames/IPs. See
+        # fix_global_dns_ns_delegation() and GLOBAL_DNS_NS_DELEGATIONS' comment
+        # for full root-cause detail.
+        with track_step(lsf, _telemetry_results, 'global_dns_ns_delegation'):
+            fix_global_dns_ns_delegation(lsf)
 
-    # NSX-T LB app profiles (custom-fast-tcp/custom-fast-udp) + HTTP
-    # monitor (http-30001). See configure_nsxt_app_profiles() docstring --
-    # this used to be inline here, PUT unconditionally, and errored out on
-    # every run after the pod's first, since these objects persist across
-    # the pod's lifetime. Now idempotent (GET-before-PUT), safe to run
-    # every time.
-    with track_step(lsf, _telemetry_results, 'nsxt_app_profiles'):
-        configure_nsxt_app_profiles(lsf)
+        # NSX-T LB app profiles (custom-fast-tcp/custom-fast-udp) + HTTP
+        # monitor (http-30001). See configure_nsxt_app_profiles() docstring --
+        # this used to be inline here, PUT unconditionally, and errored out on
+        # every run after the pod's first, since these objects persist across
+        # the pod's lifetime. Now idempotent (GET-before-PUT), safe to run
+        # every time.
+        with track_step(lsf, _telemetry_results, 'nsxt_app_profiles'):
+            configure_nsxt_app_profiles(lsf)
 
-    # NSX-ALB credential/lockout durability -- see resync_nsxt_alb_*()
-    # docstrings. This vApp is a saved/suspended VCD template that can sit
-    # powered off for up to ~18 months (or more) between power-ons, so
-    # anything with a calendar-based expiration needs re-checking (and,
-    # if needed, re-extending) on every single boot rather than trusting
-    # a one-time manual fix to hold. Both functions are fast in the common
-    # (already-healthy) case; only resync_nsxt_alb_cloud_connector_credentials
-    # pays a slower (~1min) cost, and only on the rare boot where it finds
-    # an actual broken credential to rotate.
-    with track_step(lsf, _telemetry_results, 'nsxt_alb_enforcement_point_tokens'):
-        resync_nsxt_alb_enforcement_point_tokens(lsf)
-    with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
-        resync_nsxt_alb_cloud_connector_credentials(lsf)
-    with track_step(lsf, _telemetry_results, 'sso_password_policy'):
-        resync_sso_password_policy(lsf)
+        # NSX-ALB credential/lockout durability -- see resync_nsxt_alb_*()
+        # docstrings. This vApp is a saved/suspended VCD template that can sit
+        # powered off for up to ~18 months (or more) between power-ons, so
+        # anything with a calendar-based expiration needs re-checking (and,
+        # if needed, re-extending) on every single boot rather than trusting
+        # a one-time manual fix to hold. Both functions are fast in the common
+        # (already-healthy) case; only resync_nsxt_alb_cloud_connector_credentials
+        # pays a slower (~1min) cost, and only on the rare boot where it finds
+        # an actual broken credential to rotate.
+        with track_step(lsf, _telemetry_results, 'nsxt_alb_enforcement_point_tokens'):
+            resync_nsxt_alb_enforcement_point_tokens(lsf)
+        with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
+            resync_nsxt_alb_cloud_connector_credentials(lsf)
+        with track_step(lsf, _telemetry_results, 'sso_password_policy'):
+            resync_sso_password_policy(lsf)
 
-    # try:
-    #     lsf.write_output("Running first stages playbook")
-    #     # Playbook to run final config steps
-    #     result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_firststage.yaml", 
-    #         "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file", 
-    #         "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-    #     lsf.write_output(result)
-    #     try:
-    #         lsf.write_output(result.stdout)
-    #     except:
-    #         pass
-    # except Exception as e:
-    #     lsf.write_output(e)
-    #     try:
-    #         lsf.write_output(e.stdout)
-    #         lsf.write_output(e.stderr)
-    #     except:
-    #         pass   
-    #     lsf.write_output('Adjustomatic failed at avitweaker - first stage playbook step') 
-    #     lsf.labfail('Adjustomatic failed at avitweaker - first stage playbook step')
+        # try:
+        #     lsf.write_output("Running first stages playbook")
+        #     # Playbook to run final config steps
+        #     result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_firststage.yaml", 
+        #         "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file", 
+        #         "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        #     lsf.write_output(result)
+        #     try:
+        #         lsf.write_output(result.stdout)
+        #     except:
+        #         pass
+        # except Exception as e:
+        #     lsf.write_output(e)
+        #     try:
+        #         lsf.write_output(e.stdout)
+        #         lsf.write_output(e.stderr)
+        #     except:
+        #         pass   
+        #     lsf.write_output('Adjustomatic failed at avitweaker - first stage playbook step') 
+        #     lsf.labfail('Adjustomatic failed at avitweaker - first stage playbook step')
 
-    with track_step(lsf, _telemetry_results, 'avi_config_workload_domain'):
-        try:
-            lsf.write_output("Running avi configuration playbook - workload domain")
-            result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
-                "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
-                "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-            # Playbook already succeeded at this point - don't let a transient I/O error while
-            # logging its output turn a successful run into a lab failure.
+        with track_step(lsf, _telemetry_results, 'avi_config_workload_domain', scan_for_warnings=False):
             try:
-                retry_io(lsf.write_output, result, console=False)
-                retry_io(lsf.write_output, result.stdout, console=False)
-            except OSError as log_err:
+                lsf.write_output("Running avi configuration playbook - workload domain")
+                result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
+                    "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
+                    "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+                # Playbook already succeeded at this point - don't let a transient I/O error while
+                # logging its output turn a successful run into a lab failure.
                 try:
-                    lsf.write_output(f"avi workload-domain configuration succeeded, but logging its output failed: {log_err}")
-                except OSError:
-                    pass
-        except Exception as e:
-            lsf.write_output(e)
-            try:
-                lsf.write_output(e.stdout)
-                lsf.write_output(e.stderr)
-            except:
-                pass
-            lsf.write_output('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
-            lsf.labfail('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
-
-    with track_step(lsf, _telemetry_results, 'avi_config_mgmt_domain'):
-        try:
-            lsf.write_output("Running avi configuration playbook - management domain")
-            result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
-                "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
-                "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-            # Playbook already succeeded at this point - don't let a transient I/O error while
-            # logging its output turn a successful run into a lab failure.
-            try:
-                retry_io(lsf.write_output, result, console=False)
-                retry_io(lsf.write_output, result.stdout, console=False)
-            except OSError as log_err:
+                    retry_io(lsf.write_output, result, console=False)
+                    retry_io(lsf.write_output, result.stdout, console=False)
+                except OSError as log_err:
+                    try:
+                        lsf.write_output(f"avi workload-domain configuration succeeded, but logging its output failed: {log_err}")
+                    except OSError:
+                        pass
+            except Exception as e:
+                lsf.write_output(e)
                 try:
-                    lsf.write_output(f"avi management-domain configuration succeeded, but logging its output failed: {log_err}")
-                except OSError:
+                    lsf.write_output(e.stdout)
+                    lsf.write_output(e.stderr)
+                except:
                     pass
-        except Exception as e:
-            lsf.write_output(e)
-            try:
-                lsf.write_output(e.stdout)
-                lsf.write_output(e.stderr)
-            except:
-                pass
-            lsf.write_output('Adjustomatic failed at avitweaker - avi management-domain configuration step')
-            lsf.labfail('Adjustomatic failed at avitweaker - avi management-domain configuration step')
+                lsf.write_output('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
+                lsf.labfail('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
 
-    with track_step(lsf, _telemetry_results, 'final_stage_playbook'):
-        try:
-            lsf.write_output("Running final stages playbook")
-            # Playbook to run final config steps
-            result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml",
-                "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file",
-                "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-            # Playbook already succeeded at this point - don't let a transient I/O error while
-            # logging its output turn a successful run into a lab failure.
+        with track_step(lsf, _telemetry_results, 'avi_config_mgmt_domain', scan_for_warnings=False):
             try:
-                retry_io(lsf.write_output, result, console=False)
-                retry_io(lsf.write_output, result.stdout, console=False)
-            except OSError as log_err:
+                lsf.write_output("Running avi configuration playbook - management domain")
+                result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
+                    "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
+                    "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+                # Playbook already succeeded at this point - don't let a transient I/O error while
+                # logging its output turn a successful run into a lab failure.
                 try:
-                    lsf.write_output(f"final stage playbook succeeded, but logging its output failed: {log_err}")
-                except OSError:
+                    retry_io(lsf.write_output, result, console=False)
+                    retry_io(lsf.write_output, result.stdout, console=False)
+                except OSError as log_err:
+                    try:
+                        lsf.write_output(f"avi management-domain configuration succeeded, but logging its output failed: {log_err}")
+                    except OSError:
+                        pass
+            except Exception as e:
+                lsf.write_output(e)
+                try:
+                    lsf.write_output(e.stdout)
+                    lsf.write_output(e.stderr)
+                except:
                     pass
-        except Exception as e:
-            lsf.write_output(e)
+                lsf.write_output('Adjustomatic failed at avitweaker - avi management-domain configuration step')
+                lsf.labfail('Adjustomatic failed at avitweaker - avi management-domain configuration step')
+
+        with track_step(lsf, _telemetry_results, 'final_stage_playbook', scan_for_warnings=False):
             try:
-                lsf.write_output(e.stdout)
-                lsf.write_output(e.stderr)
-            except:
-                pass
-            lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step')
-            lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
+                lsf.write_output("Running final stages playbook")
+                # Playbook to run final config steps
+                result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml",
+                    "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file",
+                    "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+                # Playbook already succeeded at this point - don't let a transient I/O error while
+                # logging its output turn a successful run into a lab failure.
+                try:
+                    retry_io(lsf.write_output, result, console=False)
+                    retry_io(lsf.write_output, result.stdout, console=False)
+                except OSError as log_err:
+                    try:
+                        lsf.write_output(f"final stage playbook succeeded, but logging its output failed: {log_err}")
+                    except OSError:
+                        pass
+            except Exception as e:
+                lsf.write_output(e)
+                try:
+                    lsf.write_output(e.stdout)
+                    lsf.write_output(e.stderr)
+                except:
+                    pass
+                lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step')
+                lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
 
-    # Confirm the VKS worker node pool scale-up kicked off at the very top
-    # of this function actually finished (fails the lab if it didn't) --
-    # run last so it's had the full runtime of everything above to converge
-    # in the background first.
-    with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
-        wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
+        # Confirm the VKS worker node pool scale-up kicked off at the very top
+        # of this function actually finished (fails the lab if it didn't) --
+        # run last so it's had the full runtime of everything above to converge
+        # in the background first.
+        with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
+            wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
 
-    # Telemetry upload -- always last, always best-effort. See
-    # send_telemetry_summary()'s docstring: no failure mode here can fail
-    # the lab or affect anything above: the try/except here is deliberate
-    # defense-in-depth on top of that function's own internal try/except,
-    # specifically so that even an unanticipated bug in the telemetry code
-    # itself still can't take startup down with it.
-    try:
-        send_telemetry_summary(lsf, _telemetry_results, _run_started_at_iso, _time.time() - _run_start)
-    except Exception as _telemetry_err:
+        # Summarize ~/hol/labstartup.log (the pod's overall boot-time log,
+        # not just this script's own output) -- see
+        # write_labstartup_log_summary()'s docstring. scan_for_warnings=False
+        # for the same reason the three ansible-playbook steps above use it:
+        # this step deliberately reproduces WARNING/ERROR/etc. substrings
+        # from elsewhere in the log as data, which would otherwise falsely
+        # mark this step itself 'degraded' on every run that has any notable
+        # message at all.
+        _labstartup_log_summary = None
+        with track_step(lsf, _telemetry_results, 'labstartup_log_summary', scan_for_warnings=False):
+            _labstartup_log_summary = write_labstartup_log_summary(lsf)
+
+        # Telemetry upload -- always last, always best-effort. See
+        # send_telemetry_summary()'s docstring: no failure mode here can fail
+        # the lab or affect anything above: the try/except here is deliberate
+        # defense-in-depth on top of that function's own internal try/except,
+        # specifically so that even an unanticipated bug in the telemetry code
+        # itself still can't take startup down with it.
         try:
-            lsf.write_output(f'  WARNING: telemetry summary step itself raised (non-fatal, lab startup unaffected): {_telemetry_err}')
-        except Exception:
-            pass
+            send_telemetry_summary(
+                lsf, _telemetry_results, _run_started_at_iso, _time.time() - _run_start,
+                labstartup_log_summary=_labstartup_log_summary,
+            )
+        except Exception as _telemetry_err:
+            try:
+                lsf.write_output(f'  WARNING: telemetry summary step itself raised (non-fatal, lab startup unaffected): {_telemetry_err}')
+            except Exception:
+                pass
 
     # try:
     #     stdout = subprocess.run(["/usr/bin/rm", "-rf", "/home/holuser/vaultsecret.txt"], text=True, check=True)
