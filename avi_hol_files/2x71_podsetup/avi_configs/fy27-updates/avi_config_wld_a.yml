@@ -177,8 +177,8 @@
         disk_per_se: 15
         cpu_reserve: false
         mem_reserve: true
-        vcpus_per_se: 1
-        memory_per_se: 2048
+        vcpus_per_se: 2
+        memory_per_se: 4096
         max_vs_per_se: 100
         self_se_election: true
         se_deprovision_delay: 120
