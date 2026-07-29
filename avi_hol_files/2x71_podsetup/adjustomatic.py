@@ -1,3 +1,9 @@
+import contextlib  # needed at module load time for the @contextlib.contextmanager
+                    # decorator below (track_step) -- everything else in this file
+                    # imports locally per-function, but a decorator runs at def-time,
+                    # too early for a local import inside that same function's body.
+
+
 def retry_io(fn, *args, retries=3, delay=5, **kwargs):
     """Retry fn on transient I/O errors (errno 5). Re-raises immediately on any other error."""
     import time
@@ -1542,6 +1548,272 @@ foreach ($d in $domains) {{
         lsf.write_output(f'  WARNING: could not resync SSO password policy: {e}')
 
 
+# Startup telemetry: reports how long each adjustomatic run took and which
+# steps were healthy, as one JSON object per run uploaded to a GCS bucket
+# -- no Sheets, no Drive, no Apps Script, no BigQuery, no human OAuth
+# consent. Deliberately best-effort -- see send_telemetry_summary()'s
+# docstring for why this can never affect lab pass/fail.
+#
+# Auth: a personal OAuth refresh token (your own Google identity), not a
+# service account. Four separate Google-side walls were hit reaching this
+# point (all confirmed 2026-07-28): (1) a human "Sign in with Google"
+# OAuth flow, under a custom consent screen created in this project, hit
+# org_internal -- this project lives under the labs.broadcom.com Cloud
+# org, a different domain than individual @broadcom.com accounts, so no
+# human broadcom.com sign-in could pass that org-membership check for an
+# app registered *in this project*; (2) a service account's own email
+# (...iam.gserviceaccount.com) couldn't be shared a Sheet, blocked by a
+# Workspace sharing-allowlist policy; (3) creating a BigQuery dataset was
+# denied by project-level IAM (missing bigquery.datasets.create); (4)
+# granting the service account IAM access to a GCS bucket was denied too
+# (missing storage.buckets.setIamPolicy) -- but a manual Console upload
+# confirmed the account's own human identity already has OWNER access to
+# the bucket via GCS's legacy per-bucket ACL (automatic for the creating
+# principal), with no extra grant needed at all.
+#
+# That's why this ended up as a personal credential: (1) was about a
+# *custom* OAuth client's audience restriction -- it does NOT recur here
+# because this uses gcloud's own pre-registered, globally-available OAuth
+# client (the client_id/secret embedded in `gcloud auth
+# application-default login`'s output) rather than a new consent screen
+# registered under this project. (2)/(3)/(4) don't apply to begin with,
+# since this never touches Sheets/Drive/BigQuery and needs no new IAM
+# grant on the bucket. Just a plain OAuth refresh-token grant -- no JWT
+# signing, no crypto library needed (contrast the service-account
+# version this replaced, which needed pyjwt+cryptography for RS256
+# signing).
+#
+# There's no live "dashboard" here -- summarize_telemetry.py (run
+# locally, not on any pod) pulls every object down and renders a static
+# HTML table on demand, which sidesteps needing any internal hosting too.
+#
+# TELEMETRY_VAULT_FILE points at this repo's existing shared secrets.yml
+# (already loaded as vars_files by labconfig_finalstage.yaml/
+# labconfig_registration.yaml/the avi_configs playbooks) rather than a
+# separate dedicated file -- the telemetry credential was added there
+# directly (2026-07-28) under telemetry_user_credentials_json. Ansible
+# ignores vars a given playbook doesn't reference, so this extra key is
+# harmless to everything else already loading that file.
+TELEMETRY_POD_ID_FILE = '/home/holuser/pod_telemetry_id.txt'
+TELEMETRY_VAULT_FILE = '/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/secrets.yml'
+TELEMETRY_VAULT_PASSWORD_FILE = '/home/holuser/vaultsecret.txt'
+TELEMETRY_GCS_BUCKET = 'lans001-avi-demo-labs-hol-telemetry'  # TODO: paste the bucket name here once created
+
+
+def _get_or_create_pod_id():
+    """
+    Return a UUID identifying this pod, generating and caching one on
+    first run so it's stable across reboots of the same pod. Needed
+    because manager's own hostname is identical across every pod --
+    there's no other existing identifier in this codebase that
+    distinguishes one pod from another (checked: no pod/vpod-number
+    convention exists anywhere in this repo).
+
+    Best-effort: if the cache file can't be read or written, this still
+    returns a usable (just not stable across reboots) UUID rather than
+    raising -- telemetry identity is not worth risking lab startup over.
+    """
+    import os
+    import uuid
+
+    if os.path.isfile(TELEMETRY_POD_ID_FILE):
+        try:
+            cached = open(TELEMETRY_POD_ID_FILE).read().strip()
+            if cached:
+                return cached
+        except OSError:
+            pass
+
+    pod_id = str(uuid.uuid4())
+    try:
+        with open(TELEMETRY_POD_ID_FILE, 'w') as f:
+            f.write(pod_id + '\n')
+    except OSError:
+        pass
+    return pod_id
+
+
+@contextlib.contextmanager
+def track_step(lsf, results, name):
+    """
+    Time one main() step and classify it ok/degraded/failed for the
+    end-of-run telemetry summary, WITHOUT changing any existing
+    function's behavior or touching its internals -- it only observes
+    what that function already does, by temporarily monkeypatching two
+    things every step function in this file already calls by
+    convention:
+      - lsf.write_output(...) -- watched for the literal string
+        'WARNING' every non-fatal failure path in this file already
+        logs -> classified 'degraded'.
+      - lsf.labfail(...) -- the one call every genuinely lab-failing
+        path in this file already makes -> classified 'failed'.
+    Both are restored in the finally block regardless of outcome.
+
+    Never suppresses the wrapped block's own exception -- if something
+    here ever needs to raise, it still propagates; this context manager
+    only records, it never changes lab-startup control flow.
+    """
+    import time
+
+    orig_write_output = lsf.write_output
+    orig_labfail = lsf.labfail
+    saw_warning = []
+    saw_labfail = []
+
+    def _tracking_write_output(msg, *args, **kwargs):
+        try:
+            if 'WARNING' in str(msg):
+                saw_warning.append(True)
+        except Exception:
+            pass
+        return orig_write_output(msg, *args, **kwargs)
+
+    def _tracking_labfail(msg, *args, **kwargs):
+        saw_labfail.append(str(msg))
+        return orig_labfail(msg, *args, **kwargs)
+
+    lsf.write_output = _tracking_write_output
+    lsf.labfail = _tracking_labfail
+    start = time.time()
+    exc_repr = None
+    try:
+        yield
+    except Exception as e:
+        exc_repr = str(e)
+        raise
+    finally:
+        lsf.write_output = orig_write_output
+        lsf.labfail = orig_labfail
+        if exc_repr or saw_labfail:
+            status = 'failed'
+        elif saw_warning:
+            status = 'degraded'
+        else:
+            status = 'ok'
+        results.append({
+            'name': name,
+            'duration_s': round(time.time() - start, 1),
+            'status': status,
+            'detail': exc_repr or (saw_labfail[0] if saw_labfail else None),
+        })
+
+
+def _get_telemetry_access_token():
+    """
+    Exchange the ansible-vault-stored personal OAuth refresh token for a
+    short-lived access token. See the telemetry constants block above
+    main() for the full history of why this is a personal credential
+    (minted via `gcloud auth application-default login`, using gcloud's
+    own pre-registered OAuth client) rather than a service account.
+
+    Just a plain refresh-token grant -- no JWT signing, since this is an
+    "authorized_user" style credential (client_id/client_secret/
+    refresh_token), not a service-account key.
+
+    Returns the access token on success, or None (never raises) if the
+    vault file doesn't exist, decryption fails, the credential doesn't
+    parse, or Google's token endpoint rejects the refresh token --
+    send_telemetry_summary() treats that as "telemetry unavailable this
+    run," never as a lab failure.
+    """
+    import json
+    import os
+    import subprocess
+    import requests
+    import yaml
+
+    if not os.path.isfile(TELEMETRY_VAULT_FILE):
+        return None
+
+    try:
+        result = subprocess.run(
+            ['/usr/bin/ansible-vault', 'view', '--vault-password-file', TELEMETRY_VAULT_PASSWORD_FILE, TELEMETRY_VAULT_FILE],
+            capture_output=True, text=True, timeout=15, check=True,
+        )
+        vault_contents = yaml.safe_load(result.stdout)
+        creds = json.loads(vault_contents['telemetry_user_credentials_json'])
+        resp = requests.post(
+            'https://oauth2.googleapis.com/token', timeout=15,
+            data={
+                'client_id': creds['client_id'],
+                'client_secret': creds['client_secret'],
+                'refresh_token': creds['refresh_token'],
+                'grant_type': 'refresh_token',
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()['access_token']
+    except Exception:
+        return None
+
+
+def send_telemetry_summary(lsf, results, run_started_at_iso, total_duration_s):
+    """
+    Best-effort upload of this run's timing/health summary as one JSON
+    object per run to a GCS bucket (no Sheets/Drive/Apps Script/BigQuery
+    involved -- see the telemetry constants block above main() for why).
+    This must NEVER affect lab pass/fail or block/slow down startup beyond
+    a short, bounded timeout: every failure mode -- unconfigured bucket,
+    vault/key problems, DNS/network failure, timeout, a non-2xx response,
+    even a bug in this function itself -- is caught here and only logged
+    as a warning. lsf.labfail is never called from this function, on
+    purpose. summarize_telemetry.py (run locally, not on any pod) is what
+    later reads all these objects back and renders a viewable summary.
+    """
+    if not TELEMETRY_GCS_BUCKET:
+        lsf.write_output('  Telemetry: TELEMETRY_GCS_BUCKET not configured -- skipping upload')
+        return
+
+    try:
+        import datetime
+        import json
+        import requests
+
+        if any(r['status'] == 'failed' for r in results):
+            overall_status = 'failed'
+        elif any(r['status'] == 'degraded' for r in results):
+            overall_status = 'degraded'
+        else:
+            overall_status = 'ok'
+
+        access_token = _get_telemetry_access_token()
+        if not access_token:
+            lsf.write_output(
+                '  WARNING: telemetry upload skipped -- could not obtain an '
+                'access token (vault missing, decrypt failed, credential '
+                'invalid, or token exchange failed)'
+            )
+            return
+        headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+
+        pod_id = _get_or_create_pod_id()
+        finished_at_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        summary = {
+            'received_at': finished_at_iso,
+            'pod_id': pod_id,
+            'started_at': run_started_at_iso,
+            'finished_at': finished_at_iso,
+            'total_duration_s': round(total_duration_s, 1),
+            'overall_status': overall_status,
+            'steps': results,
+        }
+        # One object per run, grouped by pod under runs/ -- object names
+        # can't collide across concurrent pods (pod_id) or across repeated
+        # runs of the same pod (timestamp has second resolution and this
+        # only runs once per boot anyway).
+        object_name = f'runs/{pod_id}/{finished_at_iso}.json'
+        resp = requests.post(
+            f'https://storage.googleapis.com/upload/storage/v1/b/{TELEMETRY_GCS_BUCKET}/o',
+            headers=headers, timeout=15,
+            params={'uploadType': 'media', 'name': object_name},
+            data=json.dumps(summary).encode(),
+        )
+        resp.raise_for_status()
+        lsf.write_output(f'  Telemetry: uploaded run summary (HTTP {resp.status_code}, overall={overall_status})')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: telemetry upload failed (non-fatal, lab startup unaffected): {e}')
+
+
 def main():
     # install forgotten pip package
     import subprocess
@@ -1577,7 +1849,18 @@ def main():
     # check -- fine since scale-out to 3 workers is only needed once, to be
     # captured into the saved vApp template; ok to remove once that's done.
     import time as _time
-    _time.sleep(180)
+    import datetime as _datetime
+
+    # Telemetry: overall run clock + per-step results list, both started
+    # here (before the settling sleep below) so the reported total
+    # duration covers the whole run, not just the part after it. See
+    # track_step()/send_telemetry_summary() above main().
+    _run_start = _time.time()
+    _run_started_at_iso = _datetime.datetime.now(_datetime.timezone.utc).isoformat()
+    _telemetry_results = []
+
+    with track_step(lsf, _telemetry_results, 'settling_sleep'):
+        _time.sleep(180)
 
     # Kick off VKS worker node pool scale-up (1 -> 3) right away (after the
     # settling buffer above), before anything else in this script. This just
@@ -1588,28 +1871,32 @@ def main():
     # confirms it actually finished (and fails the lab if it doesn't) before
     # returning control to the rest of startup.
     _vks_scale_start = _time.time()
-    scale_vks_worker_nodepools(lsf, target_replicas=3)
+    with track_step(lsf, _telemetry_results, 'vks_scale_request'):
+        scale_vks_worker_nodepools(lsf, target_replicas=3)
 
     # VSP vmsp-platform kube-vip DaemonSet hardening (fleet-01a/vmsp-gateway
     # VIP flap fix). Independent of the Avi playbooks below; run first so a
     # flapping gateway VIP doesn't intermittently affect anything later in
     # this script that happens to depend on fleet/depot reachability.
     # See fix_vmsp_gateway_kubevip() docstring for full root-cause detail.
-    fix_vmsp_gateway_kubevip(lsf)
+    with track_step(lsf, _telemetry_results, 'vmsp_kubevip_hardening'):
+        fix_vmsp_gateway_kubevip(lsf)
 
     # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
     # page-load hang). Independent of everything else here; see
     # fix_firefox_remote_settings_bypass() docstring for full root-cause
     # detail -- and see fix_firefox_remote_settings_dns_block() for why
     # that fix alone isn't sufficient and what actually closes the gap.
-    fix_firefox_remote_settings_bypass(lsf)
-    fix_firefox_remote_settings_dns_block(lsf)
+    with track_step(lsf, _telemetry_results, 'firefox_remote_settings_fix'):
+        fix_firefox_remote_settings_bypass(lsf)
+        fix_firefox_remote_settings_dns_block(lsf)
 
     # global.vcf.lab GSLB NS delegation -- keeps the NS/glue records pointed
     # at the pod's actual Avi GSLB DNS VS hostnames/IPs. See
     # fix_global_dns_ns_delegation() and GLOBAL_DNS_NS_DELEGATIONS' comment
     # for full root-cause detail.
-    fix_global_dns_ns_delegation(lsf)
+    with track_step(lsf, _telemetry_results, 'global_dns_ns_delegation'):
+        fix_global_dns_ns_delegation(lsf)
 
     # NSX-T LB app profiles (custom-fast-tcp/custom-fast-udp) + HTTP
     # monitor (http-30001). See configure_nsxt_app_profiles() docstring --
@@ -1617,7 +1904,8 @@ def main():
     # every run after the pod's first, since these objects persist across
     # the pod's lifetime. Now idempotent (GET-before-PUT), safe to run
     # every time.
-    configure_nsxt_app_profiles(lsf)
+    with track_step(lsf, _telemetry_results, 'nsxt_app_profiles'):
+        configure_nsxt_app_profiles(lsf)
 
     # NSX-ALB credential/lockout durability -- see resync_nsxt_alb_*()
     # docstrings. This vApp is a saved/suspended VCD template that can sit
@@ -1628,9 +1916,12 @@ def main():
     # (already-healthy) case; only resync_nsxt_alb_cloud_connector_credentials
     # pays a slower (~1min) cost, and only on the rare boot where it finds
     # an actual broken credential to rotate.
-    resync_nsxt_alb_enforcement_point_tokens(lsf)
-    resync_nsxt_alb_cloud_connector_credentials(lsf)
-    resync_sso_password_policy(lsf)
+    with track_step(lsf, _telemetry_results, 'nsxt_alb_enforcement_point_tokens'):
+        resync_nsxt_alb_enforcement_point_tokens(lsf)
+    with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
+        resync_nsxt_alb_cloud_connector_credentials(lsf)
+    with track_step(lsf, _telemetry_results, 'sso_password_policy'):
+        resync_sso_password_policy(lsf)
 
     # try:
     #     lsf.write_output("Running first stages playbook")
@@ -1653,87 +1944,105 @@ def main():
     #     lsf.write_output('Adjustomatic failed at avitweaker - first stage playbook step') 
     #     lsf.labfail('Adjustomatic failed at avitweaker - first stage playbook step')
 
-    try:
-        lsf.write_output("Running avi configuration playbook - workload domain")
-        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
-            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
-            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-        # Playbook already succeeded at this point - don't let a transient I/O error while
-        # logging its output turn a successful run into a lab failure.
+    with track_step(lsf, _telemetry_results, 'avi_config_workload_domain'):
         try:
-            retry_io(lsf.write_output, result, console=False)
-            retry_io(lsf.write_output, result.stdout, console=False)
-        except OSError as log_err:
+            lsf.write_output("Running avi configuration playbook - workload domain")
+            result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
+                "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
+                "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+            # Playbook already succeeded at this point - don't let a transient I/O error while
+            # logging its output turn a successful run into a lab failure.
             try:
-                lsf.write_output(f"avi workload-domain configuration succeeded, but logging its output failed: {log_err}")
-            except OSError:
+                retry_io(lsf.write_output, result, console=False)
+                retry_io(lsf.write_output, result.stdout, console=False)
+            except OSError as log_err:
+                try:
+                    lsf.write_output(f"avi workload-domain configuration succeeded, but logging its output failed: {log_err}")
+                except OSError:
+                    pass
+        except Exception as e:
+            lsf.write_output(e)
+            try:
+                lsf.write_output(e.stdout)
+                lsf.write_output(e.stderr)
+            except:
                 pass
-    except Exception as e:
-        lsf.write_output(e)
-        try:
-            lsf.write_output(e.stdout)
-            lsf.write_output(e.stderr)
-        except:
-            pass
-        lsf.write_output('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
-        lsf.labfail('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
+            lsf.write_output('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
+            lsf.labfail('Adjustomatic failed at avitweaker - avi workload-domain configuration step')
 
-    try:
-        lsf.write_output("Running avi configuration playbook - management domain")
-        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
-            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
-            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-        # Playbook already succeeded at this point - don't let a transient I/O error while
-        # logging its output turn a successful run into a lab failure.
+    with track_step(lsf, _telemetry_results, 'avi_config_mgmt_domain'):
         try:
-            retry_io(lsf.write_output, result, console=False)
-            retry_io(lsf.write_output, result.stdout, console=False)
-        except OSError as log_err:
+            lsf.write_output("Running avi configuration playbook - management domain")
+            result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
+                "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
+                "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+            # Playbook already succeeded at this point - don't let a transient I/O error while
+            # logging its output turn a successful run into a lab failure.
             try:
-                lsf.write_output(f"avi management-domain configuration succeeded, but logging its output failed: {log_err}")
-            except OSError:
+                retry_io(lsf.write_output, result, console=False)
+                retry_io(lsf.write_output, result.stdout, console=False)
+            except OSError as log_err:
+                try:
+                    lsf.write_output(f"avi management-domain configuration succeeded, but logging its output failed: {log_err}")
+                except OSError:
+                    pass
+        except Exception as e:
+            lsf.write_output(e)
+            try:
+                lsf.write_output(e.stdout)
+                lsf.write_output(e.stderr)
+            except:
                 pass
-    except Exception as e:
-        lsf.write_output(e)
-        try:
-            lsf.write_output(e.stdout)
-            lsf.write_output(e.stderr)
-        except:
-            pass
-        lsf.write_output('Adjustomatic failed at avitweaker - avi management-domain configuration step')
-        lsf.labfail('Adjustomatic failed at avitweaker - avi management-domain configuration step')
+            lsf.write_output('Adjustomatic failed at avitweaker - avi management-domain configuration step')
+            lsf.labfail('Adjustomatic failed at avitweaker - avi management-domain configuration step')
 
-    try:
-        lsf.write_output("Running final stages playbook")
-        # Playbook to run final config steps
-        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml",
-            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file",
-            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-        # Playbook already succeeded at this point - don't let a transient I/O error while
-        # logging its output turn a successful run into a lab failure.
+    with track_step(lsf, _telemetry_results, 'final_stage_playbook'):
         try:
-            retry_io(lsf.write_output, result, console=False)
-            retry_io(lsf.write_output, result.stdout, console=False)
-        except OSError as log_err:
+            lsf.write_output("Running final stages playbook")
+            # Playbook to run final config steps
+            result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/labconfig_finalstage.yaml",
+                "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/inventory.yml", "--vault-password-file",
+                "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+            # Playbook already succeeded at this point - don't let a transient I/O error while
+            # logging its output turn a successful run into a lab failure.
             try:
-                lsf.write_output(f"final stage playbook succeeded, but logging its output failed: {log_err}")
-            except OSError:
+                retry_io(lsf.write_output, result, console=False)
+                retry_io(lsf.write_output, result.stdout, console=False)
+            except OSError as log_err:
+                try:
+                    lsf.write_output(f"final stage playbook succeeded, but logging its output failed: {log_err}")
+                except OSError:
+                    pass
+        except Exception as e:
+            lsf.write_output(e)
+            try:
+                lsf.write_output(e.stdout)
+                lsf.write_output(e.stderr)
+            except:
                 pass
-    except Exception as e:
-        lsf.write_output(e)
-        try:
-            lsf.write_output(e.stdout)
-            lsf.write_output(e.stderr)
-        except:
-            pass   
-        lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step')
-        lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
+            lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step')
+            lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
 
     # Confirm the VKS worker node pool scale-up kicked off at the very top
     # of this function actually finished (fails the lab if it didn't) --
     # run last so it's had the full runtime of everything above to converge
     # in the background first.
-    wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
+    with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
+        wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
+
+    # Telemetry upload -- always last, always best-effort. See
+    # send_telemetry_summary()'s docstring: no failure mode here can fail
+    # the lab or affect anything above: the try/except here is deliberate
+    # defense-in-depth on top of that function's own internal try/except,
+    # specifically so that even an unanticipated bug in the telemetry code
+    # itself still can't take startup down with it.
+    try:
+        send_telemetry_summary(lsf, _telemetry_results, _run_started_at_iso, _time.time() - _run_start)
+    except Exception as _telemetry_err:
+        try:
+            lsf.write_output(f'  WARNING: telemetry summary step itself raised (non-fatal, lab startup unaffected): {_telemetry_err}')
+        except Exception:
+            pass
 
     # try:
     #     stdout = subprocess.run(["/usr/bin/rm", "-rf", "/home/holuser/vaultsecret.txt"], text=True, check=True)
