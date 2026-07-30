@@ -522,6 +522,96 @@ def install_vmsp_kvip_keeper_cron(lsf):
         lsf.write_output(f'  WARNING: could not install kvip-keeper cron job: {e}')
 
 
+# SSH target for the VCFA (VMware Cloud Foundation Automation) appliance's
+# own single-node control-plane VM -- a completely separate kube-vip
+# instance from the vmsp-platform gateway one hardened above. VCFA's own
+# "vcfa-stabilizer.sh" (not part of this repo -- lives only on the live
+# appliance/console, found and read live during the 2026-07-30 session)
+# already hardens this node's kube-vip *lease/renew/retry timing* via its
+# own "Phase 1.5" marker, but that hardening only ever bumped
+# vip_renewdeadline (default 10s -> 90s) without correspondingly raising
+# vip_leaseduration (left at its default 60s) -- an invalid combination
+# per Kubernetes' own leaderelection invariant (leaseDuration must exceed
+# renewDeadline, which must exceed retryPeriod). kube-vip panics on
+# startup rather than merely misbehaving when this is violated, so the
+# static pod (kubelet-managed, not a Deployment) crash-loops forever with
+# no auto-recovery. Confirmed live: 111 restarts over 22h before this was
+# found and fixed by hand.
+VCFA_SSH_HOST = 'vmware-system-user@10.1.1.72'
+VCFA_KUBE_VIP_MANIFEST = '/etc/kubernetes/manifests/kube-vip.yaml'
+
+
+def fix_vcfa_kube_vip_lease_invariant(lsf):
+    """
+    Idempotently ensure the VCFA appliance's own control-plane kube-vip
+    static pod manifest satisfies vip_leaseduration > vip_renewdeadline >
+    vip_retryperiod. See VCFA_SSH_HOST's comment above for the full root
+    cause: this doesn't just correct the one 60/90 combination found live
+    on 2026-07-30 -- it re-derives a safe leaseduration from whatever
+    renewdeadline/retryperiod are *currently* set to, so it stays correct
+    even if vcfa-stabilizer.sh's own values change in a future version.
+
+    This is a static pod (kubelet watches the manifest file directly, no
+    Deployment/DaemonSet to patch or rollout-restart) -- rewriting the file
+    is the fix; kubelet picks up the change and restarts the pod itself,
+    typically within a few seconds.
+
+    Non-fatal: any failure here is logged as a warning and does not fail
+    lab startup.
+    """
+    import base64
+
+    lsf.write_output('Checking VCFA kube-vip lease/renew/retry invariant...')
+    password = lsf.get_password()
+
+    fix_py = f"""
+import re, sys
+
+MANIFEST = '{VCFA_KUBE_VIP_MANIFEST}'
+
+def get_val(content, name):
+    m = re.search(r'- name: ' + name + r'\\s*\\n\\s*value: "(\\d+)"', content)
+    return int(m.group(1)) if m else None
+
+with open(MANIFEST) as f:
+    content = f.read()
+
+lease = get_val(content, 'vip_leaseduration')
+renew = get_val(content, 'vip_renewdeadline')
+retry = get_val(content, 'vip_retryperiod')
+
+if lease is None or renew is None:
+    print(f'FIELDS_NOT_FOUND lease={{lease}} renew={{renew}} retry={{retry}}')
+    sys.exit(0)
+
+if lease > renew > (retry or 0):
+    print(f'ALREADY_VALID lease={{lease}} renew={{renew}} retry={{retry}}')
+    sys.exit(0)
+
+new_lease = renew + 30
+new_content = re.sub(
+    r'(- name: vip_leaseduration\\s*\\n\\s*value: )"\\d+"',
+    lambda m: m.group(1) + f'"{{new_lease}}"',
+    content,
+)
+with open(MANIFEST, 'w') as f:
+    f.write(new_content)
+print(f'FIXED lease={{lease}}->{{new_lease}} renew={{renew}} retry={{retry}}')
+"""
+    fix_b64 = base64.b64encode(fix_py.encode()).decode()
+    remote_cmd = (
+        f"echo {fix_b64} | base64 -d > /tmp/vcfa_kvip_fix.py && "
+        f"echo '{password}' | sudo -S python3 /tmp/vcfa_kvip_fix.py; "
+        f"rm -f /tmp/vcfa_kvip_fix.py"
+    )
+    try:
+        result = lsf.ssh(remote_cmd, VCFA_SSH_HOST, password)
+        out_text = (getattr(result, 'stdout', '') or '').strip()
+        lsf.write_output(f'  {out_text or "(no output)"}')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not check/fix VCFA kube-vip lease invariant: {e}')
+
+
 def fix_firefox_remote_settings_bypass(lsf):
     """
     Disable Firefox's Remote Settings network calls on the console jump
@@ -2373,6 +2463,15 @@ def main():
         # See fix_vmsp_gateway_kubevip() docstring for full root-cause detail.
         with track_step(lsf, _telemetry_results, 'vmsp_kubevip_hardening'):
             fix_vmsp_gateway_kubevip(lsf)
+
+        # VCFA's own control-plane kube-vip (a different instance from the
+        # vmsp-platform one above) crash-loops forever if its own
+        # stabilizer script's lease/renew timing hardening leaves an
+        # invalid leaseDuration/renewDeadline combination in place -- see
+        # fix_vcfa_kube_vip_lease_invariant() docstring for the 2026-07-30
+        # incident this guards against.
+        with track_step(lsf, _telemetry_results, 'vcfa_kubevip_lease_invariant'):
+            fix_vcfa_kube_vip_lease_invariant(lsf)
 
         # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
         # page-load hang). Independent of everything else here; see
