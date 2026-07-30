@@ -1162,6 +1162,33 @@ def resync_nsxt_alb_enforcement_point_tokens(lsf):
                 lsf.write_output(f"  WARNING: {d['domain']}: could not generate Avi token: {token_resp}")
                 continue
 
+            # 'status' is a REQUIRED field on AviConnectionInfo, and NSX
+            # Policy does NOT field-merge this nested object on PATCH -- it
+            # replaces connection_info wholesale, filling in the schema
+            # default for anything omitted. That default is literally
+            # "DEACTIVATE_API" (confirmed via
+            # GET /policy/api/v1/infra/sites/default/enforcement-points --
+            # the healthy resting state for this integration is
+            # "DEACTIVATE_PROVIDER", NOT "DEACTIVATE_API"). An earlier
+            # version of this function omitted 'status' here and silently
+            # deactivated NSX<->Avi on every boot that happened to need a
+            # token refresh -- see the 2026-07-30 avi-secret/AKO
+            # CrashLoopBackOff incident, a second occurrence of the same
+            # underlying issue as the 2026-07-25 nsx-lockout incident this
+            # function was originally written to guard against. Always
+            # carry the existing status forward explicitly rather than
+            # trusting NSX to preserve it.
+            existing_status = ep.get('connection_info', {}).get('status') or 'DEACTIVATE_PROVIDER'
+            # Same wholesale-replace hazard applies to every other optional
+            # field on connection_info -- 'managed_by' (VCF/LCM) was found
+            # missing entirely during the 2026-07-30 incident, almost
+            # certainly wiped by this same function on an earlier run.
+            # Losing it doesn't break token refresh directly, but it does
+            # break NSX's own /infra/alb-onboarding-workflow/{managed-by}
+            # de-registration API (throws a server-side NullPointerException
+            # on a null managed_by) -- carry it forward too so a future
+            # manual re-registration isn't blocked by our own omission.
+            existing_managed_by = ep.get('connection_info', {}).get('managed_by') or 'VCF'
             patch_body = {
                 '_revision': ep['_revision'],
                 'connection_info': {
@@ -1171,6 +1198,8 @@ def resync_nsxt_alb_enforcement_point_tokens(lsf):
                     'password': token_resp['token'],
                     'expires_at': token_resp['expires_at'],
                     'tenant': 'admin',
+                    'status': existing_status,
+                    'managed_by': existing_managed_by,
                 },
             }
             patch_result = requests.patch(
@@ -1181,8 +1210,171 @@ def resync_nsxt_alb_enforcement_point_tokens(lsf):
                 f"(PATCH {patch_result.status_code})"
             )
 
+            # Verify the PATCH actually left the endpoint in the state we
+            # asked for -- don't just trust a 200. This is exactly the
+            # check that would have caught the missing-'status' bug
+            # immediately instead of it silently breaking AKO hours later.
+            verify = requests.get(ep_url, auth=('admin', admin_password), verify=False, timeout=15).json()
+            verify_status = verify.get('connection_info', {}).get('status')
+            if verify_status != existing_status:
+                lsf.write_output(
+                    f"  WARNING: {d['domain']}: enforcement-point status is '{verify_status}' "
+                    f"after patch, expected '{existing_status}' -- NSX<->Avi integration may be "
+                    f"broken; AKO/NCP on this domain will likely fail to get an avi-secret"
+                )
+
         except Exception as e:
             lsf.write_output(f"  WARNING: could not resync {d['domain']} enforcement-point token: {e}")
+
+
+# wld01-a is the only domain with a Supervisor cluster / AKO on it (see
+# NSXT_ALB_DOMAINS' own immune_addresses comment above) -- mgmt-a has no
+# equivalent secret chain to check here, so this all runs against the
+# Supervisor context directly rather than looping over NSXT_ALB_DOMAINS.
+AKO_NAMESPACE = 'vmware-system-ako'
+NCP_NAMESPACE = 'vmware-system-nsx'
+NCP_DEPLOYMENT = 'nsx-ncp'
+NETOP_NAMESPACE = 'vmware-system-netop'
+NETOP_DEPLOYMENT = 'vmware-system-netop-controller-manager'
+
+
+def ensure_ako_avi_secret_healthy(lsf, timeout_per_step=90, poll_interval=10):
+    """
+    Detect and repair the 2026-07-30 avi-secret/AKO CrashLoopBackOff class of
+    failure: AKO's controller-manager/crd-operator pods in vmware-system-ako
+    crash-loop because the 'avi-secret' Kubernetes Secret they depend on was
+    never created. That secret is derived through a chain of components,
+    none of which retries automatically or promptly on every failure mode:
+
+        NSX alb-endpoint EnforcementPoint (fixed durably by
+        resync_nsxt_alb_enforcement_point_tokens() above, if that was the
+        problem)
+          -> nsx-ncp's AviSecretController creates 'avi-init-secret' in
+             vmware-system-ako (namespace vmware-system-ako)
+          -> vmware-system-netop-controller-manager's loadbalancerconfig
+             controller reads avi-init-secret and creates 'avi-secret'
+          -> AKO consumes avi-secret
+
+    Root-caused live on 2026-07-30: even with a healthy alb-endpoint, this
+    chain does not reliably self-heal promptly -- nsx-ncp's AviSecretController
+    can be stuck retrying against a stale connection to NSX, and
+    vmware-system-netop-controller-manager's own AviLoadBalancerConfig
+    provider-sync only re-runs on its own resync cadence (empirically tens
+    of minutes) rather than the instant avi-init-secret appears. A plain
+    `rollout restart` of each -- in that order, since the second depends on
+    output from the first -- reliably unstuck both in every case tested
+    that day. This function automates exactly that, bounded and non-fatal.
+
+    Deliberately NOT automated here: deleting/recreating the NSX
+    EnforcementPoint itself. That was also needed once, live, to clear an
+    NSX<->Avi TLS handshake fault (BouncyCastle "certificate_unknown(46)")
+    that resync_nsxt_alb_enforcement_point_tokens() cannot fix (that
+    function only ever PATCHes an existing EnforcementPoint's
+    connection_info; it never touches the TLS layer). The exact mechanism
+    by which delete+recreate cleared that fault was never conclusively
+    pinned down (possibly a stale connection/session cache on NSX Manager
+    keyed to the EnforcementPoint's own identity, possibly coincidental
+    timing) -- automating a blind delete of a live, shared NSX object on
+    every boot on an unconfirmed hypothesis is a worse trade than leaving
+    this one case to a human, so this function stops short of that and
+    just logs a clear pointer to it instead.
+
+    Non-fatal: any failure or unresolved state here is logged as a warning
+    and does not fail lab startup.
+    """
+    import time
+
+    lsf.write_output('Checking AKO / avi-secret health on Supervisor...')
+    password = lsf.get_password()
+
+    def _ako_pods_ready():
+        cmd = (
+            f"kubectl --context Supervisor -n {AKO_NAMESPACE} get pods "
+            f"-o jsonpath='{{range .items[*]}}{{.metadata.name}}{{\" \"}}"
+            f"{{.status.containerStatuses[*].ready}}{{\"\\n\"}}{{end}}'"
+        )
+        result = lsf.ssh(cmd, VKS_KUBECTL_HOST, password)
+        out = (getattr(result, 'stdout', '') or '').strip()
+        if not out:
+            return False
+        for line in out.splitlines():
+            if 'false' in line.split():
+                return False
+        return True
+
+    def _secret_exists(namespace, name):
+        cmd = f"kubectl --context Supervisor -n {namespace} get secret {name} --ignore-not-found -o name"
+        result = lsf.ssh(cmd, VKS_KUBECTL_HOST, password)
+        return bool((getattr(result, 'stdout', '') or '').strip())
+
+    def _wait_for(predicate, description):
+        deadline = time.time() + timeout_per_step
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(poll_interval)
+        lsf.write_output(f'  WARNING: timed out waiting for {description}')
+        return False
+
+    try:
+        if _ako_pods_ready():
+            lsf.write_output('  AKO pods are healthy -- no-op')
+            return
+
+        lsf.write_output('  AKO pods are not all Ready -- checking avi-secret chain')
+
+        if not _secret_exists(AKO_NAMESPACE, 'avi-secret'):
+            if not _secret_exists(AKO_NAMESPACE, 'avi-init-secret'):
+                lsf.write_output(
+                    f"  avi-init-secret missing -- restarting {NCP_DEPLOYMENT} "
+                    f"to force its AviSecretController to retry"
+                )
+                lsf.ssh(
+                    f"kubectl --context Supervisor -n {NCP_NAMESPACE} rollout restart deployment {NCP_DEPLOYMENT}",
+                    VKS_KUBECTL_HOST, password,
+                )
+                if not _wait_for(
+                    lambda: _secret_exists(AKO_NAMESPACE, 'avi-init-secret'),
+                    'avi-init-secret to appear after nsx-ncp restart',
+                ):
+                    lsf.write_output(
+                        '  avi-init-secret still missing after restarting nsx-ncp. This can mean '
+                        'the NSX<->Avi connection itself is broken beneath the object data (a TLS '
+                        'handshake fault was the cause on 2026-07-30, invisible to a plain status '
+                        'check) -- manually verify with: '
+                        "curl -sk -u admin:<password> -X PUT "
+                        "'https://nsx-<domain>.site-a.vcf.lab/policy/api/v1/infra/alb-auth-token' "
+                        "-d '{\"username\":\"nsxt-alb\",\"hours\":\"5\"}' -- a "
+                        "'Certificate validation failed' response confirms it. See the "
+                        "nsx-lockout incident doc for the full delete/re-create remediation; "
+                        "not attempted automatically here."
+                    )
+                    return
+
+            lsf.write_output(
+                f"  avi-init-secret present -- restarting {NETOP_DEPLOYMENT} "
+                f"to force it to derive avi-secret"
+            )
+            lsf.ssh(
+                f"kubectl --context Supervisor -n {NETOP_NAMESPACE} rollout restart deployment {NETOP_DEPLOYMENT}",
+                VKS_KUBECTL_HOST, password,
+            )
+            if not _wait_for(
+                lambda: _secret_exists(AKO_NAMESPACE, 'avi-secret'),
+                'avi-secret to appear after netop-controller-manager restart',
+            ):
+                return
+
+        lsf.write_output('  avi-secret present -- forcing AKO pods to restart rather than wait out backoff')
+        lsf.ssh(
+            f"kubectl --context Supervisor -n {AKO_NAMESPACE} delete pods --all --wait=false",
+            VKS_KUBECTL_HOST, password,
+        )
+        if _wait_for(_ako_pods_ready, 'AKO pods to become Ready'):
+            lsf.write_output('  AKO pods are healthy after remediation')
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not verify/repair AKO avi-secret health: {e}')
 
 
 def resync_nsxt_alb_cloud_connector_credentials(lsf):
@@ -2220,6 +2412,14 @@ def main():
             resync_nsxt_alb_enforcement_point_tokens(lsf)
         with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
             resync_nsxt_alb_cloud_connector_credentials(lsf)
+        # Belt-and-suspenders check for the specific downstream failure the
+        # above two functions can still leave behind even when they
+        # succeed: AKO on Supervisor stuck in CrashLoopBackOff because
+        # avi-secret/avi-init-secret never got (re)created. See
+        # ensure_ako_avi_secret_healthy()'s docstring for the full chain
+        # and the 2026-07-30 incident this guards against.
+        with track_step(lsf, _telemetry_results, 'ako_avi_secret_health'):
+            ensure_ako_avi_secret_healthy(lsf)
         with track_step(lsf, _telemetry_results, 'sso_password_policy'):
             resync_sso_password_policy(lsf)
 
