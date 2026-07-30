@@ -325,6 +325,37 @@
     #     path: /home/holuser/Desktop/Postman.desktop
     #     state: absent
 
+    ## Taskbar pins are separate from Desktop-folder icons above - GNOME/Ubuntu
+    ## Dock stores them as a list of .desktop IDs in the org.gnome.shell
+    ## favorite-apps gsettings key, not as a file. Must run as holuser (no
+    ## become) since it's a per-user setting - same read/write pattern already
+    ## proven to work unattended in avi_modswitcher/create_launcher.py.
+    # - name: Remove Postman from taskbar/dock favorites
+    #   ansible.builtin.shell: |
+    #     set -e
+    #     python3 - <<'EOF'
+    #     import ast, subprocess
+    #     raw = subprocess.run(
+    #         ["gsettings", "get", "org.gnome.shell", "favorite-apps"],
+    #         capture_output=True, text=True, check=True,
+    #     ).stdout.strip()
+    #     if raw.startswith("@as "):
+    #         raw = raw[len("@as "):]
+    #     current = ast.literal_eval(raw)
+    #     updated = [a for a in current if "postman" not in a.lower()]
+    #     if updated != current:
+    #         new_value = "[" + ", ".join(f"'{a}'" for a in updated) + "]"
+    #         subprocess.run(
+    #             ["gsettings", "set", "org.gnome.shell", "favorite-apps", new_value],
+    #             check=True,
+    #         )
+    #         print("CHANGED")
+    #     else:
+    #         print("OK")
+    #     EOF
+    #   register: postman_favorites_result
+    #   changed_when: "'CHANGED' in postman_favorites_result.stdout"
+
     # - name: Remove bottraffic shortcut
     #   ansible.builtin.file:
     #     path: /home/holuser/Desktop/bottraffic.desktop
