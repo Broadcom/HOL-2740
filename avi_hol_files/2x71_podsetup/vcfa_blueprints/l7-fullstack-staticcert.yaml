@@ -1,0 +1,168 @@
+formatVersion: 1
+inputs:
+  namespace:
+    title: Namespace
+    type: string
+    description: Namespace you wish to deploy to
+    default: preprod-ns-3w9xh
+  vm_image_id:
+    title: VM image ID
+    type: string
+    description: the ID of the VM image for building the virtual machine
+    $data: /data/namespaceclass-vmimages
+  fqdn:
+    title: Hostname of the application
+    type: string
+    description: the fully qualified domain name of the application
+  secret_name:
+    title: TLS Secret
+    type: string
+    description: the name of the TLS secret that will secure the connection
+resources:
+  CCI_Supervisor_Namespace_1:
+    type: CCI.Supervisor.Namespace
+    properties:
+      name: ${input.namespace}
+      existing: true
+  HttpRoute_1:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: ${env.deploymentName}-httproute
+        spec:
+          hostnames:
+            - ${input.fqdn}
+          parentRefs:
+            - kind: Gateway
+              name: ${env.deploymentName}-gateway
+          rules:
+            - backendRefs:
+                - kind: Service
+                  name: ${env.deploymentName}-vmservice
+                  port: 80
+                  weight: 1
+              matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+  Virtual_Machine_Service_1:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: vmoperator.vmware.com/v1alpha5
+        kind: VirtualMachineService
+        metadata:
+          name: ${env.deploymentName}-vmservice
+        spec:
+          ports:
+            - name: http
+              port: 80
+              protocol: TCP
+              targetPort: 80
+          selector:
+            lb-selector: ${env.deploymentName}-app # This is how the LB will select VMs
+          type: ClusterIP # needs to be ClusterIP to generate a layer 7 VS
+  Gateway_1:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: Gateway
+        metadata:
+          name: ${env.deploymentName}-gateway
+        spec:
+          gatewayClassName: avi-lb
+          listeners:
+            - allowedRoutes:
+                namespaces:
+                  from: Same
+              hostname: ${input.fqdn}
+              name: https
+              port: 443
+              protocol: HTTPS
+              tls:
+                certificateRefs:
+                  - name: ${input.secret_name}
+                mode: Terminate
+  Virtual_Machine_1:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: vmoperator.vmware.com/v1alpha5
+        kind: VirtualMachine
+        metadata:
+          labels:
+            lb-selector: ${env.deploymentName}-app # This is how the LB will select VMs
+          name: ${env.deploymentName}-vm1
+        spec:
+          className: best-effort-xsmall
+          image:
+            kind: VirtualMachineImage
+            name: ${input.vm_image_id} #ID of the VM image to build from
+          powerState: PoweredOn
+          bootstrap:
+            cloudInit:
+              cloudConfig:
+                defaultUserEnabled: true
+                runcmd:
+                  - /usr/bin/apt update
+                  - /usr/bin/apt-get install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
+                users:
+                  - name: aviuser
+                    passwd:
+                      name: ${env.deploymentName}-bootstrap-secret
+                      key: aviuser-passwd
+                    lock_passwd: false
+                    sudo: ALL=(ALL) NOPASSWD:ALL
+          storageClass: mgmt-anchor-optimal-datastore-default-policy-autoraid
+  Virtual_Machine_2:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: vmoperator.vmware.com/v1alpha5
+        kind: VirtualMachine
+        metadata:
+          labels:
+            lb-selector: ${env.deploymentName}-app # This is how the LB will select VMs
+          name: ${env.deploymentName}-vm2
+        spec:
+          className: best-effort-xsmall
+          image:
+            kind: VirtualMachineImage
+            name: ${input.vm_image_id} #ID of the VM image to build from
+          powerState: PoweredOn
+          bootstrap:
+            cloudInit:
+              cloudConfig:
+                defaultUserEnabled: true
+                runcmd:
+                  - /usr/bin/apt update
+                  - /usr/bin/apt-get install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
+                users:
+                  - name: aviuser
+                    passwd:
+                      name: ${env.deploymentName}-bootstrap-secret
+                      key: aviuser-passwd
+                    lock_passwd: false
+                    sudo: ALL=(ALL) NOPASSWD:ALL
+          storageClass: mgmt-anchor-optimal-datastore-default-policy-autoraid
+  Username_Secret:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.CCI_Supervisor_Namespace_1.id}
+      manifest:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: ${env.deploymentName}-bootstrap-secret
+          namespace: ${resource.CCI_Supervisor_Namespace_1.name}
+        stringData:
+          aviuser-passwd: $1$xITZYmhL$wz6xxzHHCnaZBJFkzfXIz0
