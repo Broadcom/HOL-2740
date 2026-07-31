@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-# VCF.py - HOLFY27 Core VCF Startup Module
-# Version 3.10 - 2026-07-22
-# Author - Burke Azbill and HOL Core Team
+# VCF.py - HOL-2740 Core VCF Startup Module
+# Version 3.11 - 2026-07-31
+# Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # VMware Cloud Foundation startup sequence
 #
+# v3.11 Changes (2026-07-31):
+# - CUSTOM section: added a second shim, adjustomatic.unpause_vks_clusters(),
+#   run right after the existing AKO shim. Undoes the spec.paused=true that
+#   this repo's customized Shutdown/VCFshutdown.py Phase 3b applies during
+#   shutdown (to stop Supervisor's CAPI reconciliation from fighting the
+#   graceful worker-VM power-off there). Nothing in the upstream
+#   HOLFY27-MGR-HOLUSER startup framework knows that pause exists, so without
+#   this it would stay paused indefinitely across power cycles. Placed here
+#   (not in Kubernetes.py/VCFfinal.py) for the same reason as the AKO shim:
+#   must run before those generic modules' own Supervisor checks, which have
+#   no ability to diagnose a paused cluster and could waste their own
+#   timeout budgets on it.
 # v3.10 Changes:
 # - Fix: Added outer retry loop (up to 3 attempts with 30s delay) in
 #   _start_vm_on_hosts() when VM power-on attempts fail across all candidate
@@ -887,6 +899,21 @@ def main(lsf=None, standalone=False, dry_run=False):
         adjustomatic.check_supervisor_ako_health_early(lsf)
     except Exception as e:
         lsf.write_output(f'Early AKO/avi-secret shim check failed (non-fatal): {e}')
+
+    # Shim: undo the Supervisor cluster pause applied by this repo's
+    # customized Shutdown/VCFshutdown.py (Phase 3b, pause_supervisor_clusters())
+    # during the last lab shutdown. Must run before Kubernetes.py's per-cluster
+    # health check and VCFfinal.py's Supervisor polling, since a paused
+    # cluster is exactly the kind of thing those generic modules have no
+    # ability to diagnose and could waste their own timeout budgets on.
+    # See adjustomatic.unpause_vks_clusters()'s docstring for full detail.
+    lsf.write_output('Checking for paused Supervisor clusters shim...')
+    try:
+        sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
+        import adjustomatic
+        adjustomatic.unpause_vks_clusters(lsf)
+    except Exception as e:
+        lsf.write_output(f'Supervisor cluster unpause shim failed (non-fatal): {e}')
 
     ##=========================================================================
     ## End CUSTOM section

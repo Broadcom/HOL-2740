@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+# Shutdown.py - HOL-2740 Lab Shutdown Orchestration
+# Version 2.8 - 2026-07-31
+# Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
+# Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
+# Main shutdown script for graceful lab environment shutdown
+#
+# v 2.8 Changes (2026-07-31) - HOL-2740 fork:
+# - CLI epilog: added Phase 3c (Supervisor CP VMs); also fixed pre-existing
+#   staleness (missing 4b, stale 19b) while touching this block. See
+#   VCFshutdown.py v3.10. (Avi Service Engine ordering was also fixed in
+#   v3.10, via a config.ini change, not a new phase — no epilog change
+#   needed for that half.)
+#
+# v 2.7 Changes (2026-07-31) - HOL-2740 fork:
+# - CLI epilog: reordered Phase 3/3b to match VCFshutdown.py v3.9 (WCP stop
+#   now runs before the cluster-pause step, not after).
+#
+# v 2.6 Changes (2026-06-01):
+# - Added run_vvf_shutdown() helper that imports VVFshutdown and routes VVF labs
+#   to the dedicated 8-phase VVF shutdown sequence.
+# - Detection logic: if [VVF] section present AND no [VCF] section → VVF path.
+#   VCF takes precedence if both sections exist (should not occur in practice).
+# - Updated CLI help text to include VVF shutdown phases.
+#
+# v 2.5 Changes (2026-05-14):
+# - Replaced remaining lsf.write_output() calls (module import error paths) with
+#   write_shutdown_output() so all Shutdown.py output goes only to shutdown.log.
+# - Fixed stale docstring in init_shutdown_log() referencing labstartup.log.
+# - Fixed stale comment in run_shutdown() referencing labstartup.log.
+# - Bumped SCRIPT_VERSION constant to match header (was stuck at 2.3).
+#
+# v 2.4 Changes (2026-05-13):
+# - Removed labstartup.log initialization and logging. All logging is only output to shutdown.log
+#
+# v 2.3 Changes (2026-04-27):
+# - Added --phases and --fleet-products CLI; mutually exclusive --phase / --phases; pass-through to VCFshutdown
+# - Orchestrator skips Docker (0b), cleanup (21), host wait (22) unless full run (no --phase / --phases)
+# - wait_for_hosts_poweroff: STILL_RUNNING heartbeat every 90s; optional shutdown_helpers import
+#
+# v 2.2 Changes:
+# - Updated vSAN elevator polling: now polls `/storage/lsom/elevatorRunning`
+#   on each host every 30 seconds until all hosts report `0` (flush complete)
+# - Removed 45-minute timeout safety ceiling: the script now finishes as
+#   soon as all hosts complete the flush. In a quiesced lab environment
+#   (all VMs already shut down), this typically takes **2-10 minutes**
+#   instead of the full 45.
+# - Added `--quick` flag to skip the elevator entirely (faster but less safe)
+# v 2.1 Changes:
+# - Fixed --phase parameter: now correctly runs only the targeted VCF
+#   shutdown phase instead of all phases from that point onward
+# - Outer orchestrator phases (Docker Containers, Final Cleanup, Wait for
+#   ESXi) are now skipped when --phase targets a single VCF phase
+#
+# v 2.0 Changes:
+# - Added --phase parameter for single-phase VCF shutdown execution
+# - Added VCF 9.0/9.1 dual-version support via VCFshutdown.py
+# - Updated CLI help with phase ID list and examples
+
+"""
+Lab Shutdown Orchestration Script
+
+This script provides a graceful, orderly shutdown of the HOL lab environment.
+The shutdown order is the REVERSE of the startup order to ensure all
+dependencies are properly handled.
+
+Startup Order (labstartup.py):
+1. prelim.py - Preliminary checks and services
+2. ESXi.py - ESXi host startup
+3. vSphere.py - vSphere infrastructure  
+4. VCF.py - VCF management (NSX, vCenter)
+5. services.py - Core services
+6. Kubernetes.py - Kubernetes clusters
+7. VCFfinal.py - Final VCF tasks (Tanzu, VCF Automation)
+8. final.py - Final cleanup
+
+Shutdown Order (this script):
+1. Fleet Operations - VCF Operations Suite via SDDC Manager
+2. Kubernetes/Tanzu workloads
+3. VCF Final components (VCF Automation VMs)
+4. Core services
+5. VCF Management (vCenter, NSX)
+6. vSphere infrastructure
+7. ESXi hosts (with vSAN elevator)
+
+Usage:
+    python3 Shutdown.py                    # Full shutdown
+    python3 Shutdown.py --dry-run          # Preview without changes
+    python3 Shutdown.py --phase 1          # Run a single VCF shutdown phase
+    python3 Shutdown.py --phase 1 --dry-run  # Preview a single phase
+    python3 Shutdown.py --help             # Show help
+
+Configuration:
+    The script reads from /tmp/config.ini for lab-specific settings.
+    Custom shutdown configuration can be added in the [SHUTDOWN] section.
+"""
+
+import os
+import sys
+import argparse
+import logging
+import time
+import datetime
+
+# Add hol directory to path
+sys.path.insert(0, '/home/holuser/hol')
+sys.path.insert(0, '/home/holuser/hol/Shutdown')
+
+try:
+    import shutdown_helpers as shutdown_helpers  # noqa: F401
+except ImportError:
+    shutdown_helpers = None  # type: ignore
+
+# Default logging level
+logging.basicConfig(
+    level=logging.WARNING,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+#==============================================================================
+# SCRIPT CONFIGURATION
+#==============================================================================
+
+SCRIPT_NAME = 'Shutdown'
+SCRIPT_VERSION = '2.8'
+SCRIPT_DESCRIPTION = 'HOL-2740 Lab Shutdown Orchestration'
+
+# Log files
+SHUTDOWN_LOG = '/home/holuser/hol/shutdown.log'
+
+# Status file for console display
+STATUS_FILE = '/lmchol/hol/startup_status.txt'
+
+# Valid lab types that use VCF shutdown procedure
+VCF_LAB_TYPES = ['VCF', 'HOL', 'DISCOVERY', 'ATE', 'VXP', 'EDU', 'NINJA']
+
+#==============================================================================
+# LOGGING FUNCTIONS
+#==============================================================================
+
+def init_shutdown_log(dry_run: bool = False):
+    """
+    Initialize the shutdown log file.
+    
+    :param dry_run: If True, skip log initialization
+    """
+    if dry_run:
+        return
+    
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    header = f'Lab Shutdown: {timestamp}\n'
+    
+    # Initialize shutdown.log
+    try:
+        with open(SHUTDOWN_LOG, 'w') as f:
+            f.write(header)
+            f.write('=' * 70 + '\n')
+    except Exception as e:
+        print(f'Warning: Could not initialize {SHUTDOWN_LOG}: {e}')
+
+
+def update_status(status: str, dry_run: bool = False):
+    """
+    Update the startup_status.txt file with current shutdown status.
+    This is displayed on the console desktop widget.
+    
+    :param status: Status text to write
+    :param dry_run: If True, skip status update
+    """
+    if dry_run:
+        return
+    
+    try:
+        # Ensure directory exists
+        status_dir = os.path.dirname(STATUS_FILE)
+        if status_dir and not os.path.exists(status_dir):
+            os.makedirs(status_dir, exist_ok=True)
+        
+        with open(STATUS_FILE, 'w') as f:
+            f.write(status)
+    except Exception as e:
+        print(f'Warning: Could not update status file: {e}')
+
+
+def write_shutdown_output(msg: str, lsf=None):
+    """
+    Write output to both console and shutdown log file.
+    
+    :param msg: Message to write
+    :param lsf: Optional lsfunctions module for additional logging (NFS locations)
+    """
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    formatted_msg = f'[{timestamp}] {msg}'
+    
+    # Print to console
+    print(formatted_msg)
+    
+    # Write to shutdown log
+    try:
+        with open(SHUTDOWN_LOG, 'a') as f:
+            f.write(formatted_msg + '\n')
+    except Exception:
+        pass
+
+#==============================================================================
+# HELPER FUNCTIONS
+#==============================================================================
+
+def print_banner(lsf):
+    """Print shutdown script banner"""
+    banner = f"""
+================================================================================
+    {SCRIPT_DESCRIPTION}
+    Version {SCRIPT_VERSION} - February 2026
+================================================================================
+"""
+    write_shutdown_output(banner, lsf)
+
+
+def print_phase_header(lsf, phase_num, phase_name: str, dry_run: bool = False):
+    """Print a phase header and update status file"""
+    write_shutdown_output('', lsf)
+    write_shutdown_output('=' * 70, lsf)
+    write_shutdown_output(f'PHASE {phase_num}: {phase_name}', lsf)
+    write_shutdown_output('=' * 70, lsf)
+    
+    # Update status file for console display
+    update_status(f'Shutdown Phase {phase_num}: {phase_name}', dry_run)
+
+
+def import_shutdown_module(module_name: str, lsf):
+    """
+    Dynamically import and run a shutdown module
+    
+    :param module_name: Name of the module (without .py)
+    :param lsf: lsfunctions module
+    :return: Module or None if not found
+    """
+    module_path = f'/home/holuser/hol/Shutdown/{module_name}.py'
+    
+    if not os.path.isfile(module_path):
+        write_shutdown_output(f'Shutdown module not found: {module_name}')
+        return None
+    
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:
+        write_shutdown_output(f'Failed to import {module_name}: {e}')
+        return None
+
+
+#==============================================================================
+# SHUTDOWN PHASES
+#==============================================================================
+
+def shutdown_docker_containers(lsf, dry_run: bool = False) -> bool:
+    """
+    Shutdown Docker containers on remote Docker host
+    
+    :param lsf: lsfunctions module
+    :param dry_run: Preview mode
+    :return: Success status
+    """
+    docker_host = None
+    docker_user = 'holuser'
+    container_list = []
+    
+    if lsf.config.has_option('SHUTDOWN', 'docker_host'):
+        docker_host = lsf.config.get('SHUTDOWN', 'docker_host')
+    else:
+        docker_host = 'docker.site-a.vcf.lab'
+    
+    if lsf.config.has_option('SHUTDOWN', 'docker_user'):
+        docker_user = lsf.config.get('SHUTDOWN', 'docker_user')
+    
+    if lsf.config.has_option('SHUTDOWN', 'docker_containers'):
+        containers_raw = lsf.config.get('SHUTDOWN', 'docker_containers')
+        container_list = [c.strip() for c in containers_raw.split(',') if c.strip()]
+    else:
+        container_list = ['gitlab', 'ldap', 'poste.io', 'flask']
+    
+    if not lsf.test_tcp_port(docker_host, 22, timeout=5):
+        write_shutdown_output(f'Docker host {docker_host} not reachable, skipping', lsf)
+        return True
+    
+    password = lsf.get_password()
+    
+    for container in container_list:
+        if dry_run:
+            write_shutdown_output(f'Would stop container: {container}', lsf)
+        else:
+            write_shutdown_output(f'Stopping container: {container}', lsf)
+            try:
+                lsf.ssh(f'docker stop {container}', f'{docker_user}@{docker_host}', password)
+            except Exception as e:
+                write_shutdown_output(f'Warning: Failed to stop {container}: {e}', lsf)
+    
+    return True
+
+
+def run_vcf_shutdown(lsf, dry_run: bool = False, phase=None,
+                     phases=None, fleet_products=None) -> dict:
+    """
+    Run the VCF shutdown module
+
+    :param lsf: lsfunctions module
+    :param dry_run: Preview mode
+    :param phase: Run only this VCF shutdown phase (single)
+    :param phases: Comma-separated phases for one process (multi)
+    :param fleet_products: Override [SHUTDOWN] fleet_products for Phase 1
+    :return: Dictionary with 'success' status and 'esx_hosts' list
+    """
+    module = import_shutdown_module('VCFshutdown', lsf)
+
+    if module is None:
+        write_shutdown_output('VCFshutdown module not available')
+        return {'success': False, 'esx_hosts': []}
+
+    try:
+        result = module.main(
+            lsf=lsf, dry_run=dry_run, phase=phase, phases=phases,
+            fleet_products_override=fleet_products)
+        if isinstance(result, dict):
+            return result
+        else:
+            return {'success': result, 'esx_hosts': []}
+    except Exception as e:
+        write_shutdown_output(f'VCFshutdown failed: {e}', lsf)
+        import traceback
+        write_shutdown_output(f'Traceback: {traceback.format_exc()}', lsf)
+        return {'success': False, 'esx_hosts': []}
+
+
+def run_vvf_shutdown(lsf, dry_run: bool = False, phase=None) -> dict:
+    """
+    Run the VVF shutdown module (8-phase graceful shutdown for VVF labs).
+
+    :param lsf: lsfunctions module
+    :param dry_run: Preview mode
+    :param phase: Run only this VVF shutdown phase (single, e.g. '1', '5')
+    :return: Dictionary with 'success' status and 'esx_hosts' list
+    """
+    module = import_shutdown_module('VVFshutdown', lsf)
+
+    if module is None:
+        write_shutdown_output('VVFshutdown module not available')
+        return {'success': False, 'esx_hosts': []}
+
+    try:
+        result = module.main(lsf=lsf, dry_run=dry_run, phase=phase)
+        if isinstance(result, dict):
+            return result
+        else:
+            return {'success': bool(result), 'esx_hosts': []}
+    except Exception as e:
+        write_shutdown_output(f'VVFshutdown failed: {e}', lsf)
+        import traceback
+        write_shutdown_output(f'Traceback: {traceback.format_exc()}', lsf)
+        return {'success': False, 'esx_hosts': []}
+
+
+def wait_for_hosts_poweroff(lsf, hosts: list, dry_run: bool = False,
+                            max_wait: int = 1800, poll_interval: int = 15):
+    """
+    Wait for ESXi hosts to stop responding to pings (fully powered off)
+    
+    :param lsf: lsfunctions module
+    :param hosts: List of host FQDNs/IPs to monitor
+    :param dry_run: Preview mode
+    :param max_wait: Maximum wait time in seconds (default 30 minutes)
+    :param poll_interval: Time between ping attempts in seconds (default 15)
+    :return: True if all hosts are offline, False if timeout
+    """
+    import time
+    
+    if not hosts:
+        write_shutdown_output('No ESXi hosts to monitor for power off', lsf)
+        return True
+    
+    if dry_run:
+        write_shutdown_output(f'Would wait for {len(hosts)} host(s) to power off: {hosts}', lsf)
+        return True
+    
+    write_shutdown_output('', lsf)
+    write_shutdown_output('ESXi hosts are powering off...', lsf)
+    write_shutdown_output(f'Monitoring {len(hosts)} host(s) for up to {max_wait // 60} minutes', lsf)
+    update_status('Waiting for ESXi Hosts to Power Off', dry_run)
+    
+    start_time = time.time()
+    hosts_remaining = set(hosts)
+    last_hb = time.time()
+
+    while (time.time() - start_time) < max_wait:
+        elapsed = int(time.time() - start_time)
+        now = time.time()
+        hb_sec = (shutdown_helpers.HEARTBEAT_SEC if shutdown_helpers else 90)
+        if (now - last_hb) >= hb_sec:
+            rem = max_wait - elapsed
+            write_shutdown_output(
+                f'STILL_RUNNING: host power-off wait — {len(hosts_remaining)} host(s) up, '
+                f'{rem}s left on wait ceiling',
+                lsf)
+            last_hb = now
+        hosts_still_up = set()
+        
+        for host in hosts_remaining:
+            # Extract hostname if it contains additional info (like user:pass)
+            hostname = host.split(':')[0] if ':' in host else host
+            
+            if lsf.test_ping(hostname, count=1, timeout=5):
+                hosts_still_up.add(host)
+        
+        # Report any newly offline hosts
+        newly_offline = hosts_remaining - hosts_still_up
+        for host in newly_offline:
+            hostname = host.split(':')[0] if ':' in host else host
+            write_shutdown_output(f'  {hostname}: Powered off (elapsed: {elapsed}s)', lsf)
+        
+        hosts_remaining = hosts_still_up
+        
+        if not hosts_remaining:
+            elapsed = int(time.time() - start_time)
+            write_shutdown_output(f'All ESXi hosts powered off after {elapsed} seconds', lsf)
+            return True
+        
+        # Show status
+        remaining_time = max_wait - elapsed
+        write_shutdown_output(f'  {len(hosts_remaining)} host(s) still running... '
+                            f'(elapsed: {elapsed}s, remaining: {remaining_time}s)', lsf)
+        last_hb = time.time()
+
+        time.sleep(poll_interval)
+    
+    # Timeout - report which hosts are still up
+    elapsed = int(time.time() - start_time)
+    write_shutdown_output(f'Timeout after {elapsed}s - {len(hosts_remaining)} host(s) still responding:', lsf)
+    for host in hosts_remaining:
+        hostname = host.split(':')[0] if ':' in host else host
+        write_shutdown_output(f'  - {hostname}', lsf)
+    
+    return False
+
+
+#==============================================================================
+# MAIN FUNCTION
+#==============================================================================
+
+def main(lsf=None, dry_run: bool = False, skip_vsan_wait: bool = False,
+         skip_host_shutdown: bool = False, phase=None, phases=None,
+         fleet_products=None):
+    """
+    Main shutdown orchestration function
+
+    :param lsf: lsfunctions module (will be imported if None)
+    :param dry_run: Preview mode - show what would be done
+    :param skip_vsan_wait: Skip the vSAN elevator wait period
+    :param skip_host_shutdown: Skip ESXi host shutdown
+    :param phase: Run only this specific VCF shutdown phase (e.g., '1', '13')
+    :param phases: Comma-separated VCF phases for one run (e.g. '2,8')
+    :param fleet_products: Comma-separated Phase 1 product keys (e.g. 'vra,vrni')
+    """
+    start_time = datetime.datetime.now()
+    
+    # Initialize shutdown log
+    init_shutdown_log(dry_run)
+    
+    if lsf is None:
+        import lsfunctions as lsf
+        lsf.init(router=False)
+    
+    # Enable console output for real-time feedback during shutdown
+    lsf.console_output = True
+    
+    # Set initial status
+    update_status('Shutting Down', dry_run)
+    
+    if phase is None and phases is None:
+        print_banner(lsf)
+        write_shutdown_output(f'Shutdown started at: {start_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
+        write_shutdown_output(f'Lab SKU: {lsf.lab_sku}', lsf)
+        write_shutdown_output(f'Dry run mode: {dry_run}', lsf)
+        if dry_run:
+            write_shutdown_output('', lsf)
+            write_shutdown_output('*** DRY RUN MODE - No changes will be made ***', lsf)
+            write_shutdown_output('', lsf)
+    
+    #==========================================================================
+    # Phase 0: Pre-shutdown checks
+    #==========================================================================
+    
+    if phase is None and phases is None:
+        print_phase_header(lsf, 0, 'Pre-Shutdown Checks', dry_run)
+    
+    if not os.path.isfile(lsf.configini):
+        if phase is None and phases is None:
+            write_shutdown_output('WARNING: config.ini not found - using defaults', lsf)
+    elif phase is None and phases is None:
+        write_shutdown_output(f'Config file: {lsf.configini}', lsf)
+    
+    lab_type = 'VCF'
+    if lsf.config.has_option('VPOD', 'labtype'):
+        lab_type = lsf.config.get('VPOD', 'labtype').upper()
+    
+    if phase is None and phases is None:
+        write_shutdown_output(f'Lab type: {lab_type}', lsf)
+    
+    #==========================================================================
+    # Phase 0b: Docker Containers (Optional) - skip when --phase targets a VCF phase
+    #==========================================================================
+    
+    if phase is None and phases is None:
+        print_phase_header(lsf, '0b', 'Docker Containers', dry_run)
+        
+        if lsf.config.has_option('SHUTDOWN', 'shutdown_docker'):
+            if lsf.config.getboolean('SHUTDOWN', 'shutdown_docker'):
+                shutdown_docker_containers(lsf, dry_run)
+            else:
+                write_shutdown_output('Docker shutdown disabled in config', lsf)
+        else:
+            docker_host = 'docker.site-a.vcf.lab'
+            if lsf.config.has_option('SHUTDOWN', 'docker_host'):
+                docker_host = lsf.config.get('SHUTDOWN', 'docker_host')
+            
+            if lsf.test_tcp_port(docker_host, 22, timeout=5):
+                shutdown_docker_containers(lsf, dry_run)
+            else:
+                write_shutdown_output(f'Docker host {docker_host} not reachable, skipping', lsf)
+    
+    #==========================================================================
+    # VCF/VVF Shutdown (Main)
+    # Detection: [VVF] section present AND no [VCF] section → VVF shutdown path.
+    # VCF takes precedence if both sections present (should not occur in practice).
+    #==========================================================================
+
+    esx_hosts = []
+    vcf_result = {'success': False, 'esx_hosts': []}
+
+    # Determine whether this lab uses the VVF shutdown path.
+    # VVF labs have [VVF] but not [VCF] in config.ini.
+    is_vvf_lab = (lsf.config.has_section('VVF') and
+                  not lsf.config.has_section('VCF'))
+
+    if is_vvf_lab:
+        if phase is None and phases is None:
+            write_shutdown_output('VVF lab detected — using VVF shutdown procedure (8 phases)', lsf)
+
+        if skip_vsan_wait and not dry_run:
+            if not lsf.config.has_section('SHUTDOWN'):
+                lsf.config.add_section('SHUTDOWN')
+            lsf.config.set('SHUTDOWN', 'vsan_timeout', '0')
+
+        if skip_host_shutdown and not dry_run:
+            if not lsf.config.has_section('SHUTDOWN'):
+                lsf.config.add_section('SHUTDOWN')
+            lsf.config.set('SHUTDOWN', 'shutdown_hosts', 'false')
+
+        vcf_result = run_vvf_shutdown(lsf, dry_run, phase=phase)
+
+    elif lab_type.upper() in VCF_LAB_TYPES:
+        if phase is None and phases is None:
+            write_shutdown_output(f'Lab type {lab_type} uses VCF shutdown procedure', lsf)
+
+        if skip_vsan_wait and not dry_run:
+            if not lsf.config.has_section('SHUTDOWN'):
+                lsf.config.add_section('SHUTDOWN')
+            lsf.config.set('SHUTDOWN', 'vsan_timeout', '0')
+
+        if skip_host_shutdown and not dry_run:
+            if not lsf.config.has_section('SHUTDOWN'):
+                lsf.config.add_section('SHUTDOWN')
+            lsf.config.set('SHUTDOWN', 'shutdown_hosts', 'false')
+
+        vcf_result = run_vcf_shutdown(
+            lsf, dry_run, phase=phase, phases=phases, fleet_products=fleet_products)
+
+    else:
+        if phase is None and phases is None:
+            write_shutdown_output(f'Lab type {lab_type} - using default VCF shutdown procedure', lsf)
+        vcf_result = run_vcf_shutdown(
+            lsf, dry_run, phase=phase, phases=phases, fleet_products=fleet_products)
+    
+    # Extract ESXi hosts list from VCF shutdown result
+    esx_hosts = vcf_result.get('esx_hosts', [])
+    
+    #==========================================================================
+    # Phase 21: Final Cleanup - skip when --phase targets a single VCF phase
+    #==========================================================================
+    
+    if phase is None and phases is None:
+        print_phase_header(lsf, 21, 'Final Cleanup', dry_run)
+        
+        write_shutdown_output('Disconnecting vSphere sessions...', lsf)
+        if not dry_run:
+            from pyVim import connect
+            for si in lsf.sis:
+                try:
+                    connect.Disconnect(si)
+                except Exception:
+                    pass
+            lsf.sis.clear()
+            lsf.sisvc.clear()
+        
+        #======================================================================
+        # Phase 22: Wait for ESXi Hosts to Power Off
+        #======================================================================
+        
+        if esx_hosts and not skip_host_shutdown:
+            print_phase_header(lsf, 22, 'Wait for ESXi Host Power Off', dry_run)
+            wait_for_hosts_poweroff(lsf, esx_hosts, dry_run)
+    
+    #==========================================================================
+    # Summary
+    #==========================================================================
+    
+    end_time = datetime.datetime.now()
+    elapsed = end_time - start_time
+    
+    write_shutdown_output('', lsf)
+    write_shutdown_output('=' * 70, lsf)
+    if phases:
+        write_shutdown_output(f'VCF PHASES {phases} SHUTDOWN COMPLETE', lsf)
+    elif phase is not None:
+        write_shutdown_output(f'PHASE {phase} SHUTDOWN COMPLETE', lsf)
+    else:
+        write_shutdown_output('SHUTDOWN COMPLETE', lsf)
+    write_shutdown_output('=' * 70, lsf)
+    write_shutdown_output(f'Start time: {start_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
+    write_shutdown_output(f'End time: {end_time.strftime("%Y-%m-%d %H:%M:%S")}', lsf)
+    write_shutdown_output(f'Elapsed: {str(elapsed).split(".")[0]}', lsf)
+    
+    if phase is None and phases is None:
+        write_shutdown_output('', lsf)
+        if dry_run:
+            write_shutdown_output('*** DRY RUN COMPLETE - No changes were made ***', lsf)
+        else:
+            write_shutdown_output('Lab environment has been shut down.', lsf)
+            write_shutdown_output('Please manually shutdown your manager, router, and console.', lsf)
+            update_status('Shutdown Complete', dry_run)
+    
+    return True
+
+
+#==============================================================================
+# COMMAND LINE INTERFACE
+#==============================================================================
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description=SCRIPT_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python3 Shutdown.py                    # Full shutdown (all phases)
+    python3 Shutdown.py --dry-run          # Preview without changes
+    python3 Shutdown.py --quick            # Skip vSAN elevator (faster but less safe)
+    python3 Shutdown.py --no-hosts         # Shutdown VMs but leave hosts running
+    python3 Shutdown.py --phase 1          # Run only Fleet Operations phase
+    python3 Shutdown.py --phases 2,8       # vCenter connect + Ops for Networks VMs
+    python3 Shutdown.py --phase 1 --fleet-products vra,vrni   # Phase 1 subset
+    python3 Shutdown.py --phase 13         # Run only VCF Operations shutdown
+    python3 Shutdown.py --phase 1 --dry-run  # Preview a single phase
+
+VCF Shutdown Phases (for --phase / --phases):
+    1     Fleet Operations (VCF Operations Suite) Shutdown
+    1b    VCF Automation VM fallback (if Fleet API failed)
+    2     Connect to vCenters
+    2b    VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site VIP)
+    3     Stop Workload Control Plane (WCP)
+    3b    Pause Supervisor Clusters (kubectl patch cluster ... paused=true)
+    3c    Shutdown Supervisor Control Plane VM(s) (direct ESXi connection)
+    4     Shutdown Workload VMs (Tanzu, K8s) + Dynamic Discovery
+    4b    Shutdown VSP Platform VMs (vCenter primary; ESXi direct fallback)
+    5     Shutdown Workload Domain NSX Edges
+    6     Shutdown Workload Domain NSX Manager
+    7     Shutdown Workload vCenters
+    8     Shutdown VCF Operations for Networks VMs
+    9     Shutdown VCF Operations Collector VMs
+    10    Shutdown VCF Operations for Logs VMs
+    11    Shutdown VCF Identity Broker VMs
+    12    Shutdown VCF Operations Fleet Management VMs
+    13    Shutdown VCF Operations (vrops) VMs
+    14    Shutdown Management Domain NSX Edges
+    15    Shutdown Management Domain NSX Manager
+    16    Shutdown SDDC Manager
+    17    Shutdown Management vCenter
+    17b   Connect to ESXi Hosts directly
+    17c   Shutdown Post-Edge VMs (License Servers, etc.)
+    18    Set Host Advanced Settings
+    19    vSAN Elevator Operations
+    19c   Pre-ESXi Shutdown Audit
+    20    Shutdown ESXi Hosts
+
+VVF Shutdown Phases (auto-selected when [VVF] section in config.ini):
+    1     VSP Cluster Graceful Shutdown (vcf_services_runtime_shutdown.sh per site VIP)
+    2     Connect to vCenters
+    3     Shutdown VCF Operations VMs (ops-a, ops-b)
+    4     Establish ESXi Direct Connections (BEFORE vCenter shutdown)
+    5     Shutdown vCenter VMs (via ESXi direct)
+    6     Shutdown License VMs (via ESXi direct, AFTER vCenter off)
+    7     vSAN Elevator Operations (OSA only — ESA auto-detected and skipped)
+    8     Shutdown ESXi Hosts
+
+Configuration:
+    Add a [SHUTDOWN] section to /tmp/config.ini for customization:
+    
+    [SHUTDOWN]
+    fleet_fqdn = opslcm-a.site-a.vcf.lab
+    fleet_products = vra,vrni,vrops,vrli
+    docker_host = docker.site-a.vcf.lab
+    docker_containers = gitlab,ldap
+    vsan_enabled = true
+    vsan_timeout = 2700
+    shutdown_hosts = true
+"""
+    )
+    
+    parser.add_argument('--dry-run', '-n', action='store_true',
+                        help='Show what would be done without making changes')
+    
+    parser.add_argument('--quick', '-q', action='store_true',
+                        help='Skip vSAN elevator entirely (faster but less safe)')
+    
+    parser.add_argument('--no-hosts', action='store_true',
+                        help='Skip ESXi host shutdown (leave hosts running)')
+    
+    phase_grp = parser.add_mutually_exclusive_group()
+    phase_grp.add_argument('--phase', '-p', type=str, default=None,
+                           help='Run only a specific VCF shutdown phase (e.g., 1, 1b, 13, 17b)')
+    phase_grp.add_argument('--phases', type=str, default=None,
+                           help='Comma-separated VCF phases in one run (e.g. 2,8,13); prerequisites auto-inserted')
+
+    parser.add_argument('--fleet-products', type=str, default=None,
+                        help='Override [SHUTDOWN] fleet_products for Phase 1 (e.g. vra,vrni,vrops)')
+
+    parser.add_argument('--version', '-v', action='version',
+                        version=f'{SCRIPT_NAME} v{SCRIPT_VERSION}')
+    
+    parser.add_argument('--debug', '-d', action='store_true',
+                        help='Enable debug logging')
+    
+    args = parser.parse_args()
+    
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG, force=True,
+            format='[%(asctime)s] %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+    
+    # Run main shutdown
+    try:
+        success = main(
+            dry_run=args.dry_run,
+            skip_vsan_wait=args.quick,
+            skip_host_shutdown=args.no_hosts,
+            phase=args.phase,
+            phases=args.phases,
+            fleet_products=args.fleet_products,
+        )
+        sys.exit(0 if success else 1)
+    except KeyboardInterrupt:
+        print('\n\nShutdown interrupted by user')
+        sys.exit(130)
+    except Exception as e:
+        print(f'\nFATAL ERROR: {e}')
+        if args.debug:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)

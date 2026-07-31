@@ -125,6 +125,84 @@ def scale_vks_worker_nodepools(lsf, target_replicas=3):
             lsf.write_output(f'  WARNING: could not scale {cluster_name}: {e}')
 
 
+def unpause_vks_clusters(lsf):
+    """
+    Clear spec.paused on each cluster in VKS_WORKLOAD_CLUSTERS, undoing the
+    pause that HOL-2740's customized Shutdown/VCFshutdown.py Phase 3b
+    (pause_supervisor_clusters()) applies before the last lab shutdown.
+
+    Why this exists: the shutdown-side fix (2026-07-31) patches
+    spec.paused=true on the Supervisor Cluster object right after WCP stops,
+    to keep CAPI reconciliation from fighting Phase 4's graceful VM
+    power-off (it was seeing worker VMs go down and immediately powering
+    them back on). That fix intentionally does NOT undo the pause itself --
+    pausing is a shutdown-time action, so the matching unpause has to be a
+    startup-time action, and nothing in the upstream HOLFY27-MGR-HOLUSER
+    startup framework knows this pause exists. Left paused indefinitely, VM
+    boot is unaffected but CAPI self-healing for that cluster stays frozen --
+    so this must run on every lab startup, not just once.
+
+    Called from Startup/VCF.py's CUSTOM section (this repo), same shim slot
+    as check_supervisor_ako_health_early() and for the same reason: it needs
+    to run BEFORE Kubernetes.py's per-cluster health check and VCFfinal.py's
+    Supervisor polling, since a paused cluster is exactly the kind of thing
+    those generic downstream checks have no ability to diagnose or fix and
+    could waste their own timeout budgets on.
+
+    Idempotent: no-ops any cluster that isn't currently paused (covers both
+    "shutdown script never got to run" and "already unpaused" cases).
+    Non-fatal: any failure here is logged as a warning. Never raises --
+    safe to call from a CUSTOM section that isn't itself labfail-gated.
+    """
+    import base64
+
+    lsf.write_output('Checking for paused Supervisor clusters (post-shutdown unpause)...')
+    password = lsf.get_password()
+
+    for cluster_name in VKS_WORKLOAD_CLUSTERS:
+        try:
+            get_cmd = (
+                f"kubectl --context Supervisor -n {VKS_SUPERVISOR_NS} get cluster {cluster_name} "
+                f"-o jsonpath='{{.spec.paused}}'"
+            )
+            result = lsf.ssh(get_cmd, VKS_KUBECTL_HOST, password)
+            current = (getattr(result, 'stdout', '') or '').strip()
+
+            if current != 'true':
+                lsf.write_output(f'  {cluster_name}: not paused (spec.paused={current!r}) -- no-op')
+                continue
+
+            lsf.write_output(f'  {cluster_name}: paused -- clearing spec.paused')
+
+            # Same base64-over-stdin pattern as scale_vks_worker_nodepools()
+            # above, for the same reason: lsf.ssh() wraps this command in its
+            # own outer double quotes, and a raw JSON patch body containing
+            # unescaped double quotes silently mangles that wrapping.
+            patch_json = '[{"op":"replace","path":"/spec/paused","value":false}]'
+            patch_b64 = base64.b64encode(patch_json.encode()).decode()
+            patch_cmd = (
+                f"echo {patch_b64} | base64 -d | "
+                f"kubectl --context Supervisor -n {VKS_SUPERVISOR_NS} patch cluster {cluster_name} "
+                f"--type=json --patch-file=/dev/stdin"
+            )
+            patch_result = lsf.ssh(patch_cmd, VKS_KUBECTL_HOST, password)
+            rc = getattr(patch_result, 'returncode', None)
+            patch_out = (getattr(patch_result, 'stdout', '') or '').strip()
+            patch_err = (getattr(patch_result, 'stderr', '') or '').strip()
+
+            if rc not in (0, None):
+                lsf.write_output(
+                    f'  WARNING: {cluster_name} unpause patch failed (rc={rc}): '
+                    f'{patch_err or patch_out or "(no output)"}'
+                )
+                continue
+
+            lsf.write_output(f'  {cluster_name}: unpaused ({patch_out or "no output"})')
+
+        except Exception as e:
+            lsf.write_output(f'  WARNING: could not unpause {cluster_name}: {e}')
+
+
 def wait_for_vks_nodepool_scaleup(lsf, start_time, target_replicas=3,
                                    timeout_seconds=600, poll_interval=30):
     """
