@@ -233,13 +233,27 @@ def print_phase_header(lsf, phase_num, phase_name: str, dry_run: bool = False):
 def import_shutdown_module(module_name: str, lsf):
     """
     Dynamically import and run a shutdown module
-    
+
+    Resolves module_name relative to this file's own directory rather than
+    a hardcoded path -- a prior hardcoded '/home/holuser/hol/Shutdown/'
+    silently loaded a stale, unsynced copy there (VCFshutdown.py v3.8, from
+    2026-06-22) regardless of which checkout this script itself was run
+    from, even when the current repo checkout right next to it had a
+    current version. That stale copy predated Phase 3b (Supervisor cluster
+    pause) and Phase 3c (Supervisor CP VM shutdown) entirely, so both
+    silently never ran -- no error, since should_run() just cleanly
+    evaluated the code path that doesn't exist in that older file. Found by
+    comparing a --dry-run's actual phase output against this file's own
+    module directly, which produced Phase 3b/3c and the stale path's
+    subprocess run did not.
+
     :param module_name: Name of the module (without .py)
     :param lsf: lsfunctions module
     :return: Module or None if not found
     """
-    module_path = f'/home/holuser/hol/Shutdown/{module_name}.py'
-    
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    module_path = os.path.join(module_dir, f'{module_name}.py')
+
     if not os.path.isfile(module_path):
         write_shutdown_output(f'Shutdown module not found: {module_name}')
         return None
