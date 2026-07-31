@@ -1467,6 +1467,135 @@ def ensure_ako_avi_secret_healthy(lsf, timeout_per_step=90, poll_interval=10):
         lsf.write_output(f'  WARNING: could not verify/repair AKO avi-secret health: {e}')
 
 
+# vCenter host that owns the Supervisor-enabled cluster this shim checks.
+# Only wld01-a has one -- see NSXT_ALB_DOMAINS' own comment on that.
+SUPERVISOR_VC_HOST = 'vc-wld01-a.site-a.vcf.lab'
+
+
+def check_supervisor_ako_health_early(lsf):
+    """
+    Early-boot, cause-discriminating check shimmed into Startup/VCF.py's
+    CUSTOM section (this repo) so it runs BEFORE the generic VCFfinal.py
+    module's Supervisor health polling.
+
+    Root cause this guards against: VCFfinal.py's three Supervisor checks
+    (confirmed by reading its source at
+    github.com/Broadcom/HOLFY27-MGR-HOLUSER) never call lsf.labfail() --
+    they only log WARNINGs and continue. But the main poll allows up to
+    30 minutes (WCP_MAX_POLL_TIME) and its supervisor_stabilizer.py run
+    allows up to another 31 minutes (WCP_SCRIPT_TIMEOUT), and neither has
+    any ability to fix a broken avi-secret/alb-endpoint chain (see
+    ensure_ako_avi_secret_healthy() and resync_nsxt_alb_enforcement_point_tokens()
+    above). On a pod carrying that problem, VCFfinal would burn up to
+    ~60 minutes retrying something it can't fix before ever reaching
+    final.py, where adjustomatic.py (and this repo's real fix) actually
+    runs. Running the same fix here first, before VCFfinal starts
+    polling, means it just sees a healthy Supervisor and passes quickly.
+
+    Deliberately narrow: only calls the AKO repair chain when vCenter's
+    own kubernetes_status_messages specifically name a vmware-system-ako
+    pod. If Supervisor is WARNING/ERROR for some other reason (e.g. other
+    system pods still reconciling shortly after boot), this logs what it
+    found and does nothing else -- supervisor_stabilizer.py (later, in
+    VCFfinal) is the right place for those, and an unrelated intervention
+    here could race with or duplicate its own remediation.
+
+    Non-fatal: any failure here is logged as a warning. Never raises --
+    safe to call from a CUSTOM section that isn't itself labfail-gated.
+    """
+    import requests
+    requests.packages.urllib3.disable_warnings()
+
+    lsf.write_output('Early check: Supervisor status ahead of VCFfinal (AKO shim)...')
+    password = lsf.get_password()
+
+    try:
+        session_resp = requests.post(
+            f'https://{SUPERVISOR_VC_HOST}/api/session',
+            auth=('administrator@wld.sso', password), verify=False, timeout=15,
+        )
+        if session_resp.status_code != 201:
+            lsf.write_output(
+                f'  WARNING: could not create vCenter session (HTTP {session_resp.status_code}): '
+                f'{session_resp.text[:200]} -- vCenter/wcp may still be starting or mid-shutdown, skipping'
+            )
+            return
+        headers = {'vmware-api-session-id': session_resp.json()}
+
+        clusters_resp = requests.get(
+            f'https://{SUPERVISOR_VC_HOST}/api/vcenter/namespace-management/clusters',
+            headers=headers, verify=False, timeout=15,
+        )
+        if clusters_resp.status_code != 200:
+            lsf.write_output(
+                f'  WARNING: namespace-management/clusters returned HTTP {clusters_resp.status_code}: '
+                f'{clusters_resp.text[:200]} -- wcp service may still be starting, skipping'
+            )
+            return
+        clusters = clusters_resp.json()
+        if not clusters:
+            lsf.write_output('  No Supervisor-enabled clusters found on this vCenter -- nothing to check')
+            return
+
+        for c in clusters:
+            cluster_moid = c['cluster']
+            status = c.get('kubernetes_status')
+            label = c.get('cluster_name', cluster_moid)
+            if status == 'READY':
+                lsf.write_output(f'  {label}: kubernetes_status READY -- no-op')
+                continue
+
+            lsf.write_output(f'  {label}: kubernetes_status {status} -- inspecting cause')
+            detail_resp = requests.get(
+                f'https://{SUPERVISOR_VC_HOST}/api/vcenter/namespace-management/clusters/{cluster_moid}',
+                headers=headers, verify=False, timeout=15,
+            )
+            if detail_resp.status_code != 200:
+                lsf.write_output(
+                    f'    WARNING: could not fetch cluster detail (HTTP {detail_resp.status_code}) -- skipping'
+                )
+                continue
+            detail = detail_resp.json()
+            messages = detail.get('kubernetes_status_messages', [])
+            if not messages:
+                lsf.write_output(
+                    '    No status messages reported (likely a transient state right after boot) '
+                    '-- deferring to VCFfinal\'s own polling'
+                )
+                continue
+
+            ako_related, other = [], []
+            for m in messages:
+                text = m.get('details', {}).get('default_message', '') or ''
+                (ako_related if AKO_NAMESPACE in text else other).append(text)
+
+            for text in ako_related:
+                lsf.write_output(f'    AKO-related: {text}')
+            for text in other:
+                lsf.write_output(f'    Non-AKO: {text}')
+
+            if not ako_related:
+                lsf.write_output(
+                    '    Nothing AKO-related in the reported causes -- leaving as-is for '
+                    'VCFfinal\'s own Supervisor stabilization; no action taken here'
+                )
+                continue
+
+            if other:
+                lsf.write_output(
+                    '    Mixed causes -- running the avi-secret repair chain for the AKO part only; '
+                    'leaving the rest for VCFfinal\'s supervisor_stabilizer.py'
+                )
+            else:
+                lsf.write_output('    All reported causes are AKO-related -- running avi-secret repair chain now')
+
+            resync_nsxt_alb_enforcement_point_tokens(lsf)
+            ensure_ako_avi_secret_healthy(lsf)
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: early Supervisor/AKO check failed: {e}')
+
+
 def resync_nsxt_alb_cloud_connector_credentials(lsf):
     """
     Verify (fast path) that Avi's cloud-connector credential for each NSX
@@ -2521,6 +2650,16 @@ def main():
             ensure_ako_avi_secret_healthy(lsf)
         with track_step(lsf, _telemetry_results, 'sso_password_policy'):
             resync_sso_password_policy(lsf)
+
+        # Pre-populate the Automation lab module's VCF Automation blueprint
+        # catalog (org acme-east-a / project default-project) so students
+        # don't have to paste each one in through the UI. See
+        # install_vcfa_blueprints.py's module docstring for the VCD-style
+        # cloudapi/sessions login this uses -- non-fatal, logs and skips on
+        # any failure rather than failing the lab.
+        with track_step(lsf, _telemetry_results, 'vcfa_blueprint_install'):
+            import install_vcfa_blueprints
+            install_vcfa_blueprints.install_vcfa_blueprints(lsf)
 
         # try:
         #     lsf.write_output("Running first stages playbook")

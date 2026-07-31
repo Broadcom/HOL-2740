@@ -869,10 +869,25 @@ def main(lsf=None, standalone=False, dry_run=False):
     ##=========================================================================
     ## CUSTOM - Insert your code here using the file in your vPod_repo
     ##=========================================================================
-    
-    # Example: Add custom VCF configuration or checks here
-    # See prelim.py for detailed examples of common operations
-    
+
+    # Shim: run the AKO/avi-secret health check+repair here, before
+    # VCFfinal's own Supervisor polling starts. VCFfinal never hard-fails
+    # on a bad Supervisor status, but it can burn up to ~60 minutes
+    # retrying something it has no ability to fix (a broken
+    # avi-secret/alb-endpoint chain) before ever reaching final.py, where
+    # adjustomatic.py's real fix lives. Running the same fix here first
+    # means VCFfinal just sees a healthy Supervisor and passes quickly.
+    # See adjustomatic.check_supervisor_ako_health_early()'s docstring for
+    # the full timeline/root-cause detail (2026-07-30 incident) and why
+    # this only acts when the reported cause is actually AKO-related.
+    lsf.write_output('Checking for early AKO/avi-secret shim...')
+    try:
+        sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
+        import adjustomatic
+        adjustomatic.check_supervisor_ako_health_early(lsf)
+    except Exception as e:
+        lsf.write_output(f'Early AKO/avi-secret shim check failed (non-fatal): {e}')
+
     ##=========================================================================
     ## End CUSTOM section
     ##=========================================================================
