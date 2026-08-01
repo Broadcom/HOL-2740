@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 # VCFshutdown.py - HOL-2740 Core VCF Shutdown Module
-# Version 3.10 - 2026-07-31
+# Version 3.11 - 2026-07-31
 # Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # Based on original shutdown work by Christopher Lewis (VCF Single Site Shutdown Script, v26.x)
 # VMware Cloud Foundation graceful shutdown sequence
+#
+# v 3.11 Changes (2026-07-31) - HOL-2740 fork:
+# - discover_supervisor_vms(): added 'vcf_avi' to skip_patterns. Confirmed
+#   live against a real shutdown run that v3.10's fix (removing
+#   vcf_Avi-.* from [SHUTDOWN] vm_patterns) was incomplete: Phase 4's
+#   *dynamic discovery* step is a separate catch-all with its own
+#   skip_patterns list, which never excluded Avi SEs either — so it found
+#   and shut them down anyway (via "Dynamic discovery", not the static
+#   pattern loop), defeating the deferral to Phase 17c. Same live run
+#   confirmed Phase 3c itself works correctly: 1 SupervisorControlPlaneVM
+#   shut down cleanly via direct ESXi in 156s, after which all 6
+#   workload-cluster-* TKC node VMs shut down with normal (7-103s) gaps —
+#   no repower, no 5-minute timeouts. Phase 3b's cluster-pause step
+#   separately logged "No clusters API response (may not have TKG
+#   installed)" (0 clusters paused) despite TKC clusters clearly existing —
+#   its SSH/kubectl-via-decryptK8Pwd.py path is failing silently
+#   (stderr redirected to /dev/null); not yet root-caused, lower priority
+#   since Phase 3c alone was sufficient to fix the repower race.
 #
 # v 3.10 Changes (2026-07-31) - HOL-2740 fork:
 # - Added Phase 3c (shutdown_supervisor_cp_vms()): explicitly powers off
@@ -393,7 +411,7 @@ logger = logging.getLogger(__name__)
 #==============================================================================
 
 MODULE_NAME = 'VCFshutdown'
-MODULE_VERSION = '2.11'
+MODULE_VERSION = '2.12'
 MODULE_DESCRIPTION = 'VMware Cloud Foundation graceful shutdown (VCF 9.x compliant)'
 
 # Status file for console display
@@ -693,6 +711,13 @@ def discover_supervisor_vms(lsf, vc_fqdn: str, password: str,
         'nsx-',
         'vc-',
         'sddcmanager',
+        'vcf_avi',  # Avi Controllers/SEs — handled in Phase 4's vm_patterns
+                    # (Controllers) / Phase 17c's vcfpostedgevms (SEs, after
+                    # Supervisor/TKC are down). Confirmed live (2026-07-31):
+                    # removing vcf_Avi-.* from vm_patterns alone was NOT
+                    # enough — this dynamic-discovery catch-all found and
+                    # shut down the SEs anyway since it had no skip entry
+                    # for them, defeating the Phase 17c deferral.
     ]
 
     workload_vms = []

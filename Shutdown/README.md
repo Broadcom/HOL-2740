@@ -451,7 +451,9 @@ The scripts use `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null` to
 
 This copy is customized from the upstream HOLFY27 scripts (originally at
 `~/hol/Shutdown` on `manager`, a checkout of `Broadcom/HOLFY27-MGR-HOLUSER`).
-Two fixes applied here, not (yet) upstream:
+Four fixes applied here, not (yet) upstream (full investigation writeup, including
+Confluence sources and outstanding items, at
+`~/sanitized_gitstuff/claude_projects/hol/vks-shutdown-order/vks-supervisor-avi-shutdown-order.md`):
 
 1. **Phase 3b re-enabled and moved after Phase 3.** Upstream had it disabled
    (`and False` guard) and positioned *before* the WCP stop, with a comment
@@ -518,6 +520,13 @@ Two fixes applied here, not (yet) upstream:
    Controllers stay in Phase 4's `vm_patterns` unchanged — they're
    control-plane only, not in the API VIP data path, so there's no ordering
    constraint against Supervisor for them.
+
+   **Follow-up, found via a live run's `shutdown.log`:** this was incomplete.
+   Phase 4's separate *dynamic discovery* step (`discover_supervisor_vms()`)
+   has its own `skip_patterns` list that also never excluded Avi SEs, so it
+   found and shut them down anyway. Fixed in v3.11 by adding `'vcf_avi'` to
+   that list too. Full detail, including the live-run evidence, in
+   `~/sanitized_gitstuff/claude_projects/hol/vks-shutdown-order/vks-supervisor-avi-shutdown-order.md`.
 
 ## Support
 
