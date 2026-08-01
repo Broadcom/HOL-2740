@@ -155,16 +155,21 @@ def main(lsf=None, standalone=False, dry_run=False):
 
     lsf.write_vpodprogress('Running adjustomatic', 'GOOD-9')
     lsf.write_output('Running adjustomatic')
-    if not lsf.labcheck:
-        try:
-            sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
-            import adjustomatic
-            adjustomatic.main()
-        except Exception as e:
-            lsf.write_output(e)
-            lsf.write_output("could not import or an error occured with adjustomatic script")
-            lsf.labfail('Adjustomatic script failed')
-            exit(1)
+    # TEMPORARILY DISABLED (2026-08-01) for a controlled test: build+save a
+    # template with adjustomatic.main() never invoked at all, to see whether
+    # the NSX<->Avi cert-chain corruption still ends up baked into the saved
+    # template even when none of our NSX/Avi credential code ever touches the
+    # source pod. Re-enable by uncommenting once the test is done.
+    # if not lsf.labcheck:
+    #     try:
+    #         sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
+    #         import adjustomatic
+    #         adjustomatic.main()
+    #     except Exception as e:
+    #         lsf.write_output(e)
+    #         lsf.write_output("could not import or an error occured with adjustomatic script")
+    #         lsf.labfail('Adjustomatic script failed')
+    #         exit(1)
 
     ##=========================================================================
     ## End CUSTOM section
