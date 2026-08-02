@@ -2648,20 +2648,30 @@ def main():
     # would silently produce zero telemetry) and why it must be restored
     # afterward (lsfunctions is a shared, process-wide module).
     with _labfail_uploads_telemetry(lsf, _telemetry_results, _run_started_at_iso, _run_start):
-        with track_step(lsf, _telemetry_results, 'settling_sleep'):
-            _time.sleep(180)
-
-        # Kick off VKS worker node pool scale-up (1 -> 3) right away (after the
-        # settling buffer above), before anything else in this script. This just
-        # issues the Supervisor Cluster patch and returns immediately -- the
-        # actual node provisioning happens in the background over the next
-        # several minutes, in parallel with everything else adjustomatic does
-        # below. wait_for_vks_nodepool_scaleup() at the very end of main()
-        # confirms it actually finished (and fails the lab if it doesn't) before
-        # returning control to the rest of startup.
-        _vks_scale_start = _time.time()
-        with track_step(lsf, _telemetry_results, 'vks_scale_request'):
-            scale_vks_worker_nodepools(lsf, target_replicas=3)
+        # TEMPORARILY DISABLED (2026-08-02): VKS worker node pool scale-out
+        # (1 -> 3) is now baked into the saved template itself, so this
+        # one-time provisioning step is no longer needed on boot. The
+        # 180s settling_sleep existed solely to protect this scale-out
+        # request from a risky NSX-realization timing window (see its
+        # original comment) -- with the scale-out gone, it has no purpose,
+        # so it's disabled along with it. The matching
+        # wait_for_vks_nodepool_scaleup() confirm step at the end of
+        # main() is also disabled below, since it depends on
+        # _vks_scale_start being set here.
+        # with track_step(lsf, _telemetry_results, 'settling_sleep'):
+        #     _time.sleep(180)
+        #
+        # # Kick off VKS worker node pool scale-up (1 -> 3) right away (after the
+        # # settling buffer above), before anything else in this script. This just
+        # # issues the Supervisor Cluster patch and returns immediately -- the
+        # # actual node provisioning happens in the background over the next
+        # # several minutes, in parallel with everything else adjustomatic does
+        # # below. wait_for_vks_nodepool_scaleup() at the very end of main()
+        # # confirms it actually finished (and fails the lab if it doesn't) before
+        # # returning control to the rest of startup.
+        # _vks_scale_start = _time.time()
+        # with track_step(lsf, _telemetry_results, 'vks_scale_request'):
+        #     scale_vks_worker_nodepools(lsf, target_replicas=3)
 
         # VSP vmsp-platform kube-vip DaemonSet hardening (fleet-01a/vmsp-gateway
         # VIP flap fix). Independent of the Avi playbooks below; run first so a
@@ -2714,10 +2724,21 @@ def main():
         # (already-healthy) case; only resync_nsxt_alb_cloud_connector_credentials
         # pays a slower (~1min) cost, and only on the rare boot where it finds
         # an actual broken credential to rotate.
-        with track_step(lsf, _telemetry_results, 'nsxt_alb_enforcement_point_tokens'):
-            resync_nsxt_alb_enforcement_point_tokens(lsf)
-        with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
-            resync_nsxt_alb_cloud_connector_credentials(lsf)
+        # TEMPORARILY DISABLED (2026-08-02): both of these mutate the
+        # NSX<->Avi trust relationship on every single boot -- confirmed via
+        # the adjustomatic-disabled-corruption-test experiment to be the
+        # actual source of the NSX-Avi TLS cert-chain corruption baked into
+        # recent templates (resync_nsxt_alb_enforcement_point_tokens()
+        # wholesale-PATCHes NSX's alb-endpoint EnforcementPoint
+        # connection_info; resync_nsxt_alb_cloud_connector_credentials()
+        # rotates the NSX service-account password and pushes it into Avi's
+        # cloud connector). Leave disabled until the underlying wholesale-
+        # PATCH/rotation hazard in those two functions is actually fixed --
+        # do not just uncomment these without a real fix first.
+        # with track_step(lsf, _telemetry_results, 'nsxt_alb_enforcement_point_tokens'):
+        #     resync_nsxt_alb_enforcement_point_tokens(lsf)
+        # with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
+        #     resync_nsxt_alb_cloud_connector_credentials(lsf)
         # Belt-and-suspenders check for the specific downstream failure the
         # above two functions can still leave behind even when they
         # succeed: AKO on Supervisor stuck in CrashLoopBackOff because
@@ -2839,12 +2860,16 @@ def main():
                 lsf.write_output('Adjustomatic failed at avitweaker - final stage playbook step')
                 lsf.labfail('Adjustomatic failed at avitweaker - final stage playbook step')
 
-        # Confirm the VKS worker node pool scale-up kicked off at the very top
-        # of this function actually finished (fails the lab if it didn't) --
-        # run last so it's had the full runtime of everything above to converge
-        # in the background first.
-        with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
-            wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
+        # TEMPORARILY DISABLED (2026-08-02): paired with the scale-out
+        # request disabled at the top of this function -- the worker node
+        # pool is now provisioned at target replica count in the saved
+        # template itself, and this step also depends on _vks_scale_start,
+        # which is no longer set. Confirm the VKS worker node pool scale-up
+        # kicked off at the very top of this function actually finished
+        # (fails the lab if it didn't) -- run last so it's had the full
+        # runtime of everything above to converge in the background first.
+        # with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
+        #     wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
 
         # Summarize ~/hol/labstartup.log (the pod's overall boot-time log,
         # not just this script's own output) -- see
