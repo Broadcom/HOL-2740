@@ -155,21 +155,24 @@ def main(lsf=None, standalone=False, dry_run=False):
 
     lsf.write_vpodprogress('Running adjustomatic', 'GOOD-9')
     lsf.write_output('Running adjustomatic')
-    # TEMPORARILY DISABLED (2026-08-01) for a controlled test: build+save a
-    # template with adjustomatic.main() never invoked at all, to see whether
-    # the NSX<->Avi cert-chain corruption still ends up baked into the saved
-    # template even when none of our NSX/Avi credential code ever touches the
-    # source pod. Re-enable by uncommenting once the test is done.
-    # if not lsf.labcheck:
-    #     try:
-    #         sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
-    #         import adjustomatic
-    #         adjustomatic.main()
-    #     except Exception as e:
-    #         lsf.write_output(e)
-    #         lsf.write_output("could not import or an error occured with adjustomatic script")
-    #         lsf.labfail('Adjustomatic script failed')
-    #         exit(1)
+    # Re-enabled (2026-08-04): the 2026-08-01 controlled corruption test
+    # (commit 3a0d131) confirmed the NSX<->Avi TLS cert-chain corruption
+    # traced to resync_nsxt_alb_enforcement_point_tokens() /
+    # resync_nsxt_alb_cloud_connector_credentials(). Those two functions
+    # stay commented out inside adjustomatic.main() itself (see that
+    # function's body) -- do not re-enable them without a real fix. Every
+    # other adjustomatic step, including the VCFA blueprint installer, is
+    # safe to run again.
+    if not lsf.labcheck:
+        try:
+            sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
+            import adjustomatic
+            adjustomatic.main()
+        except Exception as e:
+            lsf.write_output(e)
+            lsf.write_output("could not import or an error occured with adjustomatic script")
+            lsf.labfail('Adjustomatic script failed')
+            exit(1)
 
     ##=========================================================================
     ## End CUSTOM section

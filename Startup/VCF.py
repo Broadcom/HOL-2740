@@ -892,9 +892,15 @@ def main(lsf=None, standalone=False, dry_run=False):
     # See adjustomatic.check_supervisor_ako_health_early()'s docstring for
     # the full timeline/root-cause detail (2026-07-30 incident) and why
     # this only acts when the reported cause is actually AKO-related.
-    # TEMPORARILY DISABLED (2026-08-01) alongside final.py's adjustomatic.main()
-    # call, for the same controlled corruption test -- see final.py's CUSTOM
-    # section comment for why. Re-enable once the test is done.
+    # STAYS DISABLED (2026-08-04): the 2026-08-01 controlled corruption test
+    # (commit 3a0d131) traced the NSX<->Avi TLS cert-chain corruption to
+    # resync_nsxt_alb_enforcement_point_tokens() / resync_nsxt_alb_cloud_connector_
+    # credentials(). adjustomatic.main() itself was re-enabled once those two
+    # were confirmed and disabled at their own call sites (fd327f8) -- but this
+    # shim calls check_supervisor_ako_health_early(), which internally calls
+    # resync_nsxt_alb_enforcement_point_tokens() directly (see that function's
+    # body, adjustomatic.py ~line 1670), bypassing the disabled call site in
+    # main(). Do not re-enable this shim until that function is actually fixed.
     # lsf.write_output('Checking for early AKO/avi-secret shim...')
     # try:
     #     sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
@@ -910,17 +916,18 @@ def main(lsf=None, standalone=False, dry_run=False):
     # cluster is exactly the kind of thing those generic modules have no
     # ability to diagnose and could waste their own timeout budgets on.
     # See adjustomatic.unpause_vks_clusters()'s docstring for full detail.
-    # TEMPORARILY DISABLED (2026-08-01) -- same controlled corruption test as
-    # above; disabling every adjustomatic import site, not just the
-    # NSX/Avi-specific ones, for a completely clean control. Re-enable once
-    # the test is done.
-    # lsf.write_output('Checking for paused Supervisor clusters shim...')
-    # try:
-    #     sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
-    #     import adjustomatic
-    #     adjustomatic.unpause_vks_clusters(lsf)
-    # except Exception as e:
-    #     lsf.write_output(f'Supervisor cluster unpause shim failed (non-fatal): {e}')
+    # Re-enabled (2026-08-04): unrelated to the NSX/Avi credential corruption
+    # traced during the 2026-08-01 controlled test (commit 3a0d131) -- this
+    # shim only clears spec.paused on VKS clusters, no NSX/Avi credential
+    # code involved. Safe alongside adjustomatic.main() being re-enabled in
+    # final.py.
+    lsf.write_output('Checking for paused Supervisor clusters shim...')
+    try:
+        sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
+        import adjustomatic
+        adjustomatic.unpause_vks_clusters(lsf)
+    except Exception as e:
+        lsf.write_output(f'Supervisor cluster unpause shim failed (non-fatal): {e}')
 
     ##=========================================================================
     ## End CUSTOM section
