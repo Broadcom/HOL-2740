@@ -4,12 +4,12 @@ inputs:
     title: Namespace
     type: string
     description: Namespace you wish to deploy to
-    default: preprod-ns-3w9xh
+    $data: /data/namespaces?projectId={{project}}
   vm_image_id:
     title: VM image ID
     type: string
-    default: vmi-c14afd94f78ed6f84
     description: the ID of the VM image for building the virtual machine
+    $data: /data/namespaceclass-vmimages
   target_port:
     title: Target Port
     type: integer

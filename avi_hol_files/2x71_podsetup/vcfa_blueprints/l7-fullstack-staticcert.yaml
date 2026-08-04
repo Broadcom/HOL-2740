@@ -4,7 +4,7 @@ inputs:
     title: Namespace
     type: string
     description: Namespace you wish to deploy to
-    default: preprod-ns-3w9xh
+    $data: /data/namespaces?projectId={{project}}
   vm_image_id:
     title: VM image ID
     type: string
