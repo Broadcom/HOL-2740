@@ -70,7 +70,7 @@ resources:
                       key: aviuser-passwd
                     lock_passwd: false
                     sudo: ALL=(ALL) NOPASSWD:ALL
-          storageClass: mgmt-anchor-optimal-datastore-default-policy-autoraid
+          storageClass: cluster-wld01-01a-optimal-datastore-default-policy-autoraid
   Virtual_Machine_2:
     type: CCI.Supervisor.Resource
     properties:
@@ -102,7 +102,7 @@ resources:
                       key: aviuser-passwd
                     lock_passwd: false
                     sudo: ALL=(ALL) NOPASSWD:ALL
-          storageClass: mgmt-anchor-optimal-datastore-default-policy-autoraid
+          storageClass: cluster-wld01-01a-optimal-datastore-default-policy-autoraid
   Username_Secret:
     type: CCI.Supervisor.Resource
     properties:
