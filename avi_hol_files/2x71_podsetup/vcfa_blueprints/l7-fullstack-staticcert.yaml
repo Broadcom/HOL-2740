@@ -112,8 +112,8 @@ resources:
               cloudConfig:
                 defaultUserEnabled: true
                 runcmd:
-                  - /usr/bin/apt update
-                  - /usr/bin/apt-get install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
+                  - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false update
+                  - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
                 users:
                   - name: aviuser
                     passwd:
@@ -144,8 +144,8 @@ resources:
               cloudConfig:
                 defaultUserEnabled: true
                 runcmd:
-                  - /usr/bin/apt update
-                  - /usr/bin/apt-get install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
+                  - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false update
+                  - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
                 users:
                   - name: aviuser
                     passwd:
