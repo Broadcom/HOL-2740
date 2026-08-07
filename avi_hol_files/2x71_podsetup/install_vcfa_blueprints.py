@@ -159,30 +159,50 @@ def install_vcfa_blueprints(lsf):
                 lsf.write_output(f'  WARNING: could not create blueprint {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
         except Exception as e:
             lsf.write_output(f'  WARNING: could not create blueprint {name!r}: {e}')
-    try:
-        # CCI's supervisornamespaces PATCH is JSON Merge Patch (RFC 7396) --
-        # confirmed against vcf/automation's supervisor-k8.service.ts, which
-        # always sends this content type for this call (never the plain
-        # application/json used by the blueprint calls above).
-        patch_headers = {**headers, 'Content-Type': 'application/merge-patch+json'}
-        resp = requests.patch(
-                f'https://{VCFA_HOST}/cci/kubernetes/apis/infrastructure.cci.vmware.com/v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h',
-                headers=patch_headers, verify=False, timeout=30,
-                json={
-                    "spec": {
-                        "classConfigOverrides": {
-                            "storageClasses": [
-                        {
-                            "name": "cluster-wld01-01a-optimal-datastore-default-policy-autoraid",
-                            "limit": "2000000Mi"
-                        }
-                    ]}}},)
-        if resp.status_code in (200, 201, 204):
-            lsf.write_output(f'  {name}: created')
-        else:
-            lsf.write_output(f'  WARNING: could not patch namespace: (HTTP {resp.status_code}): {resp.text[:300]}')
-    except Exception as e:
-            lsf.write_output(f'  WARNING: could not patch namespace: {e}')
+    # CCI's supervisornamespaces PATCH is JSON Merge Patch (RFC 7396) --
+    # confirmed against vcf/automation's supervisor-k8.service.ts, which
+    # always sends this content type for this call (never the plain
+    # application/json used by the blueprint calls above).
+    patch_headers = {**headers, 'Content-Type': 'application/merge-patch+json'}
+    namespace_patch_url = (
+        f'https://{VCFA_HOST}/cci/kubernetes/apis/infrastructure.cci.vmware.com/'
+        'v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h'
+    )
+    namespace_patch_body = {
+        "spec": {
+            "classConfigOverrides": {
+                "storageClasses": [
+                    {
+                        "name": "cluster-wld01-01a-optimal-datastore-default-policy-autoraid",
+                        "limit": "2000000Mi",
+                    }
+                ]
+            }
+        }
+    }
+
+    # Every PATCH re-validates the whole spec server-side, including fields
+    # we're not touching (e.g. segName) -- confirmed against vcf/automation's
+    # SupervisorNamespaceSpecResolver.resolveSeg(), which re-resolves segName
+    # on every patch and wraps any non-404 failure (e.g. Avi/NSX still
+    # settling right after the AKO restart forced above) into a generic
+    # HTTP 500 "Failed to resolve SEG". That's transient, not a bad SEG
+    # reference, so retry a few times before giving up.
+    import time
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.patch(namespace_patch_url, headers=patch_headers, verify=False, timeout=30, json=namespace_patch_body)
+            if resp.status_code in (200, 201, 204):
+                lsf.write_output('  acme-east-prod-wrp4h: storage class quota patched')
+                break
+            lsf.write_output(f'  attempt {attempt}/{max_attempts}: could not patch namespace (HTTP {resp.status_code}): {resp.text[:300]}')
+        except Exception as e:
+            lsf.write_output(f'  attempt {attempt}/{max_attempts}: could not patch namespace: {e}')
+        if attempt < max_attempts:
+            time.sleep(20)
+    else:
+        lsf.write_output(f'  WARNING: could not patch namespace after {max_attempts} attempts -- giving up')
 
 #patch
 #cci/kubernetes/apis/infrastructure.cci.vmware.com/v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h
