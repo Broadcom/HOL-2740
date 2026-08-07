@@ -159,3 +159,26 @@ def install_vcfa_blueprints(lsf):
                 lsf.write_output(f'  WARNING: could not create blueprint {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
         except Exception as e:
             lsf.write_output(f'  WARNING: could not create blueprint {name!r}: {e}')
+    try:
+        resp = requests.patch(
+                f'https://{VCFA_HOST}/cci/kubernetes/apis/infrastructure.cci.vmware.com/v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h',
+                headers=headers, verify=False, timeout=30,
+                json={
+                    "spec": {
+                        "classConfigOverrides": {
+                            "storageClasses": [
+                        {
+                            "name": "cluster-wld01-01a-optimal-datastore-default-policy-autoraid",
+                            "limit": "2000000Mi"
+                        }
+                    ]}}},)
+        if resp.status_code in (200, 201, 204):
+            lsf.write_output(f'  {name}: created')
+        else:
+            lsf.write_output(f'  WARNING: could not patch namespace: (HTTP {resp.status_code}): {resp.text[:300]}')
+    except Exception as e:
+            lsf.write_output(f'  WARNING: could not patch namespace: {e}')
+
+#patch
+#cci/kubernetes/apis/infrastructure.cci.vmware.com/v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h
+#{"spec":{"classConfigOverrides":{"storageClasses":[{"name":"cluster-wld01-01a-optimal-datastore-default-policy-autoraid","limit":"2000000Mi"}]}}}
