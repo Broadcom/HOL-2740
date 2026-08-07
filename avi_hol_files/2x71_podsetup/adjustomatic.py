@@ -1090,6 +1090,13 @@ def configure_nsxt_app_profiles(lsf):
     ever needed to create them). GET-before-PUT makes every subsequent
     run a no-op instead of an error.
 
+    Also ensures the hol-wildcard service certificate is imported into
+    NSX, from the cert/key files staged on the manager at
+    /lmchol/home/holuser/certificates (wildcard_cert.pem/wildcard_key.pem).
+    Idempotency here is presence-only (GET 200 -> skip) rather than a
+    field diff like the profiles above, since NSX never reads back a
+    private_key in plaintext to compare against.
+
     Non-fatal: any failure here is logged as a warning and does not fail
     lab startup (matches this block's original behavior -- lsf.labfail
     was never called here).
@@ -1145,6 +1152,35 @@ def configure_nsxt_app_profiles(lsf):
 
         except Exception as e:
             lsf.write_output(f'  WARNING: could not ensure {name}: {e}')
+
+    cert_name = 'hol-wildcard'
+    cert_dir = '/lmchol/home/holuser/certificates'
+    cert_url = f'{nsx_mgr}/policy/api/v1/infra/certificates/{cert_name}'
+    try:
+        get_result = session.get(cert_url, timeout=15)
+        if get_result.status_code == 200:
+            lsf.write_output(f'  {cert_name}: certificate already present -- no-op')
+        else:
+            if get_result.status_code != 404:
+                lsf.write_output(
+                    f'  {cert_name}: GET returned {get_result.status_code} '
+                    f'({get_result.text[:200]}) -- attempting import anyway'
+                )
+            lsf.write_output(f'  {cert_name}: not found -- importing from {cert_dir}')
+            with open(f'{cert_dir}/wildcard_cert.pem', 'r') as cert_file:
+                cert_pem = cert_file.read()
+            with open(f'{cert_dir}/wildcard_key.pem', 'r') as key_file:
+                cert_key = key_file.read()
+            cert_data = {
+                'display_name': cert_name,
+                'resource_type': 'Certificate',
+                'pem_encoded': cert_pem,
+                'private_key': cert_key,
+            }
+            put_result = session.put(cert_url, json=cert_data, timeout=15)
+            lsf.write_output(f'  {cert_name}: PUT result {put_result.status_code} - {put_result.text[:200]}')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not ensure {cert_name} certificate: {e}')
 
 
 # This vApp is a saved/suspended VCD template that can sit powered off for
@@ -1922,6 +1958,386 @@ def _ensure_sddc_auto_rotate_disabled(sddc_headers, lsf):
             },
         )
         lsf.write_output(f"    disabled auto-rotate on {e['username']} (was still enabled)")
+
+
+LICENSE_HUB_HOST = 'ssp.site-a.vcf.lab'
+LICENSE_HUB_ZIP_PATH = (
+    '/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/'
+    'b3966fca-3ec0-4fe2-b628-ff186de53b19_1000001_1785992463049_v7.lic.zip'
+)
+
+
+def upload_license_hub_disconnected_license(lsf):
+    """
+    Upload the disconnected-mode license bundle (checked into this repo
+    alongside adjustomatic.py) to License Hub via its Licensing Service
+    API -- Workflow 4 ("Upload Avi Cloud Console License to LH") from the
+    "License Hub API User Guide" Confluence doc.
+
+    License Hub for this pod is hosted at ssp.site-a.vcf.lab -- confirmed
+    live via its own UI (browser tab titled "License Hub" at that
+    hostname). Note this is despite SSP (Security Services Platform) and
+    License Hub being documented as two distinct appliances in the
+    general Confluence guide (SSP is normally onboarded AS AN ENDPOINT
+    INTO License Hub, not the LH appliance itself) -- this pod's actual
+    deployment just runs both under the same hostname.
+
+    Uses the same admin/AVICTRL_PASSWORD HTTP Basic-Auth session pattern
+    as every other direct API call in this file (e.g.
+    configure_nsxt_app_profiles above) -- no separate credential needed.
+    Logs the license list before and after the upload so a no-op import
+    (bundle already present) is visible in labstartup.log rather than
+    silently indistinguishable from a real change.
+
+    Fatal: unlike most other functions in this file, a failed upload
+    calls lsf.labfail(). Correct licensing is core lab functionality
+    here, not a best-effort convenience fix -- a silent failure would
+    leave the lab materially broken without flagging it.
+    """
+    import os
+    import requests
+
+    lsf.write_output('Uploading disconnected license file to License Hub...')
+    lh_session = requests.Session()
+    lh_session.verify = False
+    lh_session.auth = ('admin', os.environ['AVICTRL_PASSWORD'])
+    lh_mgr = f'https://{LICENSE_HUB_HOST}:443'
+
+    try:
+        before = lh_session.get(f'{lh_mgr}/licensing/views/licenses', timeout=15)
+        lsf.write_output(f'  Licenses on License Hub before upload: {before.text[:500]}')
+
+        with open(LICENSE_HUB_ZIP_PATH, 'rb') as license_file:
+            upload_result = lh_session.post(
+                f'{lh_mgr}/licensing/licenses?action=import',
+                files={'file': (os.path.basename(LICENSE_HUB_ZIP_PATH), license_file, 'application/zip')},
+                timeout=60,
+            )
+        lsf.write_output(f'  Upload result {upload_result.status_code} - {upload_result.text[:500]}')
+        upload_result.raise_for_status()
+
+        after = lh_session.get(f'{lh_mgr}/licensing/views/licenses', timeout=15)
+        lsf.write_output(f'  Licenses on License Hub after upload: {after.text[:500]}')
+
+    except Exception as e:
+        lsf.write_output(f'  License Hub upload failed: {e}')
+        lsf.labfail(f'Adjustomatic failed at License Hub license upload: {e}')
+
+
+def _ensure_license_hub_endpoint_onboarded(lh_session, lh_mgr, endpoint_type, host, username,
+                                            admin_password, certificate, lsf,
+                                            timeout_seconds=900, poll_interval=15):
+    """
+    Idempotently onboard a single host as a License Hub endpoint of the
+    given type (NSX_MANAGER or AVI_CONTROLLER), then poll until READY.
+    Matched by hostname -- no-ops (reuses the existing id) if already
+    onboarded, mirroring the doc's own "already exists" success path.
+
+    Shared by both halves of onboard_license_hub_endpoints() below since
+    the onboard-then-poll logic is identical for NSX Manager and Avi
+    Controller; only the cert-fetch mechanism differs between them.
+
+    Returns the endpoint_id once READY, or None on failure/timeout --
+    the caller decides whether that's fatal.
+    """
+    import time
+
+    existing = lh_session.get(
+        f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
+    ).json().get('results', [])
+    match = next((e for e in existing if e.get('connection_info', {}).get('hostname') == host), None)
+
+    if match:
+        endpoint_id = match['id']
+        if match.get('status') == 'READY':
+            lsf.write_output(f'    {host}: already onboarded as {endpoint_type} endpoint and READY -- no-op')
+            return endpoint_id
+        lsf.write_output(f"    {host}: already onboarded as {endpoint_type} endpoint, status={match.get('status')} -- waiting for READY")
+    else:
+        create_result = lh_session.post(
+            f'{lh_mgr}/licensing/endpoints', timeout=30,
+            json={
+                'endpoint_type': endpoint_type,
+                'display_name': host.split('.')[0],
+                'connection_info': {
+                    'connection_type': 'DYNAMIC',
+                    'hostname': host,
+                    'username': username,
+                    'password': admin_password,
+                    'certificate': certificate,
+                },
+            },
+        )
+        lsf.write_output(f'    {host}: onboard result {create_result.status_code} - {create_result.text[:300]}')
+        create_result.raise_for_status()
+        endpoint_id = create_result.json().get('id')
+
+    deadline = time.time() + timeout_seconds
+    status = None
+    while time.time() < deadline:
+        endpoints = lh_session.get(
+            f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
+        ).json().get('results', [])
+        match = next((e for e in endpoints if e.get('id') == endpoint_id), None)
+        status = match.get('status') if match else None
+        if status == 'READY':
+            lsf.write_output(f'    {host}: endpoint READY')
+            return endpoint_id
+        time.sleep(poll_interval)
+
+    lsf.write_output(f'    {host}: endpoint did not reach READY within {timeout_seconds}s (last status: {status})')
+    return None
+
+
+def onboard_license_hub_endpoints(lsf):
+    """
+    Onboard both NSX Managers (wld01-a, mgmt-a) and both Avi Controllers
+    (alb-a, alb-b) as License Hub endpoints -- Workflows 5 and 7 from the
+    "License Hub API User Guide" -- reusing NSXT_ALB_DOMAINS below for
+    the host list. Run this BEFORE resync_license_hub_endpoint_mappings()
+    so that function always has a real endpoint_id to map licenses onto,
+    even after a pod rebuild -- License Hub is a separate appliance, not
+    part of the saved vApp template, so it has no memory of previously-
+    onboarded endpoints across a fresh deploy.
+
+    Idempotent: matched by hostname, mirroring the doc's own "already
+    exists -> skip, reuse existing id" semantics -- safe to run every
+    boot (see _ensure_license_hub_endpoint_onboarded() above).
+
+    NSX Manager cert: fetched live via
+    GET https://<nsx_host>/api/v1/trust-management/certificates,
+    filtered to the entry whose used_by[].service_types includes "API"
+    (same call configure_nsxt_app_profiles's neighbors already use
+    elsewhere in this file for NSX reachability).
+
+    Avi Controller cert: there is no equivalent Avi REST API for this --
+    per the "Steps to Retrieve and Upload Avi Controller Certificate in
+    License Hub" KB, it's fetched by running fetch_cert.sh (checked into
+    this same directory) against the controller's HTTPS port. That
+    script is just a local openssl s_client TLS handshake (steered to
+    prefer the controller's EC certificate, falling back to whatever it
+    serves by default) -- it works identically run remotely as it does
+    run locally on the controller, so no SSH hop onto the Avi Controller
+    is needed; it's invoked here from wherever this script executes.
+
+    Fatal: like the other License Hub functions in this file, failure to
+    onboard (or reach READY) for any of the 4 endpoints calls
+    lsf.labfail() -- but only after attempting all 4.
+    """
+    import os
+    import subprocess
+    import tempfile
+    import requests
+
+    lsf.write_output('Onboarding NSX Manager / Avi Controller endpoints to License Hub...')
+    admin_password = os.environ['AVICTRL_PASSWORD']
+    lh_session = requests.Session()
+    lh_session.verify = False
+    lh_session.auth = ('admin', admin_password)
+    lh_mgr = f'https://{LICENSE_HUB_HOST}:443'
+    fetch_cert_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fetch_cert.sh')
+
+    failures = []
+    for d in NSXT_ALB_DOMAINS:
+        # ---- NSX Manager ----
+        try:
+            certs = requests.get(
+                f"https://{d['nsx_host']}/api/v1/trust-management/certificates",
+                auth=('admin', admin_password), verify=False, timeout=15,
+            ).json()
+            api_cert = next(
+                (c for c in certs.get('results', [])
+                 if any('API' in u.get('service_types', []) for u in c.get('used_by', []) or [])),
+                None,
+            )
+            if not api_cert:
+                lsf.write_output(f"  WARNING: {d['domain']}: no API-service certificate found on {d['nsx_host']}")
+                failures.append(f"NSX Manager ({d['domain']})")
+            else:
+                endpoint_id = _ensure_license_hub_endpoint_onboarded(
+                    lh_session, lh_mgr, 'NSX_MANAGER', d['nsx_host'], 'admin',
+                    admin_password, api_cert['pem_encoded'], lsf,
+                )
+                if not endpoint_id:
+                    failures.append(f"NSX Manager ({d['domain']})")
+        except Exception as e:
+            lsf.write_output(f"  WARNING: {d['domain']}: NSX Manager onboarding failed: {e}")
+            failures.append(f"NSX Manager ({d['domain']})")
+
+        # ---- Avi Controller ----
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = subprocess.run(
+                    ['bash', fetch_cert_script, d['avi_host']],
+                    cwd=tmpdir, capture_output=True, text=True, timeout=30,
+                )
+                cert_path = os.path.join(tmpdir, 'full_chain.pem')
+                if result.returncode != 0 or not os.path.isfile(cert_path):
+                    lsf.write_output(
+                        f"  WARNING: {d['domain']}: fetch_cert.sh failed for {d['avi_host']}: "
+                        f"{result.stdout} {result.stderr}"
+                    )
+                    failures.append(f"Avi Controller ({d['domain']})")
+                    continue
+                with open(cert_path, 'r') as f:
+                    avi_cert = f.read()
+
+            endpoint_id = _ensure_license_hub_endpoint_onboarded(
+                lh_session, lh_mgr, 'AVI_CONTROLLER', d['avi_host'], 'admin',
+                admin_password, avi_cert, lsf,
+            )
+            if not endpoint_id:
+                failures.append(f"Avi Controller ({d['domain']})")
+        except Exception as e:
+            lsf.write_output(f"  WARNING: {d['domain']}: Avi Controller onboarding failed: {e}")
+            failures.append(f"Avi Controller ({d['domain']})")
+
+    if failures:
+        lsf.labfail(f'Adjustomatic failed at License Hub endpoint onboarding for: {failures}')
+
+
+def resync_license_hub_endpoint_mappings(lsf):
+    """
+    Ensure each of this pod's 4 already-onboarded License Hub endpoints
+    (NSX Manager wld01-a/mgmt-a, Avi Controller alb-a/alb-b -- reusing
+    NSXT_ALB_DOMAINS below) is mapped to the freshest non-expired license
+    on LH for each SKU it currently holds, swapping out an older/soon-
+    expiring mapping rather than leaving it in place alongside a new one.
+
+    Run this AFTER upload_license_hub_disconnected_license() -- it only
+    re-points EXISTING endpoint<->license mappings at whatever's newest
+    on LH; it does not onboard endpoints (already onboarded in this pod,
+    unlike a fresh pod following Workflows 5/7 in the License Hub API
+    User Guide) or upload licenses itself.
+
+    Per endpoint: list its current license-endpoint-mappings
+    (GET /licensing/license-endpoint-mappings, filtered client-side by
+    endpoint_id -- this API has no server-side filter param), and for
+    each currently-mapped license's sku_code, pick the LH license
+    (GET /licensing/views/licenses) with that sku_code and the latest
+    expiration_date. If that differs from what's currently mapped,
+    replace it with a single bulk DELETE-old/CREATE-new call to
+    POST /licensing/bulk-license-endpoint-mappings -- atomic from the
+    caller's perspective, so there's never a window where the endpoint
+    has zero or two licenses of the same SKU mapped. No-op if the
+    endpoint is already on the freshest available license for that SKU.
+
+    NSX Manager endpoints get an explicit force-sync call afterward
+    (POST <nsx_host>/policy/api/v1/licenses/action/async-query) so the
+    swap is visible immediately rather than waiting on NSX's own
+    15-minute license-refresh cycle. Avi Controller has no equivalent
+    documented REST API for this (only a UI/CLI manual refresh, per the
+    "Avi Controller 32.1.1 -- Licensing Configuration Guide" doc) -- Avi
+    endpoints pick up the swap on their own next auto-sync (also ~15 min
+    per that same doc).
+
+    Fatal: like upload_license_hub_disconnected_license, this calls
+    lsf.labfail() if any of the 4 endpoints couldn't be resynced --
+    but only after attempting all 4, so one bad endpoint doesn't stop
+    the other three from getting fixed. An endpoint left on an expiring
+    license is a real lab-breaking condition, not cosmetic drift.
+    """
+    import os
+    import requests
+
+    lsf.write_output('Resyncing License Hub endpoint <-> license mappings...')
+    admin_password = os.environ['AVICTRL_PASSWORD']
+    lh_session = requests.Session()
+    lh_session.verify = False
+    lh_session.auth = ('admin', admin_password)
+    lh_mgr = f'https://{LICENSE_HUB_HOST}:443'
+
+    targets = []
+    for d in NSXT_ALB_DOMAINS:
+        targets.append({
+            'label': f"NSX Manager ({d['domain']})",
+            'host': d['nsx_host'],
+            'endpoint_type': 'NSX_MANAGER',
+            'force_sync_host': d['nsx_host'],
+        })
+        targets.append({
+            'label': f"Avi Controller ({d['domain']})",
+            'host': d['avi_host'],
+            'endpoint_type': 'AVI_CONTROLLER',
+            'force_sync_host': None,
+        })
+
+    try:
+        all_licenses = lh_session.get(f'{lh_mgr}/licensing/views/licenses', timeout=15).json().get('results', [])
+    except Exception as e:
+        lsf.write_output(f'  Could not list licenses on License Hub: {e}')
+        lsf.labfail(f'Adjustomatic failed at License Hub endpoint resync: could not list licenses: {e}')
+        return
+
+    failures = []
+    for t in targets:
+        try:
+            endpoints = lh_session.get(
+                f"{lh_mgr}/licensing/views/endpoints", params={'endpoint_type': t['endpoint_type']}, timeout=15
+            ).json().get('results', [])
+            endpoint = next((e for e in endpoints if e.get('connection_info', {}).get('hostname') == t['host']), None)
+            if not endpoint:
+                lsf.write_output(f"  WARNING: {t['label']}: no License Hub endpoint found for hostname {t['host']} -- skipping")
+                failures.append(t['label'])
+                continue
+            endpoint_id = endpoint['id']
+
+            mappings = lh_session.get(f'{lh_mgr}/licensing/license-endpoint-mappings', timeout=15).json().get('results', [])
+            current_mappings = [m for m in mappings if m.get('endpoint_id') == endpoint_id]
+            if not current_mappings:
+                lsf.write_output(f"  {t['label']}: no current license mappings found -- nothing to swap")
+                continue
+
+            operations = []
+            for m in current_mappings:
+                current_license_id = m['license_id']
+                current_license = next((l for l in all_licenses if l.get('license_id') == current_license_id), None)
+                sku_code = current_license.get('sku_code') if current_license else None
+                if not sku_code:
+                    lsf.write_output(
+                        f"  {t['label']}: could not determine sku_code for currently-mapped "
+                        f"license {current_license_id} -- leaving as-is"
+                    )
+                    continue
+
+                candidates = [l for l in all_licenses if l.get('sku_code') == sku_code]
+                best = max(candidates, key=lambda l: l.get('expiration_date', 0), default=None)
+                if not best or best['license_id'] == current_license_id:
+                    lsf.write_output(f"  {t['label']}: {sku_code} already on the freshest available license -- no-op")
+                    continue
+
+                lsf.write_output(
+                    f"  {t['label']}: {sku_code} swapping {current_license_id} "
+                    f"(expires {current_license.get('expiration_date')}) -> {best['license_id']} "
+                    f"(expires {best.get('expiration_date')})"
+                )
+                operations.append({'operation': 'DELETE', 'mapping': {'license_id': current_license_id, 'endpoint_id': endpoint_id}})
+                operations.append({'operation': 'CREATE', 'mapping': {'license_id': best['license_id'], 'endpoint_id': endpoint_id}})
+
+            if not operations:
+                continue
+
+            bulk_result = lh_session.post(
+                f'{lh_mgr}/licensing/bulk-license-endpoint-mappings', json={'operations': operations}, timeout=30
+            )
+            lsf.write_output(f"  {t['label']}: bulk mapping result {bulk_result.status_code} - {bulk_result.text[:300]}")
+            bulk_result.raise_for_status()
+
+            if t['force_sync_host']:
+                sync_result = requests.post(
+                    f"https://{t['force_sync_host']}/policy/api/v1/licenses/action/async-query",
+                    auth=('admin', admin_password), verify=False, timeout=15,
+                )
+                lsf.write_output(f"  {t['label']}: force-sync triggered ({sync_result.status_code})")
+            else:
+                lsf.write_output(f"  {t['label']}: no force-sync API available for Avi Controller -- will auto-sync within ~15 minutes")
+
+        except Exception as e:
+            lsf.write_output(f"  WARNING: {t['label']}: failed to resync license mapping: {e}")
+            failures.append(t['label'])
+
+    if failures:
+        lsf.labfail(f'Adjustomatic failed at License Hub endpoint resync for: {failures}')
 
 
 SSO_DOMAINS = (
@@ -2714,6 +3130,23 @@ def main():
         # every time.
         with track_step(lsf, _telemetry_results, 'nsxt_app_profiles'):
             configure_nsxt_app_profiles(lsf)
+
+        # Disconnected-mode License Hub upload, endpoint onboarding, and
+        # endpoint<->license mapping resync -- see upload_license_hub_
+        # disconnected_license() / onboard_license_hub_endpoints() /
+        # resync_license_hub_endpoint_mappings() docstrings. Order matters:
+        # the license must be on LH before mapping can reference it, and
+        # endpoints must be onboarded (idempotent no-op if already done)
+        # before mappings can target their endpoint_id. Independent of the
+        # NSX-ALB credential steps below; run here (right after the other
+        # direct-API NSX/Avi step above) so a licensing failure is caught
+        # early rather than after several minutes of unrelated work.
+        with track_step(lsf, _telemetry_results, 'license_hub_upload'):
+            upload_license_hub_disconnected_license(lsf)
+        with track_step(lsf, _telemetry_results, 'license_hub_endpoint_onboarding'):
+            onboard_license_hub_endpoints(lsf)
+        with track_step(lsf, _telemetry_results, 'license_hub_mapping_resync'):
+            resync_license_hub_endpoint_mappings(lsf)
 
         # NSX-ALB credential/lockout durability -- see resync_nsxt_alb_*()
         # docstrings. This vApp is a saved/suspended VCD template that can sit
