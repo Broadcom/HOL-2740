@@ -160,9 +160,14 @@ def install_vcfa_blueprints(lsf):
         except Exception as e:
             lsf.write_output(f'  WARNING: could not create blueprint {name!r}: {e}')
     try:
+        # CCI's supervisornamespaces PATCH is JSON Merge Patch (RFC 7396) --
+        # confirmed against vcf/automation's supervisor-k8.service.ts, which
+        # always sends this content type for this call (never the plain
+        # application/json used by the blueprint calls above).
+        patch_headers = {**headers, 'Content-Type': 'application/merge-patch+json'}
         resp = requests.patch(
                 f'https://{VCFA_HOST}/cci/kubernetes/apis/infrastructure.cci.vmware.com/v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h',
-                headers=headers, verify=False, timeout=30,
+                headers=patch_headers, verify=False, timeout=30,
                 json={
                     "spec": {
                         "classConfigOverrides": {
