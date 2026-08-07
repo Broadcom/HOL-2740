@@ -2044,13 +2044,25 @@ def upload_license_hub_disconnected_license(lsf):
     Skips the upload entirely if a license already on LH has the exact
     expiration_date this bundle is known to produce
     (LICENSE_HUB_EXPECTED_EXPIRATION_MS) -- i.e. it's already been
-    imported -- rather than re-importing unconditionally every run.
-    Confirmed live (2026-08-07): re-importing this exact bundle a second
-    time, after it was already successfully imported once, gets rejected
-    by License Hub with a 400 ("unsupported content type") instead of a
-    clean idempotent no-op -- an LH-side quirk, not something fixable
-    from this script's side. Skipping the call entirely once the known
-    expiration is already present avoids ever hitting that path again.
+    imported -- rather than re-importing unconditionally every run. Purely
+    an efficiency no-op, not a workaround for anything: License Hub
+    tolerates re-importing the same bundle fine (confirmed live
+    2026-08-07, back-to-back successful 204s importing the identical
+    file).
+
+    CORRECTION (2026-08-07): an earlier version of this docstring blamed
+    the 400 ("unsupported content type") seen in testing on re-importing
+    an already-known bundle -- that diagnosis was wrong. The 400 recurred
+    on a completely fresh pod boot where LH still held an older, different
+    license (not a re-import at all), which ruled that theory out. Root
+    cause, confirmed via `curl --trace-ascii`: this multipart upload's
+    file part must be sent as Content-Type application/octet-stream --
+    curl's own default (no explicit -F ...;type=) sends exactly that and
+    succeeds every time; explicitly forcing type=application/zip (what
+    this code used to hardcode) reproduces the 400 on demand. License Hub
+    apparently validates/whitelists the part's Content-Type string itself
+    and does not accept "application/zip", regardless of the file's
+    actual contents.
 
     Exact-match, not a generic "still has N days left" buffer, and
     deliberately hardcoded rather than derived from the zip's own
@@ -2096,7 +2108,7 @@ def upload_license_hub_disconnected_license(lsf):
         upload_result = _request_with_retry(
             lh_session.post,
             f'{lh_mgr}/licensing/licenses?action=import',
-            files={'file': (os.path.basename(LICENSE_HUB_ZIP_PATH), license_bytes, 'application/zip')},
+            files={'file': (os.path.basename(LICENSE_HUB_ZIP_PATH), license_bytes, 'application/octet-stream')},
             timeout=60,
         )
         lsf.write_output(f'  Upload result {upload_result.status_code} - {upload_result.text[:500]}')
