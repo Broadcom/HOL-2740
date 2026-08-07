@@ -3279,14 +3279,23 @@ def main():
         #     resync_nsxt_alb_enforcement_point_tokens(lsf)
         # with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
         #     resync_nsxt_alb_cloud_connector_credentials(lsf)
-        # Belt-and-suspenders check for the specific downstream failure the
-        # above two functions can still leave behind even when they
-        # succeed: AKO on Supervisor stuck in CrashLoopBackOff because
-        # avi-secret/avi-init-secret never got (re)created. See
-        # ensure_ako_avi_secret_healthy()'s docstring for the full chain
-        # and the 2026-07-30 incident this guards against.
-        with track_step(lsf, _telemetry_results, 'ako_avi_secret_health'):
-            ensure_ako_avi_secret_healthy(lsf)
+        # TEMPORARILY DISABLED (2026-08-07): root-caused live that this
+        # function's remediation (restart nsx-ncp / netop-controller-manager
+        # / AKO pods) cannot fix the failure actually occurring right now --
+        # nsx-ncp's own AviSecretController is healthy and already retrying
+        # on its own built-in schedule, but every attempt fails with "Failed
+        # to get Avi auth token ... No route to host" / "502 BAD_GATEWAY"
+        # hitting the Avi Controller (10.1.1.90) from NSX Manager. That's a
+        # real network/gateway problem between NSX and Avi, not a missing-
+        # secret or stale-object condition -- no amount of restarting AKO,
+        # netop-controller-manager, or nsx-ncp itself addresses it, so this
+        # function's checks were correctly reporting "not Ready" every run
+        # while its fix loop just added restart churn on top of a problem
+        # it can't touch. Leaving ensure_ako_avi_secret_healthy() defined
+        # for when it once again matches an actual secret-chain failure
+        # (its original 2026-07-30 target) rather than this network issue.
+        # with track_step(lsf, _telemetry_results, 'ako_avi_secret_health'):
+        #     ensure_ako_avi_secret_healthy(lsf)
         with track_step(lsf, _telemetry_results, 'sso_password_policy'):
             resync_sso_password_policy(lsf)
 
