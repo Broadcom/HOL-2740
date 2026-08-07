@@ -1960,6 +1960,48 @@ def _ensure_sddc_auto_rotate_disabled(sddc_headers, lsf):
         lsf.write_output(f"    disabled auto-rotate on {e['username']} (was still enabled)")
 
 
+def _request_with_retry(fn, *args, retries=5, delay=15, **kwargs):
+    """
+    Call fn(*args, **kwargs) (a requests-style call returning a
+    Response), retrying on the two symptoms confirmed (2026-08-07) to be
+    transient noise during a busy pod boot rather than real failures: a
+    401 from License Hub's authserver component before it's fully warmed
+    up, and a connection-level exception (timeout/refused) while
+    NSX/Avi/LH are still coming up. Confirmed live: a License Hub upload
+    hard-failed with a 401 during a fresh-boot run where NSX Manager
+    calls were also timing out moments earlier in that same run; the
+    identical call (same credentials, same file) succeeded immediately
+    when run by hand a few minutes later against the same, by-then-
+    settled pod.
+
+    Any other status code (400/403/404/5xx) is returned immediately
+    without retrying -- those are real errors, not boot-timing noise,
+    and should fail fast rather than burn through all the retries first.
+
+    Used throughout the License Hub functions below (upload, endpoint
+    onboarding, mapping resync) plus their NSX-side calls, since all of
+    them hit appliances that can still be initializing at the same point
+    in adjustomatic's run.
+    """
+    import time
+
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(delay)
+                continue
+            raise
+        if response.status_code == 401 and attempt < retries:
+            time.sleep(delay)
+            continue
+        return response
+    raise last_exc
+
+
 LICENSE_HUB_HOST = 'ssp.site-a.vcf.lab'
 LICENSE_HUB_ZIP_PATH = (
     '/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/'
@@ -2004,19 +2046,26 @@ def upload_license_hub_disconnected_license(lsf):
     lh_mgr = f'https://{LICENSE_HUB_HOST}:443'
 
     try:
-        before = lh_session.get(f'{lh_mgr}/licensing/views/licenses', timeout=15)
+        before = _request_with_retry(lh_session.get, f'{lh_mgr}/licensing/views/licenses', timeout=15)
         lsf.write_output(f'  Licenses on License Hub before upload: {before.text[:500]}')
 
+        # Read the whole file into memory up front (it's ~20KB) rather than
+        # passing a live file handle into files= -- a retried POST re-reads
+        # whatever's in files= on each attempt, and a file handle would
+        # already be at EOF after the first (failed) attempt, silently
+        # sending an empty body on the retry. Bytes have no such state.
         with open(LICENSE_HUB_ZIP_PATH, 'rb') as license_file:
-            upload_result = lh_session.post(
-                f'{lh_mgr}/licensing/licenses?action=import',
-                files={'file': (os.path.basename(LICENSE_HUB_ZIP_PATH), license_file, 'application/zip')},
-                timeout=60,
-            )
+            license_bytes = license_file.read()
+        upload_result = _request_with_retry(
+            lh_session.post,
+            f'{lh_mgr}/licensing/licenses?action=import',
+            files={'file': (os.path.basename(LICENSE_HUB_ZIP_PATH), license_bytes, 'application/zip')},
+            timeout=60,
+        )
         lsf.write_output(f'  Upload result {upload_result.status_code} - {upload_result.text[:500]}')
         upload_result.raise_for_status()
 
-        after = lh_session.get(f'{lh_mgr}/licensing/views/licenses', timeout=15)
+        after = _request_with_retry(lh_session.get, f'{lh_mgr}/licensing/views/licenses', timeout=15)
         lsf.write_output(f'  Licenses on License Hub after upload: {after.text[:500]}')
 
     except Exception as e:
@@ -2042,8 +2091,8 @@ def _ensure_license_hub_endpoint_onboarded(lh_session, lh_mgr, endpoint_type, ho
     """
     import time
 
-    existing = lh_session.get(
-        f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
+    existing = _request_with_retry(
+        lh_session.get, f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
     ).json().get('results', [])
     match = next((e for e in existing if e.get('connection_info', {}).get('hostname') == host), None)
 
@@ -2054,7 +2103,8 @@ def _ensure_license_hub_endpoint_onboarded(lh_session, lh_mgr, endpoint_type, ho
             return endpoint_id
         lsf.write_output(f"    {host}: already onboarded as {endpoint_type} endpoint, status={match.get('status')} -- waiting for READY")
     else:
-        create_result = lh_session.post(
+        create_result = _request_with_retry(
+            lh_session.post,
             f'{lh_mgr}/licensing/endpoints', timeout=30,
             json={
                 'endpoint_type': endpoint_type,
@@ -2075,14 +2125,21 @@ def _ensure_license_hub_endpoint_onboarded(lh_session, lh_mgr, endpoint_type, ho
     deadline = time.time() + timeout_seconds
     status = None
     while time.time() < deadline:
-        endpoints = lh_session.get(
-            f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
-        ).json().get('results', [])
-        match = next((e for e in endpoints if e.get('id') == endpoint_id), None)
-        status = match.get('status') if match else None
-        if status == 'READY':
-            lsf.write_output(f'    {host}: endpoint READY')
-            return endpoint_id
+        try:
+            endpoints = lh_session.get(
+                f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
+            ).json().get('results', [])
+            match = next((e for e in endpoints if e.get('id') == endpoint_id), None)
+            status = match.get('status') if match else None
+            if status == 'READY':
+                lsf.write_output(f'    {host}: endpoint READY')
+                return endpoint_id
+        except Exception as e:
+            # The outer while loop is already a poll-with-backoff (every
+            # poll_interval up to timeout_seconds) -- treat a single bad
+            # response (transient 401, non-JSON error body, timeout) the
+            # same as "not ready yet" rather than crashing the whole poll.
+            lsf.write_output(f'    {host}: poll check failed ({e}), will retry')
         time.sleep(poll_interval)
 
     lsf.write_output(f'    {host}: endpoint did not reach READY within {timeout_seconds}s (last status: {status})')
@@ -2141,8 +2198,8 @@ def onboard_license_hub_endpoints(lsf):
     for d in NSXT_ALB_DOMAINS:
         # ---- NSX Manager ----
         try:
-            certs = requests.get(
-                f"https://{d['nsx_host']}/api/v1/trust-management/certificates",
+            certs = _request_with_retry(
+                requests.get, f"https://{d['nsx_host']}/api/v1/trust-management/certificates",
                 auth=('admin', admin_password), verify=False, timeout=15,
             ).json()
             api_cert = next(
@@ -2263,7 +2320,9 @@ def resync_license_hub_endpoint_mappings(lsf):
         })
 
     try:
-        all_licenses = lh_session.get(f'{lh_mgr}/licensing/views/licenses', timeout=15).json().get('results', [])
+        all_licenses = _request_with_retry(
+            lh_session.get, f'{lh_mgr}/licensing/views/licenses', timeout=15
+        ).json().get('results', [])
     except Exception as e:
         lsf.write_output(f'  Could not list licenses on License Hub: {e}')
         lsf.labfail(f'Adjustomatic failed at License Hub endpoint resync: could not list licenses: {e}')
@@ -2272,8 +2331,8 @@ def resync_license_hub_endpoint_mappings(lsf):
     failures = []
     for t in targets:
         try:
-            endpoints = lh_session.get(
-                f"{lh_mgr}/licensing/views/endpoints", params={'endpoint_type': t['endpoint_type']}, timeout=15
+            endpoints = _request_with_retry(
+                lh_session.get, f"{lh_mgr}/licensing/views/endpoints", params={'endpoint_type': t['endpoint_type']}, timeout=15
             ).json().get('results', [])
             endpoint = next((e for e in endpoints if e.get('connection_info', {}).get('hostname') == t['host']), None)
             if not endpoint:
@@ -2282,7 +2341,9 @@ def resync_license_hub_endpoint_mappings(lsf):
                 continue
             endpoint_id = endpoint['id']
 
-            mappings = lh_session.get(f'{lh_mgr}/licensing/license-endpoint-mappings', timeout=15).json().get('results', [])
+            mappings = _request_with_retry(
+                lh_session.get, f'{lh_mgr}/licensing/license-endpoint-mappings', timeout=15
+            ).json().get('results', [])
             current_mappings = [m for m in mappings if m.get('endpoint_id') == endpoint_id]
             if not current_mappings:
                 lsf.write_output(f"  {t['label']}: no current license mappings found -- nothing to swap")
@@ -2317,15 +2378,16 @@ def resync_license_hub_endpoint_mappings(lsf):
             if not operations:
                 continue
 
-            bulk_result = lh_session.post(
-                f'{lh_mgr}/licensing/bulk-license-endpoint-mappings', json={'operations': operations}, timeout=30
+            bulk_result = _request_with_retry(
+                lh_session.post, f'{lh_mgr}/licensing/bulk-license-endpoint-mappings',
+                json={'operations': operations}, timeout=30
             )
             lsf.write_output(f"  {t['label']}: bulk mapping result {bulk_result.status_code} - {bulk_result.text[:300]}")
             bulk_result.raise_for_status()
 
             if t['force_sync_host']:
-                sync_result = requests.post(
-                    f"https://{t['force_sync_host']}/policy/api/v1/licenses/action/async-query",
+                sync_result = _request_with_retry(
+                    requests.post, f"https://{t['force_sync_host']}/policy/api/v1/licenses/action/async-query",
                     auth=('admin', admin_password), verify=False, timeout=15,
                 )
                 lsf.write_output(f"  {t['label']}: force-sync triggered ({sync_result.status_code})")
@@ -3131,22 +3193,30 @@ def main():
         with track_step(lsf, _telemetry_results, 'nsxt_app_profiles'):
             configure_nsxt_app_profiles(lsf)
 
-        # Disconnected-mode License Hub upload, endpoint onboarding, and
-        # endpoint<->license mapping resync -- see upload_license_hub_
-        # disconnected_license() / onboard_license_hub_endpoints() /
-        # resync_license_hub_endpoint_mappings() docstrings. Order matters:
-        # the license must be on LH before mapping can reference it, and
-        # endpoints must be onboarded (idempotent no-op if already done)
-        # before mappings can target their endpoint_id. Independent of the
-        # NSX-ALB credential steps below; run here (right after the other
-        # direct-API NSX/Avi step above) so a licensing failure is caught
-        # early rather than after several minutes of unrelated work.
+        # Disconnected-mode License Hub upload -- see
+        # upload_license_hub_disconnected_license() docstring. Independent
+        # of the NSX-ALB credential steps below; run here (right after the
+        # other direct-API NSX/Avi step above) so a licensing failure is
+        # caught early rather than after several minutes of unrelated work.
         with track_step(lsf, _telemetry_results, 'license_hub_upload'):
             upload_license_hub_disconnected_license(lsf)
-        with track_step(lsf, _telemetry_results, 'license_hub_endpoint_onboarding'):
-            onboard_license_hub_endpoints(lsf)
-        with track_step(lsf, _telemetry_results, 'license_hub_mapping_resync'):
-            resync_license_hub_endpoint_mappings(lsf)
+
+        # TEMPORARILY DISABLED (2026-08-07): confirmed live on the test pod
+        # that uploading a replacement license to License Hub updates it
+        # in place -- already-assigned endpoints stay mapped to it without
+        # needing onboarding to be (re-)run or an explicit endpoint<->
+        # license mapping swap. Neither of these has actually been
+        # exercised by a real adjustomatic.py run yet -- the one real run
+        # hard-failed at the upload step itself (transient 401, since
+        # fixed with retry) before either got a chance to execute. Leaving
+        # onboard_license_hub_endpoints() / resync_license_hub_endpoint_
+        # mappings() defined but unused until both are validated on
+        # another pod (e.g. one where endpoints aren't already onboarded,
+        # or where the in-place-update behavior doesn't hold).
+        # with track_step(lsf, _telemetry_results, 'license_hub_endpoint_onboarding'):
+        #     onboard_license_hub_endpoints(lsf)
+        # with track_step(lsf, _telemetry_results, 'license_hub_mapping_resync'):
+        #     resync_license_hub_endpoint_mappings(lsf)
 
         # NSX-ALB credential/lockout durability -- see resync_nsxt_alb_*()
         # docstrings. This vApp is a saved/suspended VCD template that can sit
