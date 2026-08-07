@@ -2007,6 +2007,16 @@ LICENSE_HUB_ZIP_PATH = (
     '/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/'
     'b3966fca-3ec0-4fe2-b628-ff186de53b19_1000001_1785992463049_v7.lic.zip'
 )
+# Expiration timestamp (epoch ms, as License Hub itself reports it) this
+# specific v7.lic.zip bundle produces once imported -- confirmed live
+# 2026-08-07 on both SKUs it carries (ANS-VMW-ALB, ANS-FW-ATP), works out
+# to ~2027-07-10. Hardcoded deliberately, not derived generically: this
+# lab's remaining life (through Aug/Sept 2027) is shorter than this one
+# license's 360-day post-expiration grace period, so this bundle is
+# expected to be the last one this lab ever needs -- there's no future
+# replacement file to stay generic for. Update this if that ever changes
+# (a newer replacement zip is checked in with a different expiration).
+LICENSE_HUB_EXPECTED_EXPIRATION_MS = 1815237720365
 
 
 def upload_license_hub_disconnected_license(lsf):
@@ -2031,6 +2041,25 @@ def upload_license_hub_disconnected_license(lsf):
     (bundle already present) is visible in labstartup.log rather than
     silently indistinguishable from a real change.
 
+    Skips the upload entirely if a license already on LH has the exact
+    expiration_date this bundle is known to produce
+    (LICENSE_HUB_EXPECTED_EXPIRATION_MS) -- i.e. it's already been
+    imported -- rather than re-importing unconditionally every run.
+    Confirmed live (2026-08-07): re-importing this exact bundle a second
+    time, after it was already successfully imported once, gets rejected
+    by License Hub with a 400 ("unsupported content type") instead of a
+    clean idempotent no-op -- an LH-side quirk, not something fixable
+    from this script's side. Skipping the call entirely once the known
+    expiration is already present avoids ever hitting that path again.
+
+    Exact-match, not a generic "still has N days left" buffer, and
+    deliberately hardcoded rather than derived from the zip's own
+    contents (which don't expose anything reliably comparable -- it's a
+    single opaque signed JWT asset-identity blob, not a plain
+    license_id/expiration list) -- see LICENSE_HUB_EXPECTED_EXPIRATION_MS
+    above for why hardcoding is the right call specifically for this
+    bundle rather than a maintenance liability.
+
     Fatal: unlike most other functions in this file, a failed upload
     calls lsf.labfail(). Correct licensing is core lab functionality
     here, not a best-effort convenience fix -- a silent failure would
@@ -2047,7 +2076,15 @@ def upload_license_hub_disconnected_license(lsf):
 
     try:
         before = _request_with_retry(lh_session.get, f'{lh_mgr}/licensing/views/licenses', timeout=15)
+        before_licenses = before.json().get('results', [])
         lsf.write_output(f'  Licenses on License Hub before upload: {before.text[:500]}')
+
+        if any(l.get('expiration_date') == LICENSE_HUB_EXPECTED_EXPIRATION_MS for l in before_licenses):
+            lsf.write_output(
+                f'  A license expiring {LICENSE_HUB_EXPECTED_EXPIRATION_MS} (this bundle\'s known '
+                f'expiration) is already present on License Hub -- already imported, skipping re-upload'
+            )
+            return
 
         # Read the whole file into memory up front (it's ~20KB) rather than
         # passing a live file handle into files= -- a retried POST re-reads
