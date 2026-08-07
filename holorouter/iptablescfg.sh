@@ -138,21 +138,57 @@ do
 done
 
 ### LAB-SPECIFIC RULES
+/usr/sbin/ip link set dev eth1.19 nomaster
+/usr/sbin/ip link set dev eth1.20 nomaster
 
-cat > /etc/sysctl.d/zz-tcp-l3mdev-accept.conf << 'EOF'
-# kubernetes.conf sets tcp_l3mdev_accept=0 as generic k8s sysctl boilerplate.
-# This file must sort alphabetically AFTER kubernetes.conf so it wins on
-# `sysctl --system` reload. Allows default-VRF-bound TCP sockets (squid,
-# etc.) to accept connections arriving via VRF-enslaved interfaces
-# (sitea/siteb), matching the existing udp_l3mdev_accept=1 already set
-# for DNS/NTP.
-net.ipv4.tcp_l3mdev_accept = 1
+/usr/bin/cat > /tmp/bgpcustom.yaml << 'EOF'
+  spec:
+    raw:
+      priority: 1
+      rawConfig: |-
+        hostname HoloRouter-9.0
+        no ipv6 forwarding
+        !
+        router bgp 65000
+        bgp router-id 10.1.6.1
+        no bgp ebgp-requires-policy
+        no bgp hard-administrative-reset
+        no bgp graceful-restart notification
+        bgp log-neighbor-changes
+        neighbor SITE-A peer-group
+        neighbor SITE-A remote-as external
+        neighbor SITE-A password VMware123!
+        bgp listen range 10.1.6.0/25 peer-group SITE-A
+        bgp listen range 10.1.6.128/25 peer-group SITE-A
+        !
+        address-family ipv4 unicast
+          redistribute kernel
+          neighbor SITE-A activate
+          neighbor SITE-A default-originate
+        exit-address-family
+        exit
+        !
+        !
+        router bgp 65000
+        bgp router-id 10.1.6.1
+        no bgp ebgp-requires-policy
+        no bgp hard-administrative-reset
+        no bgp graceful-restart notification
+        bgp log-neighbor-changes
+        !
+        address-family ipv4 unicast
+          redistribute connected
+        exit-address-family
+        exit
+  apiVersion: frrk8s.metallb.io/v1beta1
+  metadata:
+    name: frr-config
+  kind: FRRConfiguration
 EOF
 
-sysctl --system
+KUBECONFIG="/etc/kubernetes/admin.conf" /usr/bin/kubectl apply -f /tmp/bgpcustom.yaml
 
 systemctl restart squid
-
 
 ### END RULES
 
