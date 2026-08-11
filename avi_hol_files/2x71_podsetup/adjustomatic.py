@@ -1710,6 +1710,147 @@ def check_supervisor_ako_health_early(lsf):
         lsf.write_output(f'  WARNING: early Supervisor/AKO check failed: {e}')
 
 
+# The AKO deployed INSIDE each VKS guest cluster -- a different AKO from the
+# Supervisor-side vmware-system-ako namespace checked by
+# ensure_ako_avi_secret_healthy()/check_supervisor_ako_health_early() above.
+# Confirmed live 2026-08-11 on this pod: each of workload-cluster-1/-2 runs
+# its own 'avi-system' namespace with a single-replica StatefulSet 'ako'
+# (pod ako-0, containers ako/ako-gateway-api/vmci-relay) plus a separate
+# 'ako-crd-operator' Deployment. Checked on BOTH clusters here, unlike
+# VKS_WORKLOAD_CLUSTERS above (deliberately scoped to just
+# workload-cluster-1 for node-pool scaling only) -- AKO health isn't tied to
+# that scoping decision.
+WORKLOAD_CLUSTER_CONTEXTS = ('workload-cluster-1', 'workload-cluster-2')
+WORKLOAD_CLUSTER_AKO_NAMESPACE = 'avi-system'
+
+# Container waiting reasons that a plain pod delete actually fixes. All of
+# these stem from kubelet resolving a pod's inputs (a referenced
+# ConfigMap/Secret, an image reference) once at container creation; if that
+# input was missing/wrong when the pod first started but is fine now,
+# kubelet's own in-place retry can sit stuck far longer than a lab session
+# should wait (this is the exact class of failure seen live on
+# workload-cluster-1 2026-08-11: AKO's ako-0 pod stuck in
+# CreateContainerConfigError). Deleting the pod lets its owning
+# StatefulSet/Deployment recreate it and re-resolve those inputs
+# immediately. Deliberately excludes reasons a delete can't fix (e.g.
+# CrashLoopBackOff from an actual application bug) so this doesn't churn
+# pods that would just fail the same way again.
+AKO_FIXABLE_WAITING_REASONS = frozenset([
+    'CreateContainerConfigError',
+    'CreateContainerError',
+    'InvalidImageName',
+])
+
+
+def ensure_workload_cluster_ako_healthy(lsf, timeout_seconds=180, poll_interval=15):
+    """
+    For each context in WORKLOAD_CLUSTER_CONTEXTS, check that every pod in
+    the guest cluster's own avi-system namespace (AKO's ako-0 StatefulSet
+    pod and the ako-crd-operator Deployment pod) is Ready. Any pod with a
+    container stuck waiting on a reason in AKO_FIXABLE_WAITING_REASONS gets
+    deleted so its controller recreates it; this function then polls up to
+    timeout_seconds for the namespace to report all-Ready again.
+
+    A pod that's simply still starting (e.g. right after a fresh guest
+    cluster boot) is left alone -- only pods with a *waiting reason present*
+    in the fixable set are touched, so this doesn't race a normal cold
+    start.
+
+    Non-fatal: any failure, or an unfixed/unfixable pod, is logged as a
+    warning. lsf.labfail is never called here -- a stuck AKO pod degrades
+    load-balancer provisioning for workloads on that guest cluster, but
+    doesn't itself mean the lab can't be used.
+    """
+    import json
+    import time
+
+    lsf.write_output('Checking AKO pod health in each VKS workload cluster...')
+    password = lsf.get_password()
+
+    def _get_pods(context):
+        cmd = f"kubectl --context {context} -n {WORKLOAD_CLUSTER_AKO_NAMESPACE} get pods -o json"
+        result = lsf.ssh(cmd, VKS_KUBECTL_HOST, password)
+        stdout = (getattr(result, 'stdout', '') or '').strip()
+        if not stdout:
+            return None
+        return json.loads(stdout).get('items', [])
+
+    def _all_ready(pods):
+        return all(
+            cs.get('ready')
+            for pod in pods
+            for cs in (pod.get('status', {}).get('containerStatuses', []) or [])
+        )
+
+    for context in WORKLOAD_CLUSTER_CONTEXTS:
+        try:
+            pods = _get_pods(context)
+            if pods is None:
+                lsf.write_output(
+                    f'  {context}: no output listing pods in {WORKLOAD_CLUSTER_AKO_NAMESPACE} '
+                    f'-- cluster may be unreachable, skipping'
+                )
+                continue
+            if not pods:
+                lsf.write_output(f'  {context}: no pods found in {WORKLOAD_CLUSTER_AKO_NAMESPACE} -- skipping')
+                continue
+
+            to_delete = []
+            for pod in pods:
+                name = pod.get('metadata', {}).get('name', '<unknown>')
+                statuses = pod.get('status', {}).get('containerStatuses', []) or []
+                bad_reasons = []
+                for cs in statuses:
+                    if cs.get('ready'):
+                        continue
+                    reason = (cs.get('state', {}).get('waiting', {}) or {}).get('reason')
+                    if reason:
+                        bad_reasons.append(reason)
+
+                if not bad_reasons:
+                    continue
+
+                lsf.write_output(f'  {context}/{name}: not Ready ({", ".join(bad_reasons)})')
+                if any(r in AKO_FIXABLE_WAITING_REASONS for r in bad_reasons):
+                    to_delete.append(name)
+                else:
+                    lsf.write_output(
+                        f'    {name}: reason(s) not in the known pod-delete-fixable set -- leaving alone'
+                    )
+
+            if not to_delete:
+                lsf.write_output(f'  {context}: all AKO pods Ready (or not fixable by delete) -- no-op')
+                continue
+
+            for name in to_delete:
+                lsf.write_output(f'  {context}/{name}: deleting to force recreation')
+                lsf.ssh(
+                    f"kubectl --context {context} -n {WORKLOAD_CLUSTER_AKO_NAMESPACE} "
+                    f"delete pod {name} --wait=false",
+                    VKS_KUBECTL_HOST, password,
+                )
+
+            deadline = time.time() + timeout_seconds
+            recovered = False
+            while time.time() < deadline:
+                time.sleep(poll_interval)
+                pods = _get_pods(context)
+                if pods and _all_ready(pods):
+                    recovered = True
+                    break
+
+            if recovered:
+                lsf.write_output(f'  {context}: AKO pods Ready after recreation')
+            else:
+                lsf.write_output(
+                    f'  WARNING: {context}: AKO pods still not all Ready {timeout_seconds}s '
+                    f'after deleting {to_delete}'
+                )
+
+        except Exception as e:
+            lsf.write_output(f'  WARNING: could not check/repair AKO health in {context}: {e}')
+
+
 def resync_nsxt_alb_cloud_connector_credentials(lsf):
     """
     Verify (fast path) that Avi's cloud-connector credential for each NSX
@@ -3216,6 +3357,15 @@ def main():
         # incident this guards against.
         with track_step(lsf, _telemetry_results, 'vcfa_kubevip_lease_invariant'):
             fix_vcfa_kube_vip_lease_invariant(lsf)
+
+        # AKO pod health inside each VKS workload guest cluster (avi-system
+        # namespace) -- distinct from the Supervisor-side vmware-system-ako
+        # check above (currently disabled). See
+        # ensure_workload_cluster_ako_healthy()'s docstring for the
+        # 2026-08-11 workload-cluster-1 CreateContainerConfigError incident
+        # this guards against.
+        with track_step(lsf, _telemetry_results, 'workload_cluster_ako_health'):
+            ensure_workload_cluster_ako_healthy(lsf)
 
         # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
         # page-load hang). Independent of everything else here; see
