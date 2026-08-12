@@ -33,13 +33,14 @@
   - name: Install the Antrea interworking configuration
     kubernetes.core.k8s:
       state: present
-      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/mysql-vm.yaml.j2') | from_yaml_all | list }}"
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-vm.yaml.j2') | from_yaml_all | list }}"
       context: "Supervisor"
     vars:
       db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
 
   - name: Query vSphere VMService for external status allocation
     kubernetes.core.k8s_info:
+      context: "Supervisor"
       apiVersion: vmoperator.vmware.com/v1alpha5
       kind: VirtualMachineService
       name: "mysql-db"
@@ -55,14 +56,16 @@
 
   - name: Parse backend template and apply to cluster
     kubernetes.core.k8s:
+      context: "workload-cluster-1"
       state: present
       namespace: "acme-east-prod-wrp4h"
-      definition: "{{ lookup('ansible.builtin.template', 'backend.yaml.j2') | from_yaml_all | list }}"
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend.yaml.j2') | from_yaml_all | list }}"
     vars:
       db_vm_ip: "{{ hostvars['localhost']['global_db_ip'] }}"
 
   - name: Wait for Backend LoadBalancer Service to obtain an IP
     kubernetes.core.k8s_info:
+      context: "workload-cluster-1"
       apiVersion: v1
       kind: Service
       name: backend-app-service
@@ -76,11 +79,11 @@
     ansible.builtin.set_fact:
       global_backend_ip: "{{ backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
 
-
   - name: Parse frontend template and apply to cluster
     kubernetes.core.k8s:
+      context: "workload-cluster-1"
       state: present
       namespace: "acme-east-prod-wrp4h"
-      definition: "{{ lookup('ansible.builtin.template', 'frontend.yaml.j2') | from_yaml_all | list }}"
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend.yaml.j2') | from_yaml_all | list }}"
     vars:
       backend_service_ip: "{{ hostvars['localhost']['global_backend_ip'] }}"
