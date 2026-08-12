@@ -5,7 +5,7 @@ metadata:
 type: Opaque
 data:
   # Base64 encodes the full backend API destination URL path dynamically
-  api_url: "{{ backend_service_ip | b64encode }}"
+  api_url: "{{ ( backend_service_ip + ':5000') | b64encode }}"
 ---
 apiVersion: apps/v1
 kind: Deployment
