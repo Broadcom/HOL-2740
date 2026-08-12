@@ -280,11 +280,11 @@
     #     state: restarted
     #   become: yes
   
-    # - name: Restart service locust 
-    #   ansible.builtin.service:
-    #     name: locust_sitea
-    #     state: restarted
-    #   become: yes
+    - name: Restart service locust 
+      ansible.builtin.service:
+        name: demotraffic
+        state: restarted
+      become: yes
   
     # - name: Create site A kubernetes things
     #   kubernetes.core.k8s:
