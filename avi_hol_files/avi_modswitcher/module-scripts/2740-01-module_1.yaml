@@ -1,0 +1,86 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /home/holuser/py312venv/bin/python3
+  tasks:
+
+  - name: Install the Antrea interworking configuration
+    kubernetes.core.k8s:
+      state: present
+      definition: "{{ lookup('file', '/hol/hol-2740/avimart_demo/antrea-addonconfig.yaml') | from_yaml }}"
+      context: "Supervisor"
+
+  - name: Run setup script
+    ansible.builtin.shell:
+      cmd: source ./prepare-demo.sh
+      chdir: /hol/hol-2740/avimart_demo/
+      executable: /bin/bash
+    environment:
+      AVI_HOST: 'alb-a.site-a.vcf.lab'
+      NSX_HOST: 'nsx-wld01-a.site-a.vcf.lab'
+      AVI_USER: 'admin'
+      AVI_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      NSX_USER: 'admin'
+      NSX_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+    register: script_output
+
+  - name: Print the script stdout
+    ansible.builtin.debug:
+      var: script_output.stdout_lines
+
+  - name: Install the Antrea interworking configuration
+    kubernetes.core.k8s:
+      state: present
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/mysql-vm.yaml.j2') | from_yaml_all | list }}"
+      context: "Supervisor"
+    vars:
+      db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+
+  - name: Query vSphere VMService for external status allocation
+    kubernetes.core.k8s_info:
+      apiVersion: vmoperator.vmware.com/v1alpha5
+      kind: VirtualMachineService
+      name: "mysql-db"
+      namespace: "acme-east-prod-wrp4h"
+    register: db_vm_svc_info
+    until: "db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+    retries: 30
+    delay: 10
+
+  - name: Store Database Node IP internally
+    ansible.builtin.set_fact:
+      global_db_ip: "{{ db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
+
+  - name: Parse backend template and apply to cluster
+    kubernetes.core.k8s:
+      state: present
+      namespace: "acme-east-prod-wrp4h"
+      definition: "{{ lookup('ansible.builtin.template', 'backend.yaml.j2') | from_yaml_all | list }}"
+    vars:
+      db_vm_ip: "{{ hostvars['localhost']['global_db_ip'] }}"
+
+  - name: Wait for Backend LoadBalancer Service to obtain an IP
+    kubernetes.core.k8s_info:
+      apiVersion: v1
+      kind: Service
+      name: backend-app-service
+      namespace: "{{ target_namespace }}"
+    register: backend_svc_info
+    until: "backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+    retries: 30
+    delay: 10
+
+  - name: Store Backend Service IP internally
+    ansible.builtin.set_fact:
+      global_backend_ip: "{{ backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
+
+
+  - name: Parse frontend template and apply to cluster
+    kubernetes.core.k8s:
+      state: present
+      namespace: "acme-east-prod-wrp4h"
+      definition: "{{ lookup('ansible.builtin.template', 'frontend.yaml.j2') | from_yaml_all | list }}"
+    vars:
+      backend_service_ip: "{{ hostvars['localhost']['global_backend_ip'] }}"

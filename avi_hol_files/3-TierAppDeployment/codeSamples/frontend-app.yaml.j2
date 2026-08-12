@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: frontend-app-secret
+type: Opaque
+data:
+  # Base64 encodes the full backend API destination URL path dynamically
+  api_url: "{{ backend_service_ip | b64encode }}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-app-deployment
+  labels:
+    app: frontend-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend-app
+  template:
+    metadata:
+      labels:
+        app: frontend-app
+    spec:
+      containers:
+        - name: frontend-app
+          image: harbor.site-a.vcf.lab/library/developer-utilities-frontend:latest
+          ports:
+            - containerPort: 5000
+          env:
+            - name: API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: frontend-app-secret
+                  key: api_url
+                  optional: false
+      imagePullSecrets:
+        - name: docker-hub-creds
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-app-service
+spec:
+  selector:
+    app: frontend-app
+  ports:
+    - name: web-app-port
+      protocol: TCP
+      port: 5000
+      targetPort: 5000
+  type: LoadBalancer
