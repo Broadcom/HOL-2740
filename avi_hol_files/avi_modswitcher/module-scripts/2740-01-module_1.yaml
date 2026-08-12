@@ -63,7 +63,7 @@
     kubernetes.core.k8s:
       context: "workload-cluster-1"
       state: present
-      namespace: "acme-east-prod-wrp4h"
+      namespace: default
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       db_vm_ip: "{{ hostvars['localhost']['global_db_ip'] }}"
@@ -74,7 +74,7 @@
       api_version: v1
       kind: Service
       name: backend-app-service
-      namespace: "{{ target_namespace }}"
+      namespace: default
     register: backend_svc_info
     until: "backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
     retries: 30
@@ -88,7 +88,7 @@
     kubernetes.core.k8s:
       context: "workload-cluster-1"
       state: present
-      namespace: "acme-east-prod-wrp4h"
+      namespace: default
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       backend_service_ip: "{{ hostvars['localhost']['global_backend_ip'] }}"
