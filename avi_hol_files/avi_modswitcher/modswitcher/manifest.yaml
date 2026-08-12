@@ -6,7 +6,7 @@ config:
 
 skus:
   - id: HOL-2740-01
-    title: "HOL-2740-01 - Integrate VMware Avi Load Balancer with VKS."
+    title: "HOL-2740-01 - App security in VKS with vDefend and Avi"
     modules:
       - name: "Module 1 - Prepare Avi / vDefend container security lab"
         description: "Deploys the 3 tier app, the antrea interworking configuration, and the avimart manifests"
