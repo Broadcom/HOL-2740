@@ -1090,6 +1090,13 @@ def configure_nsxt_app_profiles(lsf):
     ever needed to create them). GET-before-PUT makes every subsequent
     run a no-op instead of an error.
 
+    Also ensures the hol-wildcard service certificate is imported into
+    NSX, from the cert/key files staged on the manager at
+    /lmchol/home/holuser/certificates (wildcard_cert.pem/wildcard_key.pem).
+    Idempotency here is presence-only (GET 200 -> skip) rather than a
+    field diff like the profiles above, since NSX never reads back a
+    private_key in plaintext to compare against.
+
     Non-fatal: any failure here is logged as a warning and does not fail
     lab startup (matches this block's original behavior -- lsf.labfail
     was never called here).
@@ -1145,6 +1152,35 @@ def configure_nsxt_app_profiles(lsf):
 
         except Exception as e:
             lsf.write_output(f'  WARNING: could not ensure {name}: {e}')
+
+    cert_name = 'hol-wildcard'
+    cert_dir = '/lmchol/home/holuser/certificates'
+    cert_url = f'{nsx_mgr}/policy/api/v1/infra/certificates/{cert_name}'
+    try:
+        get_result = session.get(cert_url, timeout=15)
+        if get_result.status_code == 200:
+            lsf.write_output(f'  {cert_name}: certificate already present -- no-op')
+        else:
+            if get_result.status_code != 404:
+                lsf.write_output(
+                    f'  {cert_name}: GET returned {get_result.status_code} '
+                    f'({get_result.text[:200]}) -- attempting import anyway'
+                )
+            lsf.write_output(f'  {cert_name}: not found -- importing from {cert_dir}')
+            with open(f'{cert_dir}/wildcard_cert.pem', 'r') as cert_file:
+                cert_pem = cert_file.read()
+            with open(f'{cert_dir}/wildcard_key.pem', 'r') as key_file:
+                cert_key = key_file.read()
+            cert_data = {
+                'display_name': cert_name,
+                'resource_type': 'Certificate',
+                'pem_encoded': cert_pem,
+                'private_key': cert_key,
+            }
+            put_result = session.put(cert_url, json=cert_data, timeout=15)
+            lsf.write_output(f'  {cert_name}: PUT result {put_result.status_code} - {put_result.text[:200]}')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not ensure {cert_name} certificate: {e}')
 
 
 # This vApp is a saved/suspended VCD template that can sit powered off for
@@ -1674,6 +1710,147 @@ def check_supervisor_ako_health_early(lsf):
         lsf.write_output(f'  WARNING: early Supervisor/AKO check failed: {e}')
 
 
+# The AKO deployed INSIDE each VKS guest cluster -- a different AKO from the
+# Supervisor-side vmware-system-ako namespace checked by
+# ensure_ako_avi_secret_healthy()/check_supervisor_ako_health_early() above.
+# Confirmed live 2026-08-11 on this pod: each of workload-cluster-1/-2 runs
+# its own 'avi-system' namespace with a single-replica StatefulSet 'ako'
+# (pod ako-0, containers ako/ako-gateway-api/vmci-relay) plus a separate
+# 'ako-crd-operator' Deployment. Checked on BOTH clusters here, unlike
+# VKS_WORKLOAD_CLUSTERS above (deliberately scoped to just
+# workload-cluster-1 for node-pool scaling only) -- AKO health isn't tied to
+# that scoping decision.
+WORKLOAD_CLUSTER_CONTEXTS = ('workload-cluster-1', 'workload-cluster-2')
+WORKLOAD_CLUSTER_AKO_NAMESPACE = 'avi-system'
+
+# Container waiting reasons that a plain pod delete actually fixes. All of
+# these stem from kubelet resolving a pod's inputs (a referenced
+# ConfigMap/Secret, an image reference) once at container creation; if that
+# input was missing/wrong when the pod first started but is fine now,
+# kubelet's own in-place retry can sit stuck far longer than a lab session
+# should wait (this is the exact class of failure seen live on
+# workload-cluster-1 2026-08-11: AKO's ako-0 pod stuck in
+# CreateContainerConfigError). Deleting the pod lets its owning
+# StatefulSet/Deployment recreate it and re-resolve those inputs
+# immediately. Deliberately excludes reasons a delete can't fix (e.g.
+# CrashLoopBackOff from an actual application bug) so this doesn't churn
+# pods that would just fail the same way again.
+AKO_FIXABLE_WAITING_REASONS = frozenset([
+    'CreateContainerConfigError',
+    'CreateContainerError',
+    'InvalidImageName',
+])
+
+
+def ensure_workload_cluster_ako_healthy(lsf, timeout_seconds=180, poll_interval=15):
+    """
+    For each context in WORKLOAD_CLUSTER_CONTEXTS, check that every pod in
+    the guest cluster's own avi-system namespace (AKO's ako-0 StatefulSet
+    pod and the ako-crd-operator Deployment pod) is Ready. Any pod with a
+    container stuck waiting on a reason in AKO_FIXABLE_WAITING_REASONS gets
+    deleted so its controller recreates it; this function then polls up to
+    timeout_seconds for the namespace to report all-Ready again.
+
+    A pod that's simply still starting (e.g. right after a fresh guest
+    cluster boot) is left alone -- only pods with a *waiting reason present*
+    in the fixable set are touched, so this doesn't race a normal cold
+    start.
+
+    Non-fatal: any failure, or an unfixed/unfixable pod, is logged as a
+    warning. lsf.labfail is never called here -- a stuck AKO pod degrades
+    load-balancer provisioning for workloads on that guest cluster, but
+    doesn't itself mean the lab can't be used.
+    """
+    import json
+    import time
+
+    lsf.write_output('Checking AKO pod health in each VKS workload cluster...')
+    password = lsf.get_password()
+
+    def _get_pods(context):
+        cmd = f"kubectl --context {context} -n {WORKLOAD_CLUSTER_AKO_NAMESPACE} get pods -o json"
+        result = lsf.ssh(cmd, VKS_KUBECTL_HOST, password)
+        stdout = (getattr(result, 'stdout', '') or '').strip()
+        if not stdout:
+            return None
+        return json.loads(stdout).get('items', [])
+
+    def _all_ready(pods):
+        return all(
+            cs.get('ready')
+            for pod in pods
+            for cs in (pod.get('status', {}).get('containerStatuses', []) or [])
+        )
+
+    for context in WORKLOAD_CLUSTER_CONTEXTS:
+        try:
+            pods = _get_pods(context)
+            if pods is None:
+                lsf.write_output(
+                    f'  {context}: no output listing pods in {WORKLOAD_CLUSTER_AKO_NAMESPACE} '
+                    f'-- cluster may be unreachable, skipping'
+                )
+                continue
+            if not pods:
+                lsf.write_output(f'  {context}: no pods found in {WORKLOAD_CLUSTER_AKO_NAMESPACE} -- skipping')
+                continue
+
+            to_delete = []
+            for pod in pods:
+                name = pod.get('metadata', {}).get('name', '<unknown>')
+                statuses = pod.get('status', {}).get('containerStatuses', []) or []
+                bad_reasons = []
+                for cs in statuses:
+                    if cs.get('ready'):
+                        continue
+                    reason = (cs.get('state', {}).get('waiting', {}) or {}).get('reason')
+                    if reason:
+                        bad_reasons.append(reason)
+
+                if not bad_reasons:
+                    continue
+
+                lsf.write_output(f'  {context}/{name}: not Ready ({", ".join(bad_reasons)})')
+                if any(r in AKO_FIXABLE_WAITING_REASONS for r in bad_reasons):
+                    to_delete.append(name)
+                else:
+                    lsf.write_output(
+                        f'    {name}: reason(s) not in the known pod-delete-fixable set -- leaving alone'
+                    )
+
+            if not to_delete:
+                lsf.write_output(f'  {context}: all AKO pods Ready (or not fixable by delete) -- no-op')
+                continue
+
+            for name in to_delete:
+                lsf.write_output(f'  {context}/{name}: deleting to force recreation')
+                lsf.ssh(
+                    f"kubectl --context {context} -n {WORKLOAD_CLUSTER_AKO_NAMESPACE} "
+                    f"delete pod {name} --wait=false",
+                    VKS_KUBECTL_HOST, password,
+                )
+
+            deadline = time.time() + timeout_seconds
+            recovered = False
+            while time.time() < deadline:
+                time.sleep(poll_interval)
+                pods = _get_pods(context)
+                if pods and _all_ready(pods):
+                    recovered = True
+                    break
+
+            if recovered:
+                lsf.write_output(f'  {context}: AKO pods Ready after recreation')
+            else:
+                lsf.write_output(
+                    f'  WARNING: {context}: AKO pods still not all Ready {timeout_seconds}s '
+                    f'after deleting {to_delete}'
+                )
+
+        except Exception as e:
+            lsf.write_output(f'  WARNING: could not check/repair AKO health in {context}: {e}')
+
+
 def resync_nsxt_alb_cloud_connector_credentials(lsf):
     """
     Verify (fast path) that Avi's cloud-connector credential for each NSX
@@ -1922,6 +2099,497 @@ def _ensure_sddc_auto_rotate_disabled(sddc_headers, lsf):
             },
         )
         lsf.write_output(f"    disabled auto-rotate on {e['username']} (was still enabled)")
+
+
+def _request_with_retry(fn, *args, retries=5, delay=15, **kwargs):
+    """
+    Call fn(*args, **kwargs) (a requests-style call returning a
+    Response), retrying on the two symptoms confirmed (2026-08-07) to be
+    transient noise during a busy pod boot rather than real failures: a
+    401 from License Hub's authserver component before it's fully warmed
+    up, and a connection-level exception (timeout/refused) while
+    NSX/Avi/LH are still coming up. Confirmed live: a License Hub upload
+    hard-failed with a 401 during a fresh-boot run where NSX Manager
+    calls were also timing out moments earlier in that same run; the
+    identical call (same credentials, same file) succeeded immediately
+    when run by hand a few minutes later against the same, by-then-
+    settled pod.
+
+    Any other status code (400/403/404/5xx) is returned immediately
+    without retrying -- those are real errors, not boot-timing noise,
+    and should fail fast rather than burn through all the retries first.
+
+    Used throughout the License Hub functions below (upload, endpoint
+    onboarding, mapping resync) plus their NSX-side calls, since all of
+    them hit appliances that can still be initializing at the same point
+    in adjustomatic's run.
+    """
+    import time
+
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = fn(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(delay)
+                continue
+            raise
+        if response.status_code == 401 and attempt < retries:
+            time.sleep(delay)
+            continue
+        return response
+    raise last_exc
+
+
+LICENSE_HUB_HOST = 'ssp.site-a.vcf.lab'
+LICENSE_HUB_ZIP_PATH = (
+    '/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/'
+    'b3966fca-3ec0-4fe2-b628-ff186de53b19_1000001_1785992463049_v7.lic.zip'
+)
+# Expiration timestamp (epoch ms, as License Hub itself reports it) this
+# specific v7.lic.zip bundle produces once imported -- confirmed live
+# 2026-08-07 on both SKUs it carries (ANS-VMW-ALB, ANS-FW-ATP), works out
+# to ~2027-07-10. Hardcoded deliberately, not derived generically: this
+# lab's remaining life (through Aug/Sept 2027) is shorter than this one
+# license's 360-day post-expiration grace period, so this bundle is
+# expected to be the last one this lab ever needs -- there's no future
+# replacement file to stay generic for. Update this if that ever changes
+# (a newer replacement zip is checked in with a different expiration).
+LICENSE_HUB_EXPECTED_EXPIRATION_MS = 1815237720365
+
+
+def upload_license_hub_disconnected_license(lsf):
+    """
+    Upload the disconnected-mode license bundle (checked into this repo
+    alongside adjustomatic.py) to License Hub via its Licensing Service
+    API -- Workflow 4 ("Upload Avi Cloud Console License to LH") from the
+    "License Hub API User Guide" Confluence doc.
+
+    License Hub for this pod is hosted at ssp.site-a.vcf.lab -- confirmed
+    live via its own UI (browser tab titled "License Hub" at that
+    hostname). Note this is despite SSP (Security Services Platform) and
+    License Hub being documented as two distinct appliances in the
+    general Confluence guide (SSP is normally onboarded AS AN ENDPOINT
+    INTO License Hub, not the LH appliance itself) -- this pod's actual
+    deployment just runs both under the same hostname.
+
+    Uses the same admin/AVICTRL_PASSWORD HTTP Basic-Auth session pattern
+    as every other direct API call in this file (e.g.
+    configure_nsxt_app_profiles above) -- no separate credential needed.
+    Logs the license list before and after the upload so a no-op import
+    (bundle already present) is visible in labstartup.log rather than
+    silently indistinguishable from a real change.
+
+    Skips the upload entirely if a license already on LH has the exact
+    expiration_date this bundle is known to produce
+    (LICENSE_HUB_EXPECTED_EXPIRATION_MS) -- i.e. it's already been
+    imported -- rather than re-importing unconditionally every run. Purely
+    an efficiency no-op, not a workaround for anything: License Hub
+    tolerates re-importing the same bundle fine (confirmed live
+    2026-08-07, back-to-back successful 204s importing the identical
+    file).
+
+    CORRECTION (2026-08-07): an earlier version of this docstring blamed
+    the 400 ("unsupported content type") seen in testing on re-importing
+    an already-known bundle -- that diagnosis was wrong. The 400 recurred
+    on a completely fresh pod boot where LH still held an older, different
+    license (not a re-import at all), which ruled that theory out. Root
+    cause, confirmed via `curl --trace-ascii`: this multipart upload's
+    file part must be sent as Content-Type application/octet-stream --
+    curl's own default (no explicit -F ...;type=) sends exactly that and
+    succeeds every time; explicitly forcing type=application/zip (what
+    this code used to hardcode) reproduces the 400 on demand. License Hub
+    apparently validates/whitelists the part's Content-Type string itself
+    and does not accept "application/zip", regardless of the file's
+    actual contents.
+
+    Exact-match, not a generic "still has N days left" buffer, and
+    deliberately hardcoded rather than derived from the zip's own
+    contents (which don't expose anything reliably comparable -- it's a
+    single opaque signed JWT asset-identity blob, not a plain
+    license_id/expiration list) -- see LICENSE_HUB_EXPECTED_EXPIRATION_MS
+    above for why hardcoding is the right call specifically for this
+    bundle rather than a maintenance liability.
+
+    Fatal: unlike most other functions in this file, a failed upload
+    calls lsf.labfail(). Correct licensing is core lab functionality
+    here, not a best-effort convenience fix -- a silent failure would
+    leave the lab materially broken without flagging it.
+    """
+    import os
+    import requests
+
+    lsf.write_output('Uploading disconnected license file to License Hub...')
+    lh_session = requests.Session()
+    lh_session.verify = False
+    lh_session.auth = ('admin', os.environ['AVICTRL_PASSWORD'])
+    lh_mgr = f'https://{LICENSE_HUB_HOST}:443'
+
+    try:
+        before = _request_with_retry(lh_session.get, f'{lh_mgr}/licensing/views/licenses', timeout=15)
+        before_licenses = before.json().get('results', [])
+        lsf.write_output(f'  Licenses on License Hub before upload: {before.text[:500]}')
+
+        if any(l.get('expiration_date') == LICENSE_HUB_EXPECTED_EXPIRATION_MS for l in before_licenses):
+            lsf.write_output(
+                f'  A license expiring {LICENSE_HUB_EXPECTED_EXPIRATION_MS} (this bundle\'s known '
+                f'expiration) is already present on License Hub -- already imported, skipping re-upload'
+            )
+            return
+
+        # Read the whole file into memory up front (it's ~20KB) rather than
+        # passing a live file handle into files= -- a retried POST re-reads
+        # whatever's in files= on each attempt, and a file handle would
+        # already be at EOF after the first (failed) attempt, silently
+        # sending an empty body on the retry. Bytes have no such state.
+        with open(LICENSE_HUB_ZIP_PATH, 'rb') as license_file:
+            license_bytes = license_file.read()
+        upload_result = _request_with_retry(
+            lh_session.post,
+            f'{lh_mgr}/licensing/licenses?action=import',
+            files={'file': (os.path.basename(LICENSE_HUB_ZIP_PATH), license_bytes, 'application/octet-stream')},
+            timeout=60,
+        )
+        lsf.write_output(f'  Upload result {upload_result.status_code} - {upload_result.text[:500]}')
+        upload_result.raise_for_status()
+
+        after = _request_with_retry(lh_session.get, f'{lh_mgr}/licensing/views/licenses', timeout=15)
+        lsf.write_output(f'  Licenses on License Hub after upload: {after.text[:500]}')
+
+    except Exception as e:
+        lsf.write_output(f'  License Hub upload failed: {e}')
+        lsf.labfail(f'Adjustomatic failed at License Hub license upload: {e}')
+
+
+def _ensure_license_hub_endpoint_onboarded(lh_session, lh_mgr, endpoint_type, host, username,
+                                            admin_password, certificate, lsf,
+                                            timeout_seconds=900, poll_interval=15):
+    """
+    Idempotently onboard a single host as a License Hub endpoint of the
+    given type (NSX_MANAGER or AVI_CONTROLLER), then poll until READY.
+    Matched by hostname -- no-ops (reuses the existing id) if already
+    onboarded, mirroring the doc's own "already exists" success path.
+
+    Shared by both halves of onboard_license_hub_endpoints() below since
+    the onboard-then-poll logic is identical for NSX Manager and Avi
+    Controller; only the cert-fetch mechanism differs between them.
+
+    Returns the endpoint_id once READY, or None on failure/timeout --
+    the caller decides whether that's fatal.
+    """
+    import time
+
+    existing = _request_with_retry(
+        lh_session.get, f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
+    ).json().get('results', [])
+    match = next((e for e in existing if e.get('connection_info', {}).get('hostname') == host), None)
+
+    if match:
+        endpoint_id = match['id']
+        if match.get('status') == 'READY':
+            lsf.write_output(f'    {host}: already onboarded as {endpoint_type} endpoint and READY -- no-op')
+            return endpoint_id
+        lsf.write_output(f"    {host}: already onboarded as {endpoint_type} endpoint, status={match.get('status')} -- waiting for READY")
+    else:
+        create_result = _request_with_retry(
+            lh_session.post,
+            f'{lh_mgr}/licensing/endpoints', timeout=30,
+            json={
+                'endpoint_type': endpoint_type,
+                'display_name': host.split('.')[0],
+                'connection_info': {
+                    'connection_type': 'DYNAMIC',
+                    'hostname': host,
+                    'username': username,
+                    'password': admin_password,
+                    'certificate': certificate,
+                },
+            },
+        )
+        lsf.write_output(f'    {host}: onboard result {create_result.status_code} - {create_result.text[:300]}')
+        create_result.raise_for_status()
+        endpoint_id = create_result.json().get('id')
+
+    deadline = time.time() + timeout_seconds
+    status = None
+    while time.time() < deadline:
+        try:
+            endpoints = lh_session.get(
+                f'{lh_mgr}/licensing/views/endpoints', params={'endpoint_type': endpoint_type}, timeout=15
+            ).json().get('results', [])
+            match = next((e for e in endpoints if e.get('id') == endpoint_id), None)
+            status = match.get('status') if match else None
+            if status == 'READY':
+                lsf.write_output(f'    {host}: endpoint READY')
+                return endpoint_id
+        except Exception as e:
+            # The outer while loop is already a poll-with-backoff (every
+            # poll_interval up to timeout_seconds) -- treat a single bad
+            # response (transient 401, non-JSON error body, timeout) the
+            # same as "not ready yet" rather than crashing the whole poll.
+            lsf.write_output(f'    {host}: poll check failed ({e}), will retry')
+        time.sleep(poll_interval)
+
+    lsf.write_output(f'    {host}: endpoint did not reach READY within {timeout_seconds}s (last status: {status})')
+    return None
+
+
+def onboard_license_hub_endpoints(lsf):
+    """
+    Onboard both NSX Managers (wld01-a, mgmt-a) and both Avi Controllers
+    (alb-a, alb-b) as License Hub endpoints -- Workflows 5 and 7 from the
+    "License Hub API User Guide" -- reusing NSXT_ALB_DOMAINS below for
+    the host list. Run this BEFORE resync_license_hub_endpoint_mappings()
+    so that function always has a real endpoint_id to map licenses onto,
+    even after a pod rebuild -- License Hub is a separate appliance, not
+    part of the saved vApp template, so it has no memory of previously-
+    onboarded endpoints across a fresh deploy.
+
+    Idempotent: matched by hostname, mirroring the doc's own "already
+    exists -> skip, reuse existing id" semantics -- safe to run every
+    boot (see _ensure_license_hub_endpoint_onboarded() above).
+
+    NSX Manager cert: fetched live via
+    GET https://<nsx_host>/api/v1/trust-management/certificates,
+    filtered to the entry whose used_by[].service_types includes "API"
+    (same call configure_nsxt_app_profiles's neighbors already use
+    elsewhere in this file for NSX reachability).
+
+    Avi Controller cert: there is no equivalent Avi REST API for this --
+    per the "Steps to Retrieve and Upload Avi Controller Certificate in
+    License Hub" KB, it's fetched by running fetch_cert.sh (checked into
+    this same directory) against the controller's HTTPS port. That
+    script is just a local openssl s_client TLS handshake (steered to
+    prefer the controller's EC certificate, falling back to whatever it
+    serves by default) -- it works identically run remotely as it does
+    run locally on the controller, so no SSH hop onto the Avi Controller
+    is needed; it's invoked here from wherever this script executes.
+
+    Fatal: like the other License Hub functions in this file, failure to
+    onboard (or reach READY) for any of the 4 endpoints calls
+    lsf.labfail() -- but only after attempting all 4.
+    """
+    import os
+    import subprocess
+    import tempfile
+    import requests
+
+    lsf.write_output('Onboarding NSX Manager / Avi Controller endpoints to License Hub...')
+    admin_password = os.environ['AVICTRL_PASSWORD']
+    lh_session = requests.Session()
+    lh_session.verify = False
+    lh_session.auth = ('admin', admin_password)
+    lh_mgr = f'https://{LICENSE_HUB_HOST}:443'
+    fetch_cert_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fetch_cert.sh')
+
+    failures = []
+    for d in NSXT_ALB_DOMAINS:
+        # ---- NSX Manager ----
+        try:
+            certs = _request_with_retry(
+                requests.get, f"https://{d['nsx_host']}/api/v1/trust-management/certificates",
+                auth=('admin', admin_password), verify=False, timeout=15,
+            ).json()
+            api_cert = next(
+                (c for c in certs.get('results', [])
+                 if any('API' in u.get('service_types', []) for u in c.get('used_by', []) or [])),
+                None,
+            )
+            if not api_cert:
+                lsf.write_output(f"  WARNING: {d['domain']}: no API-service certificate found on {d['nsx_host']}")
+                failures.append(f"NSX Manager ({d['domain']})")
+            else:
+                endpoint_id = _ensure_license_hub_endpoint_onboarded(
+                    lh_session, lh_mgr, 'NSX_MANAGER', d['nsx_host'], 'admin',
+                    admin_password, api_cert['pem_encoded'], lsf,
+                )
+                if not endpoint_id:
+                    failures.append(f"NSX Manager ({d['domain']})")
+        except Exception as e:
+            lsf.write_output(f"  WARNING: {d['domain']}: NSX Manager onboarding failed: {e}")
+            failures.append(f"NSX Manager ({d['domain']})")
+
+        # ---- Avi Controller ----
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result = subprocess.run(
+                    ['bash', fetch_cert_script, d['avi_host']],
+                    cwd=tmpdir, capture_output=True, text=True, timeout=30,
+                )
+                cert_path = os.path.join(tmpdir, 'full_chain.pem')
+                if result.returncode != 0 or not os.path.isfile(cert_path):
+                    lsf.write_output(
+                        f"  WARNING: {d['domain']}: fetch_cert.sh failed for {d['avi_host']}: "
+                        f"{result.stdout} {result.stderr}"
+                    )
+                    failures.append(f"Avi Controller ({d['domain']})")
+                    continue
+                with open(cert_path, 'r') as f:
+                    avi_cert = f.read()
+
+            endpoint_id = _ensure_license_hub_endpoint_onboarded(
+                lh_session, lh_mgr, 'AVI_CONTROLLER', d['avi_host'], 'admin',
+                admin_password, avi_cert, lsf,
+            )
+            if not endpoint_id:
+                failures.append(f"Avi Controller ({d['domain']})")
+        except Exception as e:
+            lsf.write_output(f"  WARNING: {d['domain']}: Avi Controller onboarding failed: {e}")
+            failures.append(f"Avi Controller ({d['domain']})")
+
+    if failures:
+        lsf.labfail(f'Adjustomatic failed at License Hub endpoint onboarding for: {failures}')
+
+
+def resync_license_hub_endpoint_mappings(lsf):
+    """
+    Ensure each of this pod's 4 already-onboarded License Hub endpoints
+    (NSX Manager wld01-a/mgmt-a, Avi Controller alb-a/alb-b -- reusing
+    NSXT_ALB_DOMAINS below) is mapped to the freshest non-expired license
+    on LH for each SKU it currently holds, swapping out an older/soon-
+    expiring mapping rather than leaving it in place alongside a new one.
+
+    Run this AFTER upload_license_hub_disconnected_license() -- it only
+    re-points EXISTING endpoint<->license mappings at whatever's newest
+    on LH; it does not onboard endpoints (already onboarded in this pod,
+    unlike a fresh pod following Workflows 5/7 in the License Hub API
+    User Guide) or upload licenses itself.
+
+    Per endpoint: list its current license-endpoint-mappings
+    (GET /licensing/license-endpoint-mappings, filtered client-side by
+    endpoint_id -- this API has no server-side filter param), and for
+    each currently-mapped license's sku_code, pick the LH license
+    (GET /licensing/views/licenses) with that sku_code and the latest
+    expiration_date. If that differs from what's currently mapped,
+    replace it with a single bulk DELETE-old/CREATE-new call to
+    POST /licensing/bulk-license-endpoint-mappings -- atomic from the
+    caller's perspective, so there's never a window where the endpoint
+    has zero or two licenses of the same SKU mapped. No-op if the
+    endpoint is already on the freshest available license for that SKU.
+
+    NSX Manager endpoints get an explicit force-sync call afterward
+    (POST <nsx_host>/policy/api/v1/licenses/action/async-query) so the
+    swap is visible immediately rather than waiting on NSX's own
+    15-minute license-refresh cycle. Avi Controller has no equivalent
+    documented REST API for this (only a UI/CLI manual refresh, per the
+    "Avi Controller 32.1.1 -- Licensing Configuration Guide" doc) -- Avi
+    endpoints pick up the swap on their own next auto-sync (also ~15 min
+    per that same doc).
+
+    Fatal: like upload_license_hub_disconnected_license, this calls
+    lsf.labfail() if any of the 4 endpoints couldn't be resynced --
+    but only after attempting all 4, so one bad endpoint doesn't stop
+    the other three from getting fixed. An endpoint left on an expiring
+    license is a real lab-breaking condition, not cosmetic drift.
+    """
+    import os
+    import requests
+
+    lsf.write_output('Resyncing License Hub endpoint <-> license mappings...')
+    admin_password = os.environ['AVICTRL_PASSWORD']
+    lh_session = requests.Session()
+    lh_session.verify = False
+    lh_session.auth = ('admin', admin_password)
+    lh_mgr = f'https://{LICENSE_HUB_HOST}:443'
+
+    targets = []
+    for d in NSXT_ALB_DOMAINS:
+        targets.append({
+            'label': f"NSX Manager ({d['domain']})",
+            'host': d['nsx_host'],
+            'endpoint_type': 'NSX_MANAGER',
+            'force_sync_host': d['nsx_host'],
+        })
+        targets.append({
+            'label': f"Avi Controller ({d['domain']})",
+            'host': d['avi_host'],
+            'endpoint_type': 'AVI_CONTROLLER',
+            'force_sync_host': None,
+        })
+
+    try:
+        all_licenses = _request_with_retry(
+            lh_session.get, f'{lh_mgr}/licensing/views/licenses', timeout=15
+        ).json().get('results', [])
+    except Exception as e:
+        lsf.write_output(f'  Could not list licenses on License Hub: {e}')
+        lsf.labfail(f'Adjustomatic failed at License Hub endpoint resync: could not list licenses: {e}')
+        return
+
+    failures = []
+    for t in targets:
+        try:
+            endpoints = _request_with_retry(
+                lh_session.get, f"{lh_mgr}/licensing/views/endpoints", params={'endpoint_type': t['endpoint_type']}, timeout=15
+            ).json().get('results', [])
+            endpoint = next((e for e in endpoints if e.get('connection_info', {}).get('hostname') == t['host']), None)
+            if not endpoint:
+                lsf.write_output(f"  WARNING: {t['label']}: no License Hub endpoint found for hostname {t['host']} -- skipping")
+                failures.append(t['label'])
+                continue
+            endpoint_id = endpoint['id']
+
+            mappings = _request_with_retry(
+                lh_session.get, f'{lh_mgr}/licensing/license-endpoint-mappings', timeout=15
+            ).json().get('results', [])
+            current_mappings = [m for m in mappings if m.get('endpoint_id') == endpoint_id]
+            if not current_mappings:
+                lsf.write_output(f"  {t['label']}: no current license mappings found -- nothing to swap")
+                continue
+
+            operations = []
+            for m in current_mappings:
+                current_license_id = m['license_id']
+                current_license = next((l for l in all_licenses if l.get('license_id') == current_license_id), None)
+                sku_code = current_license.get('sku_code') if current_license else None
+                if not sku_code:
+                    lsf.write_output(
+                        f"  {t['label']}: could not determine sku_code for currently-mapped "
+                        f"license {current_license_id} -- leaving as-is"
+                    )
+                    continue
+
+                candidates = [l for l in all_licenses if l.get('sku_code') == sku_code]
+                best = max(candidates, key=lambda l: l.get('expiration_date', 0), default=None)
+                if not best or best['license_id'] == current_license_id:
+                    lsf.write_output(f"  {t['label']}: {sku_code} already on the freshest available license -- no-op")
+                    continue
+
+                lsf.write_output(
+                    f"  {t['label']}: {sku_code} swapping {current_license_id} "
+                    f"(expires {current_license.get('expiration_date')}) -> {best['license_id']} "
+                    f"(expires {best.get('expiration_date')})"
+                )
+                operations.append({'operation': 'DELETE', 'mapping': {'license_id': current_license_id, 'endpoint_id': endpoint_id}})
+                operations.append({'operation': 'CREATE', 'mapping': {'license_id': best['license_id'], 'endpoint_id': endpoint_id}})
+
+            if not operations:
+                continue
+
+            bulk_result = _request_with_retry(
+                lh_session.post, f'{lh_mgr}/licensing/bulk-license-endpoint-mappings',
+                json={'operations': operations}, timeout=30
+            )
+            lsf.write_output(f"  {t['label']}: bulk mapping result {bulk_result.status_code} - {bulk_result.text[:300]}")
+            bulk_result.raise_for_status()
+
+            if t['force_sync_host']:
+                sync_result = _request_with_retry(
+                    requests.post, f"https://{t['force_sync_host']}/policy/api/v1/licenses/action/async-query",
+                    auth=('admin', admin_password), verify=False, timeout=15,
+                )
+                lsf.write_output(f"  {t['label']}: force-sync triggered ({sync_result.status_code})")
+            else:
+                lsf.write_output(f"  {t['label']}: no force-sync API available for Avi Controller -- will auto-sync within ~15 minutes")
+
+        except Exception as e:
+            lsf.write_output(f"  WARNING: {t['label']}: failed to resync license mapping: {e}")
+            failures.append(t['label'])
+
+    if failures:
+        lsf.labfail(f'Adjustomatic failed at License Hub endpoint resync for: {failures}')
 
 
 SSO_DOMAINS = (
@@ -2690,6 +3358,15 @@ def main():
         with track_step(lsf, _telemetry_results, 'vcfa_kubevip_lease_invariant'):
             fix_vcfa_kube_vip_lease_invariant(lsf)
 
+        # AKO pod health inside each VKS workload guest cluster (avi-system
+        # namespace) -- distinct from the Supervisor-side vmware-system-ako
+        # check above (currently disabled). See
+        # ensure_workload_cluster_ako_healthy()'s docstring for the
+        # 2026-08-11 workload-cluster-1 CreateContainerConfigError incident
+        # this guards against.
+        with track_step(lsf, _telemetry_results, 'workload_cluster_ako_health'):
+            ensure_workload_cluster_ako_healthy(lsf)
+
         # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
         # page-load hang). Independent of everything else here; see
         # fix_firefox_remote_settings_bypass() docstring for full root-cause
@@ -2715,6 +3392,31 @@ def main():
         with track_step(lsf, _telemetry_results, 'nsxt_app_profiles'):
             configure_nsxt_app_profiles(lsf)
 
+        # Disconnected-mode License Hub upload -- see
+        # upload_license_hub_disconnected_license() docstring. Independent
+        # of the NSX-ALB credential steps below; run here (right after the
+        # other direct-API NSX/Avi step above) so a licensing failure is
+        # caught early rather than after several minutes of unrelated work.
+        with track_step(lsf, _telemetry_results, 'license_hub_upload'):
+            upload_license_hub_disconnected_license(lsf)
+
+        # TEMPORARILY DISABLED (2026-08-07): confirmed live on the test pod
+        # that uploading a replacement license to License Hub updates it
+        # in place -- already-assigned endpoints stay mapped to it without
+        # needing onboarding to be (re-)run or an explicit endpoint<->
+        # license mapping swap. Neither of these has actually been
+        # exercised by a real adjustomatic.py run yet -- the one real run
+        # hard-failed at the upload step itself (transient 401, since
+        # fixed with retry) before either got a chance to execute. Leaving
+        # onboard_license_hub_endpoints() / resync_license_hub_endpoint_
+        # mappings() defined but unused until both are validated on
+        # another pod (e.g. one where endpoints aren't already onboarded,
+        # or where the in-place-update behavior doesn't hold).
+        # with track_step(lsf, _telemetry_results, 'license_hub_endpoint_onboarding'):
+        #     onboard_license_hub_endpoints(lsf)
+        # with track_step(lsf, _telemetry_results, 'license_hub_mapping_resync'):
+        #     resync_license_hub_endpoint_mappings(lsf)
+
         # NSX-ALB credential/lockout durability -- see resync_nsxt_alb_*()
         # docstrings. This vApp is a saved/suspended VCD template that can sit
         # powered off for up to ~18 months (or more) between power-ons, so
@@ -2739,14 +3441,23 @@ def main():
         #     resync_nsxt_alb_enforcement_point_tokens(lsf)
         # with track_step(lsf, _telemetry_results, 'nsxt_alb_cloud_connector_credentials'):
         #     resync_nsxt_alb_cloud_connector_credentials(lsf)
-        # Belt-and-suspenders check for the specific downstream failure the
-        # above two functions can still leave behind even when they
-        # succeed: AKO on Supervisor stuck in CrashLoopBackOff because
-        # avi-secret/avi-init-secret never got (re)created. See
-        # ensure_ako_avi_secret_healthy()'s docstring for the full chain
-        # and the 2026-07-30 incident this guards against.
-        with track_step(lsf, _telemetry_results, 'ako_avi_secret_health'):
-            ensure_ako_avi_secret_healthy(lsf)
+        # TEMPORARILY DISABLED (2026-08-07): root-caused live that this
+        # function's remediation (restart nsx-ncp / netop-controller-manager
+        # / AKO pods) cannot fix the failure actually occurring right now --
+        # nsx-ncp's own AviSecretController is healthy and already retrying
+        # on its own built-in schedule, but every attempt fails with "Failed
+        # to get Avi auth token ... No route to host" / "502 BAD_GATEWAY"
+        # hitting the Avi Controller (10.1.1.90) from NSX Manager. That's a
+        # real network/gateway problem between NSX and Avi, not a missing-
+        # secret or stale-object condition -- no amount of restarting AKO,
+        # netop-controller-manager, or nsx-ncp itself addresses it, so this
+        # function's checks were correctly reporting "not Ready" every run
+        # while its fix loop just added restart churn on top of a problem
+        # it can't touch. Leaving ensure_ako_avi_secret_healthy() defined
+        # for when it once again matches an actual secret-chain failure
+        # (its original 2026-07-30 target) rather than this network issue.
+        # with track_step(lsf, _telemetry_results, 'ako_avi_secret_health'):
+        #     ensure_ako_avi_secret_healthy(lsf)
         with track_step(lsf, _telemetry_results, 'sso_password_policy'):
             resync_sso_password_policy(lsf)
 
