@@ -41,7 +41,7 @@
   - name: Query vSphere VMService for external status allocation
     kubernetes.core.k8s_info:
       context: "Supervisor"
-      apiVersion: vmoperator.vmware.com/v1alpha5
+      api_version: vmoperator.vmware.com/v1alpha5
       kind: VirtualMachineService
       name: "mysql-db"
       namespace: "acme-east-prod-wrp4h"
@@ -66,7 +66,7 @@
   - name: Wait for Backend LoadBalancer Service to obtain an IP
     kubernetes.core.k8s_info:
       context: "workload-cluster-1"
-      apiVersion: v1
+      api_version: v1
       kind: Service
       name: backend-app-service
       namespace: "{{ target_namespace }}"
