@@ -1,0 +1,36 @@
+- hosts: lmc
+  tasks:
+    - name: Creates directory
+      file:
+        path: /hol/hol-2740
+        state: directory
+
+    - name: Copy k8s manifest folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/k8s_manifests
+        dest: /hol/hol-2740
+
+    - name: Copy modswitcher folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/avi_modswitcher
+        dest: /hol/hol-2740
+
+    - name: Copy migration files folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/migration_files
+        dest: /hol/hol-2740
+
+    - name: Copy automation lab files folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/automation_lab
+        dest: /hol/hol-2740
+
+    - name: Copy avimart lab files folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/avimart_demo
+        dest: /hol/hol-2740
+
+    - name: Copy 3tierapp lab files folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/3-TierAppDeployment
+        dest: /hol/hol-2740
