@@ -166,6 +166,11 @@
         src: /vpodrepo/2027-labs/2740/avi_hol_files/avimart_demo
         dest: /hol/hol-2740
 
+    - name: Copy 3tierapp lab files folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/3-TierAppDeployment
+        dest: /hol/hol-2740
+
     # - name: copy kubeconfig for AMKO
     #   copy:
     #     src: /home/holuser/.kube/config
