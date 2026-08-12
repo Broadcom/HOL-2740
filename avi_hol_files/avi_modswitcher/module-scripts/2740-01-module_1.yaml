@@ -12,6 +12,11 @@
       definition: "{{ lookup('file', '/hol/hol-2740/avimart_demo/antrea-addonconfig.yaml') | from_yaml }}"
       context: "Supervisor"
 
+  - name: Change the active kubeconfig context globally on disk
+    ansible.builtin.shell:
+      cmd: kubectl config use-context workload-cluster-1
+
+
   - name: Run setup script
     ansible.builtin.shell:
       cmd: source ./prepare-demo.sh
@@ -30,7 +35,7 @@
     ansible.builtin.debug:
       var: script_output.stdout_lines
 
-  - name: Install the Antrea interworking configuration
+  - name: Deploy the mysql VM
     kubernetes.core.k8s:
       state: present
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-vm.yaml.j2') | from_yaml_all | list }}"
@@ -59,7 +64,7 @@
       context: "workload-cluster-1"
       state: present
       namespace: "acme-east-prod-wrp4h"
-      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend.yaml.j2') | from_yaml_all | list }}"
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       db_vm_ip: "{{ hostvars['localhost']['global_db_ip'] }}"
 
@@ -84,6 +89,7 @@
       context: "workload-cluster-1"
       state: present
       namespace: "acme-east-prod-wrp4h"
-      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend.yaml.j2') | from_yaml_all | list }}"
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       backend_service_ip: "{{ hostvars['localhost']['global_backend_ip'] }}"
+
