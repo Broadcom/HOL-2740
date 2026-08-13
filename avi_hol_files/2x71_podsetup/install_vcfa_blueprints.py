@@ -40,9 +40,10 @@ VCFA_PROJECT_NAME = 'default-project'
 
 BLUEPRINTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vcfa_blueprints')
 BLUEPRINTS = {
-    'HOL L7 Fullstack (self-signed cert)': 'l7-fullstack-selfsigned.yaml',
+    'HOL L7 Fullstack (dynamic cert-manager cert)': 'l7-fullstack-certmanager.yaml',
     'HOL L7 Fullstack (static cert)': 'l7-fullstack-staticcert.yaml',
     'HOL L4 Passthrough': 'l4-passthrough.yaml',
+    'HOL Two Webservers': 'two-web-servers.yaml'
 }
 
 
@@ -159,11 +160,42 @@ def install_vcfa_blueprints(lsf):
                 lsf.write_output(f'  WARNING: could not create blueprint {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
         except Exception as e:
             lsf.write_output(f'  WARNING: could not create blueprint {name!r}: {e}')
-    # CCI's supervisornamespaces PATCH is JSON Merge Patch (RFC 7396) --
-    # confirmed against vcf/automation's supervisor-k8.service.ts, which
-    # always sends this content type for this call (never the plain
-    # application/json used by the blueprint calls above).
-    patch_headers = {**headers, 'Content-Type': 'application/merge-patch+json'}
+
+
+def patch_supervisor_namespace_storage_quota(lsf):
+    """
+    Raise the acme-east-prod-wrp4h Supervisor namespace's storage-class
+    quota via CCI's supervisornamespaces PATCH. Unrelated to the blueprint
+    catalog, just sharing this module's VCFA auth/session helpers.
+
+    NOT CURRENTLY CALLED FROM ANYWHERE (2026-08-13) -- adjustomatic.py only
+    calls install_vcfa_blueprints() (see its own call site). This function
+    is kept as reference for the quota bump it performs; the pod's saved
+    vApp template is presumed to already have this quota baked in, since
+    nothing in the current startup path applies it. Confirm the quota is
+    actually still correct on a fresh pod before wiring this back in --
+    don't assume it's still needed just because it once was.
+
+    CCI's supervisornamespaces PATCH is JSON Merge Patch (RFC 7396) --
+    confirmed against vcf/automation's supervisor-k8.service.ts, which
+    always sends this content type for this call (never the plain
+    application/json used by the blueprint calls in install_vcfa_blueprints()).
+
+    Non-fatal: any failure -- VCFA unreachable, login failing, the PATCH
+    itself failing after retries -- is logged as a WARNING, never
+    lsf.labfail()'d.
+    """
+    import requests
+    requests.packages.urllib3.disable_warnings()
+
+    access_token = _get_access_token(lsf)
+    if not access_token:
+        return
+    patch_headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/merge-patch+json',
+    }
+
     namespace_patch_url = (
         f'https://{VCFA_HOST}/cci/kubernetes/apis/infrastructure.cci.vmware.com/'
         'v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h'
@@ -204,6 +236,19 @@ def install_vcfa_blueprints(lsf):
     else:
         lsf.write_output(f'  WARNING: could not patch namespace after {max_attempts} attempts -- giving up')
 
-#patch
-#cci/kubernetes/apis/infrastructure.cci.vmware.com/v1alpha3/namespaces/default-project/supervisornamespaces/acme-east-prod-wrp4h
-#{"spec":{"classConfigOverrides":{"storageClasses":[{"name":"cluster-wld01-01a-optimal-datastore-default-policy-autoraid","limit":"2000000Mi"}]}}}
+
+if __name__ == '__main__':
+    # Standalone entry point for testing the blueprint installer directly
+    # against a live pod, without running the rest of adjustomatic.py.
+    # Deliberately runs ONLY install_vcfa_blueprints() -- NOT
+    # patch_supervisor_namespace_storage_quota(), which is invoked from
+    # adjustomatic.py's main() instead. Mirrors adjustomatic.py's own
+    # main() bootstrap (sys.path.append('/hol') + import lsfunctions) --
+    # on manager, /hol isn't a real path, so invoke with PYTHONPATH set
+    # instead, same gotcha as adjustomatic.py itself:
+    #   PYTHONPATH=/home/holuser/hol python3 install_vcfa_blueprints.py
+    import sys
+    sys.path.append('/hol')
+    import lsfunctions as lsf
+
+    install_vcfa_blueprints(lsf)
