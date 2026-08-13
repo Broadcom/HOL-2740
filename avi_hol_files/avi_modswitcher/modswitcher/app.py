@@ -298,7 +298,11 @@ class RunDialog(QDialog):
 
     def _on_output(self):
         text = bytes(self.process.readAllStandardOutput()).decode(errors="replace")
+        scrollbar = self.console.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
         self.console.appendPlainText(text.rstrip("\n"))
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
     def _on_finished(self, exit_code, _exit_status):
         if exit_code == 0:
