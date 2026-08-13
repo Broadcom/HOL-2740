@@ -2,15 +2,15 @@
 # ansible-playbook installed (e.g. /home/holuser/py312venv/bin/python).
 # Set to null to fall back to standard PATH resolution.
 config:
-  python_bin: null
+  python_bin: /home/holuser/py312venv/bin/python
 
 skus:
   - id: HOL-2740-01
-    title: "HOL-2740-01 - Integrate VMware Avi Load Balancer with VKS."
+    title: "HOL-2740-01 - App security in VKS with vDefend and Avi"
     modules:
-      - name: "Module 1 - Add name"
-        description: "Add description"
-        playbook: ../module-scripts/placeholder.yaml
+      - name: "Module 1 - Prepare Avi / vDefend container security lab"
+        description: "Deploys the 3 tier app, the antrea interworking configuration, and the avimart manifests"
+        playbook: ../module-scripts/2740-01-module_1.yaml
 
   # - id: HOL-2740-02 (was 2671-01)
   #   title: "HOL-2740-02 - Getting started with VCF (All Apps)"

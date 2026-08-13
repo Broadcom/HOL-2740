@@ -1,0 +1,15 @@
+apiVersion: addons.kubernetes.vmware.com/v1alpha1
+kind: AddonConfig
+metadata:
+  annotations:
+    clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"
+  labels:
+    addon.kubernetes.vmware.com/addon-name: antrea
+    cluster.x-k8s.io/cluster-name: workload-cluster-1
+  name: workload-cluster-1-antrea
+  namespace: acme-east-prod-wrp4h
+spec:
+  clusterName: workload-cluster-1
+  values:
+    antreaNSX:
+      enable: true

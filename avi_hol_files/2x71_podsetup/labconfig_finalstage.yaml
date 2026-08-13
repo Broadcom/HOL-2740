@@ -108,6 +108,22 @@
         dest: /etc/ansible/hosts/inventory.yml
       become: yes
 
+    - name: Attempt to install kubernetes packages
+      block:
+        - name: Try installing directly from the internet
+          ansible.builtin.pip:
+            name: kubernetes
+            state: present
+            virtualenv: /home/holuser/py312venv
+
+      rescue:
+        - name: Internet failed, try installing via Broadcom Artifactory
+          ansible.builtin.pip:
+            name: kubernetes
+            state: present
+            extra_args: --index-url https://packages.vcfd.broadcom.net/artifactory/api/pypi/pypi-remote/simple
+            virtualenv: /home/holuser/py312venv
+
     ##  Use readme in the root folder of git repo
     - name: Update readme on desktop
       copy:
@@ -148,6 +164,11 @@
     - name: Copy avimart lab files folder
       ansible.posix.synchronize:
         src: /vpodrepo/2027-labs/2740/avi_hol_files/avimart_demo
+        dest: /hol/hol-2740
+
+    - name: Copy 3tierapp lab files folder
+      ansible.posix.synchronize:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/3-TierAppDeployment
         dest: /hol/hol-2740
 
     # - name: copy kubeconfig for AMKO
@@ -259,11 +280,11 @@
     #     state: restarted
     #   become: yes
   
-    # - name: Restart service locust 
-    #   ansible.builtin.service:
-    #     name: locust_sitea
-    #     state: restarted
-    #   become: yes
+    - name: Restart service locust 
+      ansible.builtin.service:
+        name: demotraffic
+        state: restarted
+      become: yes
   
     # - name: Create site A kubernetes things
     #   kubernetes.core.k8s:
@@ -324,6 +345,37 @@
     #   ansible.builtin.file:
     #     path: /home/holuser/Desktop/Postman.desktop
     #     state: absent
+
+    ## Taskbar pins are separate from Desktop-folder icons above - GNOME/Ubuntu
+    ## Dock stores them as a list of .desktop IDs in the org.gnome.shell
+    ## favorite-apps gsettings key, not as a file. Must run as holuser (no
+    ## become) since it's a per-user setting - same read/write pattern already
+    ## proven to work unattended in avi_modswitcher/create_launcher.py.
+    # - name: Remove Postman from taskbar/dock favorites
+    #   ansible.builtin.shell: |
+    #     set -e
+    #     python3 - <<'EOF'
+    #     import ast, subprocess
+    #     raw = subprocess.run(
+    #         ["gsettings", "get", "org.gnome.shell", "favorite-apps"],
+    #         capture_output=True, text=True, check=True,
+    #     ).stdout.strip()
+    #     if raw.startswith("@as "):
+    #         raw = raw[len("@as "):]
+    #     current = ast.literal_eval(raw)
+    #     updated = [a for a in current if "postman" not in a.lower()]
+    #     if updated != current:
+    #         new_value = "[" + ", ".join(f"'{a}'" for a in updated) + "]"
+    #         subprocess.run(
+    #             ["gsettings", "set", "org.gnome.shell", "favorite-apps", new_value],
+    #             check=True,
+    #         )
+    #         print("CHANGED")
+    #     else:
+    #         print("OK")
+    #     EOF
+    #   register: postman_favorites_result
+    #   changed_when: "'CHANGED' in postman_favorites_result.stdout"
 
     # - name: Remove bottraffic shortcut
     #   ansible.builtin.file:

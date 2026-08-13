@@ -29,5 +29,5 @@ custom-fast-udp = "custom-fast-udp"
 
 #Other Vars
 student_desktop = "10.1.10.130"
-hol-wildcard = "HOL wildcard"
+hol-wildcard = "hol-wildcard"
 

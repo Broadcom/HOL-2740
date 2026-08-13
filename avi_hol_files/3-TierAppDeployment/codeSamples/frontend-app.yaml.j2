@@ -1,12 +1,11 @@
 apiVersion: v1
 kind: Secret
-metadata:  
+metadata:
   name: frontend-app-secret
 type: Opaque
 data:
-  #api_url: <BASE64_ENCODED_IP:PORT_FOR_backend-app-service>
-  api_url: MTkyLjE2OC4xMjMuNAo=
-
+  # Base64 encodes the full backend API destination URL path dynamically
+  api_url: "{{ ( backend_service_ip + ':5000') | b64encode }}"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -26,20 +25,19 @@ spec:
     spec:
       containers:
         - name: frontend-app
-          image: jswolf059/developer-utilities-frontend
+          image: harbor.site-a.vcf.lab/library/developer-utilities-frontend:latest
           ports:
             - containerPort: 5000
           env:
-          - name: API_URL
-            valueFrom:
-              secretKeyRef:
-                name: frontend-app-secret
-                key: api_url
-                optional: false 
+            - name: API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: frontend-app-secret
+                  key: api_url
+                  optional: false
       imagePullSecrets:
-      - name: docker-hub-creds
+        - name: docker-hub-creds
 ---
-
 apiVersion: v1
 kind: Service
 metadata:

@@ -1,3 +1,4 @@
 .DS_Store
 __pycache__
 */__pycache__
+avi_hol_files/3-TierAppDeployment/codeSamples/*.yaml
