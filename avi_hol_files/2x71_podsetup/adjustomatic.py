@@ -3471,6 +3471,16 @@ def main():
             import install_vcfa_blueprints
             install_vcfa_blueprints.install_vcfa_blueprints(lsf)
 
+        # Storage-class quota bump for the Automation lab's Supervisor
+        # namespace -- must run after the blueprint install above so a
+        # fresh blueprint deployment doesn't land in a namespace still at
+        # the un-bumped default quota. See
+        # install_vcfa_blueprints.patch_supervisor_namespace_storage_quota()'s
+        # docstring for the CCI merge-patch detail -- non-fatal, logs and
+        # skips on any failure rather than failing the lab.
+        with track_step(lsf, _telemetry_results, 'vcfa_namespace_storage_quota'):
+            install_vcfa_blueprints.patch_supervisor_namespace_storage_quota(lsf)
+
         # try:
         #     lsf.write_output("Running first stages playbook")
         #     # Playbook to run final config steps

@@ -95,7 +95,7 @@ def _get_project_id(lsf, headers):
     return projects[0]['id']
 
 
-def _blueprint_exists(lsf, headers, name):
+def _find_blueprint(lsf, headers, name):
     import requests
 
     # NOTE: unlike project-service, this endpoint does not honor $filter --
@@ -106,21 +106,84 @@ def _blueprint_exists(lsf, headers, name):
         headers=headers, verify=False, timeout=15,
     )
     if resp.status_code != 200:
-        lsf.write_output(f'  WARNING: could not check for existing blueprint {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
-        return True  # don't attempt a create we couldn't first check for
+        # Raise rather than return a sentinel -- the caller's per-blueprint
+        # try/except logs this as a WARNING and skips, same as any other
+        # failure here. Don't attempt a create we couldn't first check for.
+        raise RuntimeError(f'could not list blueprints to check for {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
 
-    return any(bp.get('name') == name for bp in _as_list(resp.json()))
+    return next((bp for bp in _as_list(resp.json()) if bp.get('name') == name), None)
+
+
+# Version/release endpoints below follow VMware Aria Automation's documented
+# on-prem API (VCFA shares this blueprint-versioning surface) -- UNLIKE every
+# other endpoint in this module, this apiVersion/path pair has NOT been
+# independently confirmed live against this pod's own VCFA build. If it's
+# wrong for this build, the failure surfaces as a WARNING per blueprint
+# (see _release_blueprint()), it won't lab-fail -- but verify by running
+# this script standalone and checking the actual response before trusting it.
+VCFA_BLUEPRINT_API_VERSION = '2019-09-12'
+
+
+def _release_blueprint(lsf, headers, blueprint_id, name):
+    """
+    Version + release a blueprint so it's actually consumable from the
+    Service Broker catalog -- creating a blueprint alone leaves it in DRAFT
+    status, which never appears there. Two separate calls are required;
+    release cannot happen in the same call as versioning.
+
+    Not sufficient on its own for a blueprint to actually appear in the
+    catalog UI -- that also requires a content source (pointed at this
+    project) and a content-sharing policy sharing it, both normally
+    one-time per-project setup done in the Automation UI, not per-blueprint.
+    If release succeeds here but the blueprint still doesn't show up for
+    students, check for those two independently before assuming this call
+    is broken.
+    """
+    import requests
+    import time as _time
+
+    version = _time.strftime('hol-%Y%m%d%H%M%S')
+    params = {'apiVersion': VCFA_BLUEPRINT_API_VERSION}
+
+    resp = requests.post(
+        f'https://{VCFA_HOST}/blueprint/api/blueprints/{blueprint_id}/versions',
+        headers=headers, params=params, verify=False, timeout=30,
+        json={'version': version, 'description': f'HOL-2740 auto-release ({name})', 'release': False},
+    )
+    if resp.status_code not in (200, 201):
+        lsf.write_output(f'  WARNING: could not version blueprint {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
+        return
+
+    release_resp = requests.post(
+        f'https://{VCFA_HOST}/blueprint/api/blueprints/{blueprint_id}/versions/{version}/actions/release',
+        headers=headers, params=params, verify=False, timeout=30,
+    )
+    if release_resp.status_code not in (200, 201, 204):
+        lsf.write_output(
+            f'  WARNING: could not release blueprint {name!r} version {version} '
+            f'(HTTP {release_resp.status_code}): {release_resp.text[:300]}'
+        )
+        return
+
+    lsf.write_output(f'  {name}: released version {version} to catalog')
 
 
 def install_vcfa_blueprints(lsf):
     """
-    Idempotently create each blueprint in BLUEPRINTS (skipping any that
-    already exist by name) in VCFA_ORG's VCFA_PROJECT_NAME project, from
-    the YAML files in vcfa_blueprints/ alongside this script.
+    Idempotently create AND release each blueprint in BLUEPRINTS (skipping
+    any already-released one by name) in VCFA_ORG's VCFA_PROJECT_NAME
+    project, from the YAML files in vcfa_blueprints/ alongside this script.
+
+    Creating a blueprint alone leaves it in DRAFT status -- invisible in
+    the Service Broker catalog students actually use. _release_blueprint()
+    is what makes a version consumable there; also retroactively releases
+    any blueprint this script created before that step existed and is
+    still sitting in DRAFT.
 
     Non-fatal: any failure anywhere in this chain -- VCFA unreachable,
-    login failing, project/org not found, a single blueprint's create call
-    failing -- is logged as a WARNING and skipped, never lsf.labfail()'d.
+    login failing, project/org not found, a single blueprint's create or
+    release call failing -- is logged as a WARNING and skipped, never
+    lsf.labfail()'d.
     """
     import requests
     requests.packages.urllib3.disable_warnings()
@@ -138,8 +201,13 @@ def install_vcfa_blueprints(lsf):
 
     for name, filename in BLUEPRINTS.items():
         try:
-            if _blueprint_exists(lsf, headers, name):
-                lsf.write_output(f'  {name}: already exists -- no-op')
+            existing = _find_blueprint(lsf, headers, name)
+            if existing:
+                if (existing.get('status') or '').upper() == 'RELEASED':
+                    lsf.write_output(f'  {name}: already exists and released -- no-op')
+                    continue
+                lsf.write_output(f'  {name}: exists but not released -- releasing')
+                _release_blueprint(lsf, headers, existing['id'], name)
                 continue
 
             content = open(os.path.join(BLUEPRINTS_DIR, filename)).read()
@@ -154,12 +222,18 @@ def install_vcfa_blueprints(lsf):
                     'requestScopeOrg': False,
                 },
             )
-            if resp.status_code in (200, 201):
-                lsf.write_output(f'  {name}: created')
-            else:
+            if resp.status_code not in (200, 201):
                 lsf.write_output(f'  WARNING: could not create blueprint {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
+                continue
+
+            lsf.write_output(f'  {name}: created')
+            blueprint_id = resp.json().get('id')
+            if not blueprint_id:
+                lsf.write_output(f'  WARNING: create response for {name!r} had no id -- cannot release')
+                continue
+            _release_blueprint(lsf, headers, blueprint_id, name)
         except Exception as e:
-            lsf.write_output(f'  WARNING: could not create blueprint {name!r}: {e}')
+            lsf.write_output(f'  WARNING: could not create/release blueprint {name!r}: {e}')
 
 
 def patch_supervisor_namespace_storage_quota(lsf):
@@ -168,13 +242,12 @@ def patch_supervisor_namespace_storage_quota(lsf):
     quota via CCI's supervisornamespaces PATCH. Unrelated to the blueprint
     catalog, just sharing this module's VCFA auth/session helpers.
 
-    NOT CURRENTLY CALLED FROM ANYWHERE (2026-08-13) -- adjustomatic.py only
-    calls install_vcfa_blueprints() (see its own call site). This function
-    is kept as reference for the quota bump it performs; the pod's saved
-    vApp template is presumed to already have this quota baked in, since
-    nothing in the current startup path applies it. Confirm the quota is
-    actually still correct on a fresh pod before wiring this back in --
-    don't assume it's still needed just because it once was.
+    Called from adjustomatic.py's main(), immediately after
+    install_vcfa_blueprints() -- deliberately NOT from this module's own
+    __main__ block, since that's used for standalone blueprint-install
+    testing only (2026-08-13). Run after the blueprint step so a fresh
+    blueprint deployment doesn't land in a namespace still at the
+    un-bumped default quota.
 
     CCI's supervisornamespaces PATCH is JSON Merge Patch (RFC 7396) --
     confirmed against vcf/automation's supervisor-k8.service.ts, which
