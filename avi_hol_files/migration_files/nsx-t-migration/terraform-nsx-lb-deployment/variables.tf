@@ -93,7 +93,7 @@ variable "student_desktop" {
 }
 
 variable "hol-wildcard" {
-    description = "HOL wildcard"
+    description = "hol-wildcard"
     type        = string
 }
 
