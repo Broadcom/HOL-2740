@@ -129,3 +129,19 @@
     # You can suppress that if you want strict visual idempotency in your playbook output.
     changed_when: false
 
+  - name: Create or overwrite A Record
+    ansible.builtin.uri:
+      url: "http://10.1.10.129:5380/api/zones/records/add"
+      method: POST
+      body_format: form-urlencoded
+      body:
+        token: "{{ technitium_auth.json.token }}"
+        domain: "3tierapp-db.site-a.vcf.lab"
+        zone: "site-a.vcf.lab"
+        type: "A"
+        ipAddress: "{{ global_db_ip }}" # The IP you grabbed from your kubectl task
+        ttl: "3600"
+        overwrite: "true"
+    # Optional: URI module will always report 'changed' on a successful POST. 
+    # You can suppress that if you want strict visual idempotency in your playbook output.
+    changed_when: false
