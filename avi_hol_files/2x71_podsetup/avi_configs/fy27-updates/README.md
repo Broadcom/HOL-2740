@@ -19,10 +19,25 @@ Every task uses a `vmware.alb` collection module (`avi_cloud`,
 `avi_controllerproperties`, `avi_network`, `avi_ipamdnsproviderprofile`,
 `avi_serviceenginegroup`, `avi_applicationprofile`, `avi_sslprofile`,
 `avi_sslkeyandcertificate`, `avi_pool`, `avi_vsvip`, `avi_virtualservice`,
-`avi_backupconfiguration`, `avi_systemconfiguration`) — no raw
-`uri`/`avi_api_session` REST calls except the pre-login controller-readiness
-poll, which is the same pattern the original `avi_config.yml` uses (there's
-no dedicated module for an unauthenticated health check).
+`avi_backupconfiguration`, `avi_systemconfiguration`), except for four raw
+`uri` tasks that run immediately after the portal-readiness poll, before any
+`vmware.alb` module runs (added 2026-08-20):
+- **Wait for the portal to become active** — the pre-login controller-readiness
+  poll (`GET /api/initial-data`, unauthenticated) — same pattern the original
+  `avi_config.yml` uses (there's no dedicated module for this health check).
+- **Verify vCenter API is responding** — `POST /api/session` against
+  `vcenter_name` with basic auth, expects `201`. Confirms the vSphere REST API
+  is actually up and authenticating before the cloud-connector-user task
+  below depends on it, rather than finding out from that task's own failure.
+- **Close vCenter API session** — `DELETE /api/session` using the session ID
+  from the check above, so the health check doesn't leak an open vCenter
+  session on every pod boot.
+- **Verify NSX Manager API is responding** — `GET /api/v1/node` against
+  `nsxt_url` with basic auth, expects `200`. Same rationale as the vCenter
+  check, for the NSX-side credentials used by the second cloud-connector user.
+
+All four retry like the portal poll (300 attempts, 10s delay) since vCenter/NSX
+may still be settling at the same time as Avi.
 
 ## Reconciliation: what changed from the original snapshot, and why
 
@@ -68,14 +83,17 @@ against a specific pod, that jump-host split is the most likely reason.
 - **Cert private key material.** Avi never returns private keys via the API
   (`"<sensitive>"` on every read). The `sslkeyandcertificate` tasks read the
   vault-created wildcard cert/key and the root CA cert via `/lmchol/...`
-  paths, because `adjustomatic.py` (which runs these playbooks) executes on
-  the lab **manager**, not the jump host/console — `/lmchol` there is a bind
-  mount of the console VM's real filesystem. (An earlier revision of this
-  README claimed the opposite — that these ran on the console directly and
-  `/lmchol` never applied — that was wrong; corrected after actually running
-  `adjustomatic.py` end to end and watching the cert task fail without the
-  prefix.) If those files are gone, this playbook can't recreate the certs
-  from what's on the controller alone.
+  paths, because these playbooks execute on the lab **manager**, not the jump
+  host/console — `/lmchol` there is a bind mount of the console VM's real
+  filesystem. (An earlier revision of this README claimed the opposite —
+  that these ran on the console directly and `/lmchol` never applied — that
+  was wrong; corrected after actually running them end to end and watching
+  the cert task fail without the prefix.) If those files are gone, this
+  playbook can't recreate the certs from what's on the controller alone.
+  **Invocation moved (2026-08-20):** these playbooks used to be run directly
+  from `adjustomatic.py`; they're now run from `Startup/VCF.py`'s CUSTOM
+  section instead (same `manager` process, so the `/lmchol` reasoning above
+  still holds unchanged) — see `Startup/VCF.py`'s v3.13 changelog entry.
 
 ## Usage
 
