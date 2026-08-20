@@ -90,10 +90,17 @@ against a specific pod, that jump-host split is the most likely reason.
   was wrong; corrected after actually running them end to end and watching
   the cert task fail without the prefix.) If those files are gone, this
   playbook can't recreate the certs from what's on the controller alone.
-  **Invocation moved (2026-08-20):** these playbooks used to be run directly
-  from `adjustomatic.py`; they're now run from `Startup/VCF.py`'s CUSTOM
-  section instead (same `manager` process, so the `/lmchol` reasoning above
-  still holds unchanged) — see `Startup/VCF.py`'s v3.13 changelog entry.
+  **Invocation moved (2026-08-20, twice):** these playbooks used to be run
+  directly from `adjustomatic.py`; they moved first to `Startup/VCF.py`'s
+  CUSTOM section (v3.13), then the same day to `Startup/vSphere.py`'s CUSTOM
+  section instead (v3.7) — `VCF.py` powers vCenter VMs on but never confirms
+  the API/UI is actually up before returning, which let the avi-config
+  playbooks (and the Avi cloud connector they configure) run ahead of
+  vCenter being truly ready and leave the Avi cloud stuck not going Ready.
+  `vSphere.py`'s own TASK 6/6b/7 block on real vCenter reachability first.
+  All three locations are the same `manager` process, so the `/lmchol`
+  reasoning above still holds unchanged throughout — see `vSphere.py`'s v3.7
+  changelog entry and `VCF.py`'s v3.13/v3.14 entries.
 
 ## Usage
 

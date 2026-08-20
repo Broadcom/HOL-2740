@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 # VCF.py - HOL-2740 Core VCF Startup Module
-# Version 3.13 - 2026-08-20
+# Version 3.14 - 2026-08-20
 # Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # VMware Cloud Foundation startup sequence
+#
+# v3.14 Changes (2026-08-20):
+# - CUSTOM section: moved the avi_config_*.yml playbook steps added in v3.13
+#   back out again, this time to Startup/vSphere.py's CUSTOM section. This
+#   module powers vCenter VMs on but never confirms vCenter's API/UI is
+#   actually up before returning; running the avi-config playbooks (and the
+#   Avi cloud connector they configure) from here could beat vCenter's own
+#   readiness, leaving the Avi cloud stuck not going Ready. vSphere.py's
+#   TASK 6/6b/7 already block on real vCenter reachability, so its CUSTOM
+#   section is the correct place. See vSphere.py's v3.7 changelog. This
+#   module's CUSTOM section is back to empty; the Supervisor-unpause shim
+#   removed in v3.13 is still removed, not restored.
 #
 # v3.13 Changes (2026-08-20):
 # - CUSTOM section: moved the workload-domain and mgmt-domain avi_config_*.yml
@@ -128,7 +140,6 @@ import sys
 import argparse
 import logging
 import time
-import subprocess
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -960,52 +971,16 @@ def main(lsf=None, standalone=False, dry_run=False):
     # except Exception as e:
     #     lsf.write_output(f'Early AKO/avi-secret shim check failed (non-fatal): {e}')
 
-    # Avi configuration playbooks (workload-domain + mgmt-domain
-    # avi_config_*.yml under avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/)
-    # -- moved here (2026-08-20) from adjustomatic.py, replacing the
-    # Supervisor-unpause shim that used to run at this point. That shim
-    # (adjustomatic.unpause_vks_clusters(), undoing the spec.paused=true
-    # applied by Shutdown/VCFshutdown.py Phase 3b) has been removed entirely,
-    # not just relocated.
-    lsf.write_output('Running avi configuration playbook - workload domain')
-    try:
-        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
-            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
-            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-        # Playbook already succeeded at this point - don't let a transient I/O error
-        # while logging its output turn a successful run into a lab failure.
-        try:
-            lsf.write_output(result.stdout)
-        except OSError as log_err:
-            lsf.write_output(f'avi workload-domain configuration succeeded, but logging its output failed: {log_err}')
-    except Exception as e:
-        lsf.write_output(e)
-        try:
-            lsf.write_output(e.stdout)
-            lsf.write_output(e.stderr)
-        except Exception:
-            pass
-        lsf.labfail('VCF module failed at avi workload-domain configuration step')
-
-    lsf.write_output('Running avi configuration playbook - management domain')
-    try:
-        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
-            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
-            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
-        # Playbook already succeeded at this point - don't let a transient I/O error
-        # while logging its output turn a successful run into a lab failure.
-        try:
-            lsf.write_output(result.stdout)
-        except OSError as log_err:
-            lsf.write_output(f'avi management-domain configuration succeeded, but logging its output failed: {log_err}')
-    except Exception as e:
-        lsf.write_output(e)
-        try:
-            lsf.write_output(e.stdout)
-            lsf.write_output(e.stderr)
-        except Exception:
-            pass
-        lsf.labfail('VCF module failed at avi management-domain configuration step')
+    # The avi-config playbook steps that briefly lived here (2026-08-20,
+    # replacing the Supervisor-unpause shim -- see v3.13 below; that shim
+    # remains removed entirely, not relocated) moved again the same day to
+    # Startup/vSphere.py's CUSTOM section. Reason: this module powers
+    # vCenter VMs on but returns without confirming vCenter's API/UI is
+    # actually up, so the avi-config playbooks (and the Avi cloud connector
+    # they configure) could run before vCenter was really ready, leaving the
+    # Avi cloud stuck not going Ready. vSphere.py's own TASK 6/6b/7 already
+    # block until vCenter is confirmed reachable, so its CUSTOM section is a
+    # safer place to run them from. See vSphere.py's v3.7 changelog.
 
     ##=========================================================================
     ## End CUSTOM section
