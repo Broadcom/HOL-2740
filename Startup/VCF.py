@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # VCF.py - HOL-2740 Core VCF Startup Module
-# Version 3.12 - 2026-08-20
+# Version 3.13 - 2026-08-20
 # Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # VMware Cloud Foundation startup sequence
+#
+# v3.13 Changes (2026-08-20):
+# - CUSTOM section: moved the workload-domain and mgmt-domain avi_config_*.yml
+#   ansible-playbook steps here from adjustomatic.py, replacing the
+#   Supervisor-unpause shim (adjustomatic.unpause_vks_clusters()) that used to
+#   run at this point. That shim is removed entirely, not relocated -- see
+#   adjustomatic.py for the corresponding removal. Shutdown/VCFshutdown.py's
+#   Phase 3b (pause_supervisor_clusters()) is intentionally left as-is.
 #
 # v3.12 Changes (2026-08-20):
 # - Incorporated core v3.11 performance optimizations: replaced hardcoded sleeps
@@ -120,6 +128,7 @@ import sys
 import argparse
 import logging
 import time
+import subprocess
 
 # Add hol directory to path
 sys.path.insert(0, '/home/holuser/hol')
@@ -951,25 +960,52 @@ def main(lsf=None, standalone=False, dry_run=False):
     # except Exception as e:
     #     lsf.write_output(f'Early AKO/avi-secret shim check failed (non-fatal): {e}')
 
-    # Shim: undo the Supervisor cluster pause applied by this repo's
-    # customized Shutdown/VCFshutdown.py (Phase 3b, pause_supervisor_clusters())
-    # during the last lab shutdown. Must run before Kubernetes.py's per-cluster
-    # health check and VCFfinal.py's Supervisor polling, since a paused
-    # cluster is exactly the kind of thing those generic modules have no
-    # ability to diagnose and could waste their own timeout budgets on.
-    # See adjustomatic.unpause_vks_clusters()'s docstring for full detail.
-    # Re-enabled (2026-08-04): unrelated to the NSX/Avi credential corruption
-    # traced during the 2026-08-01 controlled test (commit 3a0d131) -- this
-    # shim only clears spec.paused on VKS clusters, no NSX/Avi credential
-    # code involved. Safe alongside adjustomatic.main() being re-enabled in
-    # final.py.
-    lsf.write_output('Checking for paused Supervisor clusters shim...')
+    # Avi configuration playbooks (workload-domain + mgmt-domain
+    # avi_config_*.yml under avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/)
+    # -- moved here (2026-08-20) from adjustomatic.py, replacing the
+    # Supervisor-unpause shim that used to run at this point. That shim
+    # (adjustomatic.unpause_vks_clusters(), undoing the spec.paused=true
+    # applied by Shutdown/VCFshutdown.py Phase 3b) has been removed entirely,
+    # not just relocated.
+    lsf.write_output('Running avi configuration playbook - workload domain')
     try:
-        sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
-        import adjustomatic
-        adjustomatic.unpause_vks_clusters(lsf)
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
+            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        # Playbook already succeeded at this point - don't let a transient I/O error
+        # while logging its output turn a successful run into a lab failure.
+        try:
+            lsf.write_output(result.stdout)
+        except OSError as log_err:
+            lsf.write_output(f'avi workload-domain configuration succeeded, but logging its output failed: {log_err}')
     except Exception as e:
-        lsf.write_output(f'Supervisor cluster unpause shim failed (non-fatal): {e}')
+        lsf.write_output(e)
+        try:
+            lsf.write_output(e.stdout)
+            lsf.write_output(e.stderr)
+        except Exception:
+            pass
+        lsf.labfail('VCF module failed at avi workload-domain configuration step')
+
+    lsf.write_output('Running avi configuration playbook - management domain')
+    try:
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
+            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        # Playbook already succeeded at this point - don't let a transient I/O error
+        # while logging its output turn a successful run into a lab failure.
+        try:
+            lsf.write_output(result.stdout)
+        except OSError as log_err:
+            lsf.write_output(f'avi management-domain configuration succeeded, but logging its output failed: {log_err}')
+    except Exception as e:
+        lsf.write_output(e)
+        try:
+            lsf.write_output(e.stdout)
+            lsf.write_output(e.stderr)
+        except Exception:
+            pass
+        lsf.labfail('VCF module failed at avi management-domain configuration step')
 
     ##=========================================================================
     ## End CUSTOM section

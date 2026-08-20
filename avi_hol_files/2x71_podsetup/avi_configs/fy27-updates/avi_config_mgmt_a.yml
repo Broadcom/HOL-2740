@@ -38,6 +38,43 @@
       retries: 300
       delay: 10
 
+    - name: "Verify vCenter API is responding"
+      uri:
+        url: "https://{{ vcenter_name }}/api/session"
+        method: POST
+        url_username: "administrator@vsphere.local"
+        url_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: 201
+      register: vcenter_check
+      until: vcenter_check.status == 201
+      retries: 300
+      delay: 10
+
+    - name: "Close vCenter API session"
+      uri:
+        url: "https://{{ vcenter_name }}/api/session"
+        method: DELETE
+        headers:
+          vmware-api-session-id: "{{ vcenter_check.json }}"
+        validate_certs: no
+        status_code: 204
+
+    - name: "Verify NSX Manager API is responding"
+      uri:
+        url: "https://{{ nsxt_url }}/api/v1/node"
+        method: GET
+        url_username: admin
+        url_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+        force_basic_auth: yes
+        validate_certs: no
+        status_code: 200
+      register: nsx_check
+      until: nsx_check.status == 200
+      retries: 300
+      delay: 10
+
     - name: "Controller properties (template intent - was missing live, now enforced)"
       vmware.alb.avi_controllerproperties:
         avi_credentials: "{{ avi_credentials }}"
