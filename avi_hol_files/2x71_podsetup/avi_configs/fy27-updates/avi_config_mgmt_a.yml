@@ -44,6 +44,43 @@
         shared_ssl_certificates: true
         api_idle_timeout: 1440
 
+    - name: Create first Avi Cloud Connector User
+      vmware.alb.avi_cloudconnectoruser:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "vcenter_admin"
+        # Change this block if using AWS/Azure/NSX-T credentials
+        vcenter_credentials:
+          username: "administrator@vsphere.local"
+          password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      register: cc_user1
+
+    - name: Create second Avi Cloud Connector User
+      vmware.alb.avi_cloudconnectoruser:
+        avi_credentials: "{{ avi_credentials }}"
+        name: "nsx_admin"
+        nsxt_credentials:
+          username: "admin"
+          password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      register: cc_user2
+
+    - name: Check for cloud
+      vmware.alb.avi_api_session:
+        avi_credentials: "{{ avi_credentials }}"
+        http_method: get
+        path: vcenterserver
+        params: 
+          name: "{{ vcenter_name }}"
+      register: vcenter_lookup
+
+    - name: "edit vcenter server configuration"
+      vmware.alb.avi_api_session:
+        avi_credentials: "{{ avi_credentials }}"
+        http_method: patch 
+        path: "vcenterserver/{{ vcenter_lookup.obj.results[0].uuid }}"
+        data:
+          replace:
+            vcenter_credentials_ref: "{{ cc_user1.obj.url }}"
+
     # Backup configuration is VCF Operations' to manage, not ours - do NOT
     # add a task for it here. (There used to be one; it did a full PUT that
     # silently dropped ssh_user_ref, since that field is never readable via
@@ -113,6 +150,21 @@
         name: "{{ cloud_name }}"
         dns_provider_ref: "/api/ipamdnsproviderprofile?name={{ dns_profile_name }}"
         ipam_provider_ref: "/api/ipamdnsproviderprofile?name={{ ipam_profile_name }}"
+        nsxt_configuration:
+          nsxt_credentials_ref: "{{ cc_user2.obj.url }}"
+
+    - name: Wait for the Cloud to become placement ready
+      vmware.alb.avi_api_session:
+        avi_credentials: "{{ avi_credentials }}"
+        http_method: get
+        path: cloud-inventory
+        params:
+          name: "{{ cloud_name }}"
+      register: cloud_runtime
+      # Poll the cloud-inventory endpoint until the state reaches placement ready
+      until: cloud_runtime.obj.results | length > 0 and cloud_runtime.obj.results[0].status.state == 'CLOUD_STATE_PLACEMENT_READY'
+      retries: 30
+      delay: 10
 
     # self_se_election is the only field changed here (false -> true, per
     # instruction). Every other field is left at its current live value -
