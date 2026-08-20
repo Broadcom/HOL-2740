@@ -103,34 +103,14 @@
 
     - name: Create second Avi Cloud Connector User
       vmware.alb.avi_cloudconnectoruser:
-        avi_credentials: "{{ avi_credentials }}""
+        avi_credentials: "{{ avi_credentials }}"
         name: "nsx_admin"
         nsxt_credentials:
           username: "admin"
           password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
       register: cc_user2
 
-    - name: Patch the Cloud to use the new Cloud Connector Accounts
-      vmware.alb.avi_cloud:
-        controller: "{{ avi_controller }}"
-        username: "{{ avi_username }}"
-        password: "{{ avi_password }}"
-        api_version: "{{ avi_api_version }}"
-        tenant: "{{ avi_tenant }}"
-        name: "{{ cloud_name }}"
-        # Trigger the HTTP PATCH method instead of HTTP PUT
-        avi_api_update_method: patch
-        avi_patch_op: replace
-        # This path depends on the cloud type. 
-        # For a standard vCenter cloud, updating the credentials reference is common.
-        avi_patch_path: /vcenter_configuration/vcenter_credentials_ref
-        avi_patch_value: 
-          - "{{ cc_user1.obj.url }}"
-          - "{{ cc_user2.obj.url }}"
-
-
-
-
+ 
     # Backup configuration is VCF Operations' to manage, not ours - do NOT
     # add a task for it here. (There used to be one; it did a full PUT that
     # silently dropped ssh_user_ref, since that field is never readable via
@@ -206,13 +186,20 @@
         nsxt_configuration:
           nsxt_credentials_ref: "{{ cc_user1.obj.url }}"
 
-
+    - name: Check for cloud
+      vmware.alb.avi_api_session:
+        avi_credentials: "{{ avi_credentials }}"
+        http_method: get
+        path: vcenterserver
+        params: 
+          name: "{{ vcenter_name }}"
+      register: vcenter_lookup
 
     - name: "edit vcenter server configuration"
       vmware.alb.avi_api_session:
         avi_credentials: "{{ avi_credentials }}"
         http_method: patch 
-        path: vcenterserver
+        path: "vcenterserver/{{ vcenter_lookup.obj.results[0].uuid }}
         #avi_api_update_method: patch
         name: "{{ vcenter_name }}"
         data:
