@@ -94,7 +94,7 @@
     - name: Create first Avi Cloud Connector User
       vmware.alb.avi_cloudconnectoruser:
         avi_credentials: "{{ avi_credentials }}"
-        name: "{{ account1_name }}"
+        name: "vcenter_admin"
         # Change this block if using AWS/Azure/NSX-T credentials
         vcenter_credentials:
           username: "administrator@wld.sso"
@@ -103,12 +103,8 @@
 
     - name: Create second Avi Cloud Connector User
       vmware.alb.avi_cloudconnectoruser:
-        controller: "{{ avi_controller }}"
-        username: "{{ avi_username }}"
-        password: "{{ avi_password }}"
-        api_version: "{{ avi_api_version }}"
-        tenant: "{{ avi_tenant }}"
-        name: "{{ account2_name }}"
+        avi_credentials: "{{ avi_credentials }}""
+        name: "nsx_admin"
         nsxt_credentials:
           username: "admin"
           password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
