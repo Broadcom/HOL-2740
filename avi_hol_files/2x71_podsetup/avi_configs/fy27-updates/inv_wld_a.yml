@@ -28,6 +28,8 @@ all:
       # NSX Manager backing this cloud
       nsxt_url: nsx-wld01-a.site-a.vcf.lab
 
+      vcenter_name: vc-wld01-a.site-a.vcf.lab
+
       # Networks known to this cloud
       mgmt_network_name: ans-mgmt
       mgmt_network_subnet: 10.1.0.0
