@@ -471,14 +471,19 @@ Confluence sources and outstanding items, at
    `shutdown_helpers.py`'s own historical timing note that Phase 4 varied
    62-392s run to run ("vm-7737 variable") — that variance was this race.
 
-   **Startup counterpart implemented.** The upstream HOLFY27-MGR-HOLUSER
-   startup framework had no step that undoes this pause. This repo's
-   `Startup/VCF.py` CUSTOM section now calls
-   `adjustomatic.unpause_vks_clusters()` (in
-   `avi_hol_files/2x71_podsetup/adjustomatic.py`) on every lab boot, before
-   `Kubernetes.py`/`VCFfinal.py` run — same shim slot as the existing AKO
-   health check, for the same reason (must run before generic downstream
-   modules that have no ability to diagnose a paused cluster).
+   **Startup counterpart removed (2026-08-20) — known gap.** A startup-side
+   shim (`adjustomatic.unpause_vks_clusters()`, called from `Startup/VCF.py`'s
+   CUSTOM section) used to undo this pause on every lab boot. That shim's
+   call site and its function definition were both deleted outright when the
+   avi-config playbook steps were moved into that same CUSTOM section slot
+   (see `Startup/VCF.py`'s v3.13 changelog entry and
+   `avi_hol_files/2x71_podsetup/adjustomatic.py`). Phase 3b above was
+   deliberately left enabled. Net effect: as of this change, VKS clusters
+   paused by Phase 3b during shutdown **stay paused indefinitely** on the
+   next boot — nothing in the upstream HOLFY27-MGR-HOLUSER startup framework
+   or this repo's overrides clears `spec.paused` anymore. Confirmed accepted
+   as a known gap at the time of removal, not an oversight — revisit if VKS
+   CAPI self-healing turns out to matter across a shutdown/startup cycle.
 
 2. **Phase 19c straggler-skip pattern fixed.** The final pre-ESXi-shutdown
    audit used substring matching (`'manager' in vm_name_lower`) to avoid
