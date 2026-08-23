@@ -303,6 +303,17 @@
         se_deprovision_delay: 120
         disable_tso: true
 
+
+    - name: "Default-Group SE group sizing for {{ cloud_name }}"
+      vmware.alb.avi_serviceenginegroup:
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        avi_credentials: "{{ avi_credentials }}"
+        name: us-east-seg-ha
+        tenant: Acme-East-A
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        disable_tso: true
+
     # gslb01a is a separate, dedicated GSLB SE group on this cloud (missed
     # entirely in the original snapshot - it doesn't exist in avi_config.yml
     # at all). Same rule: only self_se_election changes (false -> true);
