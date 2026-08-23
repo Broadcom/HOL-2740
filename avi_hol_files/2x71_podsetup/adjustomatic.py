@@ -1773,6 +1773,240 @@ def ensure_workload_cluster_ako_healthy(lsf, timeout_seconds=180, poll_interval=
             lsf.write_output(f'  WARNING: could not check/repair AKO health in {context}: {e}')
 
 
+# The cert-manager Issuer used by the Automation lab's Supervisor namespace
+# to sign certs via HashiCorp Vault's pki/sign/holodeck path. Same
+# console-has-the-kubeconfig / manager-doesn't constraint as the VKS
+# kubectl calls above -- see VKS_KUBECTL_HOST's comment.
+VAULT_ISSUER_NAME = 'vault-issuer'
+VAULT_SERVER_FQDN = 'vault.vcf.lab'
+# Domains this pod's exercises actually request certs for via the
+# holodeck PKI role -- vcf.lab plus each site-a subdomain fronted by Avi
+# (the load-balancer VIP domain and both VKS guest-cluster domains).
+VAULT_HOLODECK_REQUIRED_DOMAINS = (
+    'vcf.lab', 'lb.site-a.vcf.lab', 'site-a.vcf.lab',
+    'vks1.site-a.vcf.lab', 'vks2.site-a.vcf.lab',
+)
+
+
+def fix_vault_issuer_ca_trust(lsf):
+    """
+    Ensure cert-manager's vault-issuer Issuer (namespace VKS_SUPERVISOR_NS,
+    Supervisor context) trusts the TLS certificate vault.vcf.lab's API
+    listener presents.
+
+    Root cause (confirmed live 2026-08-23): vault.vcf.lab's own root CA
+    ("vcf.lab Root Authority") is regenerated per pod rebuild, but the
+    Issuer object is provisioned with no spec.vault.caBundle at all --
+    cert-manager then fails every health check against Vault with
+    "x509: certificate signed by unknown authority" and the Issuer never
+    reaches Ready, which means every cert request against
+    pki/sign/holodeck in this namespace fails too.
+
+    Fix: fetch the cert chain vault.vcf.lab actually presents (via
+    `openssl s_client -showcerts`, run on console since that's the host
+    with a network route + the Supervisor kubeconfig -- see
+    VKS_KUBECTL_HOST), identify the self-signed root (subject == issuer),
+    and merge-patch it into spec.vault.caBundle. Idempotent: skips the
+    patch entirely if the currently-live root already matches what's on
+    the Issuer (covers every run after the first on a given pod, and any
+    run where this was already fixed by hand).
+
+    Non-fatal: any failure here is logged as a warning. A broken
+    vault-issuer degrades whatever exercise depends on Vault-issued certs
+    in this namespace, but doesn't itself mean the rest of the lab is
+    unusable.
+    """
+    import base64
+
+    lsf.write_output('Checking cert-manager vault-issuer CA trust...')
+    password = lsf.get_password()
+
+    remote_py = r"""
+import base64, json, re, subprocess, sys, time
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+K = ['kubectl', '--context', 'Supervisor', '-n', '__VKS_SUPERVISOR_NS__']
+
+get = run(K + ['get', 'issuer', '__VAULT_ISSUER_NAME__', '-o', 'json'])
+if get.returncode != 0:
+    print('ISSUER_NOT_FOUND: ' + get.stderr.strip())
+    sys.exit(0)
+
+issuer = json.loads(get.stdout)
+current_ca_b64 = issuer.get('spec', {}).get('vault', {}).get('caBundle', '')
+
+chain = subprocess.run(
+    ['openssl', 's_client', '-connect', '__VAULT_SERVER_FQDN__:443',
+     '-servername', '__VAULT_SERVER_FQDN__', '-showcerts'],
+    input='', capture_output=True, text=True, timeout=20,
+).stdout
+
+certs = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', chain, re.S)
+if not certs:
+    print('NO_CERTS_RETRIEVED')
+    sys.exit(0)
+
+root_pem = None
+for pem in certs:
+    with open('/tmp/_vault_issuer_cert.pem', 'w') as f:
+        f.write(pem)
+    subj = run(['openssl', 'x509', '-in', '/tmp/_vault_issuer_cert.pem', '-noout', '-subject']).stdout.strip()
+    iss = run(['openssl', 'x509', '-in', '/tmp/_vault_issuer_cert.pem', '-noout', '-issuer']).stdout.strip()
+    if subj.replace('subject=', '', 1) == iss.replace('issuer=', '', 1):
+        root_pem = pem
+subprocess.run(['rm', '-f', '/tmp/_vault_issuer_cert.pem'])
+
+if not root_pem:
+    print('NO_SELF_SIGNED_ROOT_FOUND')
+    sys.exit(0)
+
+new_ca_b64 = base64.b64encode(root_pem.encode()).decode()
+if new_ca_b64 == current_ca_b64:
+    print('ALREADY_TRUSTED')
+    sys.exit(0)
+
+patch = json.dumps({'spec': {'vault': {'caBundle': new_ca_b64}}})
+res = run(K + ['patch', 'issuer', '__VAULT_ISSUER_NAME__', '--type=merge', '-p', patch])
+if res.returncode != 0:
+    print('PATCH_FAILED: ' + res.stderr.strip())
+    sys.exit(0)
+
+for _ in range(6):
+    time.sleep(5)
+    st = run(K + ['get', 'issuer', '__VAULT_ISSUER_NAME__', '-o', 'json'])
+    if st.returncode == 0:
+        conds = json.loads(st.stdout).get('status', {}).get('conditions', [])
+        ready = next((c for c in conds if c.get('type') == 'Ready'), None)
+        if ready and ready.get('status') == 'True':
+            print('PATCHED_AND_VERIFIED')
+            sys.exit(0)
+print('PATCHED_BUT_NOT_YET_READY')
+"""
+    remote_py = (
+        remote_py
+        .replace('__VKS_SUPERVISOR_NS__', VKS_SUPERVISOR_NS)
+        .replace('__VAULT_ISSUER_NAME__', VAULT_ISSUER_NAME)
+        .replace('__VAULT_SERVER_FQDN__', VAULT_SERVER_FQDN)
+    )
+    script_b64 = base64.b64encode(remote_py.encode()).decode()
+    remote_cmd = (
+        f"echo {script_b64} | base64 -d > /tmp/fix_vault_issuer.py && "
+        f"python3 /tmp/fix_vault_issuer.py; rm -f /tmp/fix_vault_issuer.py"
+    )
+
+    try:
+        result = lsf.ssh(remote_cmd, VKS_KUBECTL_HOST, password)
+        out_text = (getattr(result, 'stdout', '') or '').strip()
+        lsf.write_output(f'  vault-issuer CA trust result: {out_text or "(no output)"}')
+        if 'FAILED' in out_text or 'NOT_YET_READY' in out_text or 'NOT_FOUND' in out_text:
+            lsf.write_output('  WARNING: vault-issuer may still need manual attention')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: vault-issuer CA trust check failed: {e}')
+
+
+def ensure_vault_holodeck_role_domains(lsf):
+    """
+    Ensure Vault's pki/roles/holodeck role (the role vault-issuer signs
+    through, via pki/sign/holodeck) has allowed_domains covering every
+    domain this pod's exercises actually request certs for --
+    VAULT_HOLODECK_REQUIRED_DOMAINS.
+
+    Uses the same universal pod password as the Vault root token --
+    confirmed live 2026-08-23 that vault.vcf.lab's root token equals the
+    standard pod password, same as it authenticates essentially every
+    other account across this lab (see CLAUDE.md's Credentials section).
+
+    Read-modify-write, not a partial POST: Vault's pki/roles/:name write
+    endpoint replaces the whole role, not just the fields supplied -- a
+    request containing only allowed_domains would silently reset every
+    other role parameter (key_type, ttl, allow_subdomains, etc.) to its
+    default. This reads the full current role first and re-submits it
+    verbatim with only allowed_domains extended, so nothing else about
+    the role changes.
+
+    Idempotent: no-ops (and only logs) if every required domain is
+    already present -- true on any pod where this was already applied,
+    confirmed live 2026-08-23.
+
+    Non-fatal: any failure is logged as a warning, never fails the lab --
+    a missing domain here breaks cert issuance for that one domain, not
+    the rest of the pod.
+    """
+    import base64
+    import json
+
+    lsf.write_output('Checking Vault pki/roles/holodeck allowed_domains...')
+    password = lsf.get_password()
+
+    remote_py = r"""
+import json, ssl, sys, urllib.request
+
+VAULT_HOST = '__VAULT_SERVER_FQDN__'
+ROLE = 'holodeck'
+REQUIRED_DOMAINS = __REQUIRED_DOMAINS_JSON__
+TOKEN = '__VAULT_TOKEN__'
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+def vault_request(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f'https://{VAULT_HOST}{path}', data=data, method=method,
+        headers={'X-Vault-Token': TOKEN, 'Content-Type': 'application/json'},
+    )
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+try:
+    current = vault_request('GET', f'/v1/pki/roles/{ROLE}')
+except Exception as e:
+    print(f'ROLE_READ_FAILED: {e}')
+    sys.exit(0)
+
+data = current.get('data', {})
+existing = data.get('allowed_domains', []) or []
+missing = [d for d in REQUIRED_DOMAINS if d not in existing]
+
+if not missing:
+    print('ALREADY_PRESENT')
+    sys.exit(0)
+
+data['allowed_domains'] = existing + missing
+try:
+    vault_request('POST', f'/v1/pki/roles/{ROLE}', data)
+except Exception as e:
+    print(f'ROLE_WRITE_FAILED: {e}')
+    sys.exit(0)
+
+print(f'ADDED: {missing}')
+"""
+    remote_py = (
+        remote_py
+        .replace('__VAULT_SERVER_FQDN__', VAULT_SERVER_FQDN)
+        .replace('__REQUIRED_DOMAINS_JSON__', json.dumps(list(VAULT_HOLODECK_REQUIRED_DOMAINS)))
+        .replace('__VAULT_TOKEN__', password)
+    )
+    script_b64 = base64.b64encode(remote_py.encode()).decode()
+    remote_cmd = (
+        f"echo {script_b64} | base64 -d > /tmp/fix_vault_holodeck_role.py && "
+        f"python3 /tmp/fix_vault_holodeck_role.py; rm -f /tmp/fix_vault_holodeck_role.py"
+    )
+
+    try:
+        result = lsf.ssh(remote_cmd, VKS_KUBECTL_HOST, password)
+        out_text = (getattr(result, 'stdout', '') or '').strip()
+        lsf.write_output(f'  holodeck role allowed_domains result: {out_text or "(no output)"}')
+        if 'FAILED' in out_text:
+            lsf.write_output('  WARNING: holodeck role allowed_domains may still need manual attention')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: holodeck role allowed_domains check failed: {e}')
+
+
 # Namespace name has a random per-pod suffix (e.g. svc-harbor-s8b1s) --
 # discovered at runtime in ensure_harbor_healthy() rather than hardcoded.
 HARBOR_NAMESPACE_PREFIX = 'svc-harbor-'
@@ -3475,6 +3709,21 @@ def main():
         # this guards against.
         with track_step(lsf, _telemetry_results, 'workload_cluster_ako_health'):
             ensure_workload_cluster_ako_healthy(lsf)
+
+        # cert-manager vault-issuer CA trust (Supervisor namespace
+        # VKS_SUPERVISOR_NS) -- see fix_vault_issuer_ca_trust()'s docstring
+        # for the 2026-08-23 x509-unknown-authority incident this guards
+        # against. Independent of everything else here; run alongside the
+        # other Supervisor/VKS-namespace checks above.
+        with track_step(lsf, _telemetry_results, 'vault_issuer_ca_trust'):
+            fix_vault_issuer_ca_trust(lsf)
+
+        # Vault pki/roles/holodeck allowed_domains -- see
+        # ensure_vault_holodeck_role_domains()'s docstring. Run right after
+        # the CA trust fix above since both gate the same vault-issuer /
+        # pki/sign/holodeck cert-issuance path.
+        with track_step(lsf, _telemetry_results, 'vault_holodeck_role_domains'):
+            ensure_vault_holodeck_role_domains(lsf)
 
         # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
         # page-load hang). Independent of everything else here; see
