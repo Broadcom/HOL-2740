@@ -1773,6 +1773,193 @@ def ensure_workload_cluster_ako_healthy(lsf, timeout_seconds=180, poll_interval=
             lsf.write_output(f'  WARNING: could not check/repair AKO health in {context}: {e}')
 
 
+# Namespace name has a random per-pod suffix (e.g. svc-harbor-s8b1s) --
+# discovered at runtime in ensure_harbor_healthy() rather than hardcoded.
+HARBOR_NAMESPACE_PREFIX = 'svc-harbor-'
+# Harbor is a wld01-a Supervisor Service, fronted by that domain's Avi --
+# reuse the same avi_host already defined for the NSX<->Avi credential work
+# above rather than duplicating it.
+HARBOR_AVI_HOST = NSXT_ALB_DOMAINS[0]['avi_host']
+
+
+def ensure_harbor_healthy(lsf, timeout_seconds=300, poll_interval=15, pending_stuck_seconds=300):
+    """
+    Verify the Harbor Supervisor Service (svc-harbor-<suffix> namespace) is
+    actually serving, and self-remediate the stuck-pod failure mode
+    root-caused live on 2026-08-20 (see the harbor-slow-start-podvm-
+    annotation writeup): the vSphere CSI controller's AttachVolume can't
+    find the "vmware-system-vm-uuid" annotation on a pod, either because
+    spherelet explicitly reports pod status.reason ==
+    "PodVMAnnotationsMissing", or -- the worse variant actually seen on
+    harbor-core -- spherelet gets stuck in a local pod-cache desync (a
+    tight "PodNotFound" retry loop) that never surfaces any reason at all
+    and never self-heals on its own. Both look identical from the pod's own
+    status: it just sits Pending indefinitely. Deleting the pod lets its
+    controller (Deployment/StatefulSet) recreate it fresh, usually landing
+    on a different node than whichever one had the desynced spherelet,
+    which resolved every instance seen so far within seconds.
+
+    This is deliberately more aggressive than
+    ensure_workload_cluster_ako_healthy() above: rather than only touching
+    pods with a *known* fixable waiting reason, any pod still Pending after
+    pending_stuck_seconds gets deleted regardless of reason, since the
+    worst-case variant (harbor-core) never reported one. A pod that's
+    genuinely just slow to schedule/pull on a busy boot could in theory get
+    touched by this before it would have recovered on its own -- accepted
+    tradeoff given the real incident sat stuck for 35+ minutes with zero
+    progress, and Harbor is a hard dependency for at least one lab module.
+
+    Ruled out before writing this as the fix: cluster-wide CPU/memory
+    *reservation* exhaustion (the most common documented root cause for
+    this exact CSI error upstream) was checked live via PowerCLI during the
+    2026-08-20 incident and was nowhere close to exhausted (~17% of CPU
+    reservation used) -- so this function does not attempt any
+    capacity-based diagnosis, only the pod-recreate remediation that was
+    actually confirmed to work.
+
+    Harbor isn't part of every pod build; if no svc-harbor-* namespace is
+    found this is a silent no-op.
+
+    FATAL: unlike most checks in this file, an unrecovered Harbor is treated
+    as a lab-failing condition (lsf.labfail) rather than a warning, since
+    Harbor is a hard dependency for at least one lab module -- callers
+    should expect this function can end the process.
+    """
+    import json
+    import time
+    import datetime
+    import os
+
+    lsf.write_output('Checking Harbor Supervisor Service health...')
+    password = lsf.get_password()
+
+    def _find_namespace():
+        result = lsf.ssh("kubectl --context Supervisor get ns -o name", VKS_KUBECTL_HOST, password)
+        stdout = (getattr(result, 'stdout', '') or '')
+        for line in stdout.splitlines():
+            name = line.strip().split('/')[-1]
+            if name.startswith(HARBOR_NAMESPACE_PREFIX):
+                return name
+        return None
+
+    def _get_pods(namespace):
+        cmd = f"kubectl --context Supervisor -n {namespace} get pods -o json"
+        result = lsf.ssh(cmd, VKS_KUBECTL_HOST, password)
+        stdout = (getattr(result, 'stdout', '') or '').strip()
+        if not stdout:
+            return None
+        return json.loads(stdout).get('items', [])
+
+    def _all_ready(pods):
+        return bool(pods) and all(
+            cs.get('ready')
+            for pod in pods
+            for cs in (pod.get('status', {}).get('containerStatuses', []) or [])
+        )
+
+    def _pod_age_seconds(pod):
+        ts = pod.get('metadata', {}).get('creationTimestamp')
+        if not ts:
+            return 0.0
+        created = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
+
+    try:
+        namespace = _find_namespace()
+        if not namespace:
+            lsf.write_output(f'  No {HARBOR_NAMESPACE_PREFIX}* namespace found -- Harbor not part of this build, skipping')
+            return
+
+        pods = _get_pods(namespace)
+        if pods is None:
+            lsf.write_output(f'  {namespace}: no output listing pods -- Supervisor may be unreachable, skipping')
+            return
+
+        to_delete = []
+        for pod in pods:
+            name = pod.get('metadata', {}).get('name', '<unknown>')
+            status = pod.get('status', {})
+            phase = status.get('phase')
+            reason = status.get('reason')
+            age = _pod_age_seconds(pod)
+
+            if reason == 'PodVMAnnotationsMissing':
+                lsf.write_output(f'  {namespace}/{name}: {reason} ({age:.0f}s old) -- deleting to force recreation')
+                to_delete.append(name)
+            elif phase == 'Pending' and age > pending_stuck_seconds:
+                lsf.write_output(
+                    f'  {namespace}/{name}: stuck Pending for {age:.0f}s (> {pending_stuck_seconds}s threshold) '
+                    f'-- deleting to force recreation'
+                )
+                to_delete.append(name)
+
+        for name in to_delete:
+            lsf.ssh(
+                f"kubectl --context Supervisor -n {namespace} delete pod {name} --wait=false",
+                VKS_KUBECTL_HOST, password,
+            )
+
+        if to_delete:
+            deadline = time.time() + timeout_seconds
+            recovered = False
+            while time.time() < deadline:
+                time.sleep(poll_interval)
+                pods = _get_pods(namespace)
+                if _all_ready(pods):
+                    recovered = True
+                    break
+            if recovered:
+                lsf.write_output(f'  {namespace}: all pods Ready after recreating {to_delete}')
+            else:
+                lsf.labfail(
+                    f'Harbor ({namespace}) still not healthy {timeout_seconds}s after recreating '
+                    f'stuck pod(s) {to_delete}'
+                )
+        elif _all_ready(pods):
+            lsf.write_output(f'  {namespace}: all pods already Ready -- no-op')
+        else:
+            not_ready = [
+                p.get('metadata', {}).get('name')
+                for p in pods
+                if not all(cs.get('ready') for cs in (p.get('status', {}).get('containerStatuses', []) or []))
+            ]
+            lsf.write_output(
+                f'  {namespace}: no pods stuck long enough to touch yet, but not all Ready: {not_ready} '
+                f'-- leaving alone, may still be a normal cold start'
+            )
+
+        # End-to-end verification via Avi, independent of the pod-level view above --
+        # this is what "Harbor is actually up" really means for a student.
+        try:
+            avi_session = _avi_login(os.environ['AVICTRL_PASSWORD'], HARBOR_AVI_HOST)
+            # No server-side name filter here (deliberately) -- fetch the
+            # full inventory and filter client-side, since this file has no
+            # prior confirmed-working use of Avi's search-query syntax for
+            # virtualservice-inventory and this list is small.
+            resp = avi_session.get(f'https://{HARBOR_AVI_HOST}/api/virtualservice-inventory', timeout=15)
+            resp.raise_for_status()
+            results = resp.json().get('results', [])
+            harbor_vs = next(
+                (r for r in results if 'harbor-nginx' in r.get('config', {}).get('name', '')), None
+            )
+            if not harbor_vs:
+                lsf.write_output('  WARNING: no Avi Virtual Service matching *harbor-nginx* found to verify')
+            else:
+                vs_name = harbor_vs['config']['name']
+                vs_state = harbor_vs.get('runtime', {}).get('oper_status', {}).get('state')
+                if vs_state == 'OPER_UP':
+                    lsf.write_output(f'  Avi VS {vs_name}: OPER_UP -- Harbor confirmed reachable')
+                else:
+                    lsf.labfail(
+                        f'Harbor Avi VS {vs_name} is {vs_state}, not OPER_UP, even after pod-level remediation'
+                    )
+        except Exception as e:
+            lsf.write_output(f'  WARNING: could not verify Harbor via Avi API: {e}')
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not check/repair Harbor health: {e}')
+
+
 def resync_nsxt_alb_cloud_connector_credentials(lsf):
     """
     Verify (fast path) that Avi's cloud-connector credential for each NSX
@@ -3467,6 +3654,17 @@ def main():
         # runtime of everything above to converge in the background first.
         # with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
         #     wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
+
+        # Harbor Supervisor Service health + stuck-pod self-remediation --
+        # see ensure_harbor_healthy()'s docstring for the 2026-08-20
+        # incident this guards against. Run last, same reasoning as the VKS
+        # scale-up wait above: Harbor's pods have had the full runtime of
+        # everything else in this function to converge on their own first,
+        # so anything still stuck by now is a real candidate for the
+        # delete-and-recreate remediation rather than a normal cold start.
+        # FATAL unlike most steps here -- see docstring.
+        with track_step(lsf, _telemetry_results, 'harbor_health'):
+            ensure_harbor_healthy(lsf)
 
         # Summarize ~/hol/labstartup.log (the pod's overall boot-time log,
         # not just this script's own output) -- see
