@@ -21,6 +21,7 @@ all:
       api_version: 32.1.1
 
       nsxt_url: nsx-mgmt-a.site-a.vcf.lab
+      vcenter_name: vc-mgmt-a.site-a.vcf.lab
 
       mgmt_network_name: ans-mgmt
       mgmt_network_subnet: 10.1.0.0

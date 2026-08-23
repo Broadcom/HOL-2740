@@ -1,0 +1,147 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /home/holuser/py312venv/bin/python3
+  tasks:
+
+  - name: Install the Antrea interworking configuration
+    kubernetes.core.k8s:
+      state: present
+      definition: "{{ lookup('file', '/hol/hol-2740/avimart_demo/antrea-addonconfig.yaml') | from_yaml }}"
+      context: "Supervisor"
+
+  - name: Change the active kubeconfig context globally on disk
+    ansible.builtin.shell:
+      cmd: kubectl config use-context workload-cluster-1
+
+
+  - name: Run setup script
+    ansible.builtin.shell:
+      cmd: source ./prepare-demo.sh
+      chdir: /hol/hol-2740/avimart_demo/
+      executable: /bin/bash
+    environment:
+      AVI_HOST: 'alb-a.site-a.vcf.lab'
+      NSX_HOST: 'nsx-wld01-a.site-a.vcf.lab'
+      AVI_USER: 'admin'
+      AVI_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      NSX_USER: 'admin'
+      NSX_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+    register: script_output
+
+  - name: Print the script stdout
+    ansible.builtin.debug:
+      var: script_output.stdout_lines
+
+  - name: Deploy the mysql VM
+    kubernetes.core.k8s:
+      state: present
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-vm.yaml.j2') | from_yaml_all | list }}"
+      context: "Supervisor"
+    vars:
+      db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+
+  - name: Query vSphere VMService for external status allocation
+    kubernetes.core.k8s_info:
+      context: "Supervisor"
+      api_version: vmoperator.vmware.com/v1alpha5
+      kind: VirtualMachineService
+      name: "mysql-db"
+      namespace: "acme-east-prod-wrp4h"
+    register: db_vm_svc_info
+    until: "db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+    retries: 30
+    delay: 10
+
+  - name: Store Database Node IP internally
+    ansible.builtin.set_fact:
+      global_db_ip: "{{ db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
+
+  - name: Parse backend template and apply to cluster
+    kubernetes.core.k8s:
+      context: "workload-cluster-1"
+      state: present
+      namespace: default
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
+    vars:
+      db_vm_ip: "{{ hostvars['localhost']['global_db_ip'] }}"
+
+  - name: Wait for Backend LoadBalancer Service to obtain an IP
+    kubernetes.core.k8s_info:
+      context: "workload-cluster-1"
+      api_version: v1
+      kind: Service
+      name: backend-app-service
+      namespace: default
+    register: backend_svc_info
+    until: "backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+    retries: 30
+    delay: 10
+
+  - name: Store Backend Service IP internally
+    ansible.builtin.set_fact:
+      global_backend_ip: "{{ backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
+
+  - name: Parse frontend template and apply to cluster
+    kubernetes.core.k8s:
+      context: "workload-cluster-1"
+      state: present
+      namespace: default
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
+    register: frontend_svc_info
+    until: "backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+    retries: 30
+    delay: 10
+    vars:
+      backend_service_ip: "{{ hostvars['localhost']['global_backend_ip'] }}"
+
+  - name: Store Backend Service IP internally
+    ansible.builtin.set_fact:
+      global_frontend_ip: "{{ frontend_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
+  
+  - name: Authenticate with Technitium DNS
+    ansible.builtin.uri:
+      url: "http://10.1.10.129:5380/api/user/login"
+      method: POST
+      body_format: form-urlencoded
+      body:
+        user: "admin"
+        pass: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+    register: technitium_auth
+    no_log: true # Prevents logging the token/password
+
+  - name: Create or overwrite A Record
+    ansible.builtin.uri:
+      url: "http://10.1.10.129:5380/api/zones/records/add"
+      method: POST
+      body_format: form-urlencoded
+      body:
+        token: "{{ technitium_auth.json.token }}"
+        domain: "3tierapp.site-a.vcf.lab"
+        zone: "site-a.vcf.lab"
+        type: "A"
+        ipAddress: "{{ global_frontend_ip }}" # The IP you grabbed from your kubectl task
+        ttl: "3600"
+        overwrite: "true"
+    # Optional: URI module will always report 'changed' on a successful POST. 
+    # You can suppress that if you want strict visual idempotency in your playbook output.
+    changed_when: false
+
+  - name: Create or overwrite A Record
+    ansible.builtin.uri:
+      url: "http://10.1.10.129:5380/api/zones/records/add"
+      method: POST
+      body_format: form-urlencoded
+      body:
+        token: "{{ technitium_auth.json.token }}"
+        domain: "3tierapp-db.site-a.vcf.lab"
+        zone: "site-a.vcf.lab"
+        type: "A"
+        ipAddress: "{{ global_db_ip }}" # The IP you grabbed from your kubectl task
+        ttl: "3600"
+        overwrite: "true"
+    # Optional: URI module will always report 'changed' on a successful POST. 
+    # You can suppress that if you want strict visual idempotency in your playbook output.
+    changed_when: false

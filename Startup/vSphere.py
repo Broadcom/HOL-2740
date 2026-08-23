@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+# vSphere.py - HOLFY27 Core vSphere Startup Module
+# Version 3.7 - 2026-08-20
+# Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
+# vSphere infrastructure startup sequence
+#
+# v3.7 Changes (2026-08-20):
+# - CUSTOM section: added the workload-domain and mgmt-domain avi_config_*.yml
+#   ansible-playbook steps here, moved from Startup/VCF.py's CUSTOM section
+#   (which had them only briefly - see VCF.py's v3.13/v3.14 changelog). VCF.py
+#   powers vCenter VMs on but returns without confirming vCenter's API/UI is
+#   actually up; this module's own TASK 6 (Verify vCenter UI Ready) and TASK 7
+#   (autostart services) block on exactly that. Running the avi-config
+#   playbooks from VCF.py's tail meant they -- and the Avi cloud connector
+#   they configure -- could hit vCenter before it was really ready, leaving
+#   the Avi cloud stuck not going Ready. Placed at the tail of this module's
+#   CUSTOM section instead, after TASK 6/6b/7 have already confirmed vCenter
+#   is genuinely reachable.
+#
+# CHANGELOG:
+# v3.6 - 2026-08-18:
+#   - TASK 4: Added conditional DRS and HA enforcement when dsm.* VMs are active
+#     in config.ini. Automatically sets Fully Automated DRS and enables vSphere HA
+#     on Site A Workload (cluster-wld01-01a) and Site B clusters, while maintaining
+#     standard Partial DRS on Site A Management cluster (cluster-mgmt-01a).
+# v3.5 - 2026-08-18:
+#   - TASK 5: Added pre-flight QueryOptions check before calling UpdateOptions for
+#     UserVars.SuppressShellWarning on ESXi hosts. Skips call if already set to 1,
+#     preventing NotEnoughLicenses faults and 50-second retry delays during early
+#     vCenter License Service startup.
+# v3.4 - 2026-08-06:
+#   - TASK 4: Fixed inverted DRS_CONSERVATIVE_VMOTION_RATE. Empirically
+#     confirmed via live DevPod test that vim.cluster.DrsConfigInfo.vmotionRate
+#     is inverted from the vSphere Client UI slider: API value 1 (what v3.3
+#     used, intending "leftmost/Conservative") actually rendered as slider
+#     position 5 ("Aggressive - More Frequent vMotions") in the UI. Changed
+#     to 5, which is the API value that renders as the leftmost/Conservative
+#     position.
+# v3.3 - 2026-08-06:
+#   - TASK 4: Clusters not flagged ":on" in [RESOURCES] Clusters (including
+#     the shipped ":off" default) now get Partially Automated DRS with the
+#     migration threshold slider set to its most conservative position,
+#     instead of being left completely unmanaged. ":on" is unchanged
+#     (Fully Automated) and always supersedes this new default. Keeps DRS
+#     from fighting the VM/host placement policy enforced in
+#     Startup/VCFfinal.py Task 4.
+# v3.2 - 2026-03-05:
+#   - TASK 5: Added retry logic for SuppressShellWarning when vCenter License
+#     Service is not yet available during cold boot (NotEnoughLicenses fault).
+# v3.1 - 2026-03-03:
+#   - Added TASK 6b: Ensure SSH and bash shell are enabled on vCenters via
+#     REST API before checking autostart services. This handles fresh lab
+#     environments where confighol-9.1.py has not yet been run.
+# v3.0 - 2026-01:
+#   - Initial HOLFY27 release
+
+import os
+import sys
+import argparse
+import logging
+import subprocess
+
+# Add hol directory to path
+sys.path.insert(0, '/home/holuser/hol')
+
+# Default logging level
+logging.basicConfig(
+    level=logging.WARNING,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+#==============================================================================
+# MODULE CONFIGURATION
+#==============================================================================
+
+MODULE_NAME = 'vSphere'
+MODULE_DESCRIPTION = 'vSphere infrastructure startup'
+
+#==============================================================================
+# CLUSTER CLASSIFICATION HELPERS
+#==============================================================================
+
+def is_site_a_mgmt_cluster(name):
+    """Return True if cluster is Site A Management cluster (e.g. cluster-mgmt-01a)."""
+    c = name.lower().strip()
+    return c in ('cluster-mgmt-01a', 'cluster-mgmt-a') or (c.startswith('cluster-mgmt') and (c.endswith('a') or 'site-a' in c))
+
+def is_site_a_wld_cluster(name):
+    """Return True if cluster is Site A Workload cluster (e.g. cluster-wld01-01a)."""
+    c = name.lower().strip()
+    return 'wld' in c and (c.endswith('a') or 'site-a' in c)
+
+def is_site_b_cluster(name):
+    """Return True if cluster is a Site B cluster (ends in 'b', or contains 'regionb'/'site-b')."""
+    c = name.lower().strip()
+    return c.endswith('b') or 'regionb' in c or 'site-b' in c
+
+#==============================================================================
+# MAIN FUNCTION
+#==============================================================================
+
+def main(lsf=None, standalone=False, dry_run=False):
+    """
+    Main entry point for vSphere module
+    
+    :param lsf: lsfunctions module (will be imported if None)
+    :param standalone: Whether running in standalone test mode
+    :param dry_run: Whether to skip actual changes
+    """
+    from pyVim import connect
+    from pyVmomi import vim, vmodl
+    
+    if lsf is None:
+        import lsfunctions as lsf
+        if not standalone:
+            lsf.init(router=False)
+    
+    ##=========================================================================
+    ## Core Team code - do not modify - place custom code in the CUSTOM section
+    ##=========================================================================
+    
+    lsf.write_output(f'Starting {MODULE_NAME}: {MODULE_DESCRIPTION}')
+    
+    # Update status dashboard
+    try:
+        sys.path.insert(0, '/home/holuser/hol/Tools')
+        from status_dashboard import StatusDashboard, TaskStatus
+        dashboard = StatusDashboard(lsf.lab_sku)
+        dashboard.update_task('vsphere', 'vcenter_connect', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    except Exception:
+        dashboard = None
+    
+    #==========================================================================
+    # TASK 1: Connect to vCenters
+    #==========================================================================
+    
+    # Maximum time to wait for vCenter to become available (10 minutes)
+    VCENTER_WAIT_TIMEOUT = 600  # seconds
+    VCENTER_CHECK_INTERVAL = 20  # seconds between checks
+    
+    # Use get_config_list to properly filter commented-out values
+    vcenters = lsf.get_config_list('RESOURCES', 'vCenters')
+    
+    if not vcenters:
+        lsf.write_output('No vCenters configured - skipping vSphere startup')
+        if dashboard:
+            dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.SKIPPED, 'No vCenters configured')
+            dashboard.generate_html()
+        return
+    
+    # Update dashboard - waiting for vCenter
+    if dashboard:
+        dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    lsf.write_vpodprogress('Connecting vCenters', 'GOOD-3')
+    
+    if not dry_run:
+        import time
+        import requests
+        import urllib3
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Wait for each vCenter to become available in parallel before attempting connection
+        def _wait_for_vcenter_single(entry):
+            if not entry:
+                return True
+            vc_hostname = entry.split(':')[0].strip()
+            lsf.write_output(f'Waiting for vCenter {vc_hostname} to become available (max {VCENTER_WAIT_TIMEOUT // 60} minutes)...')
+            
+            start_wait = time.time()
+            vcenter_available = False
+            
+            while (time.time() - start_wait) < VCENTER_WAIT_TIMEOUT:
+                # Check if vCenter port 443 is responding
+                if lsf.test_tcp_port(vc_hostname, 443, timeout=10):
+                    # Verify vCenter vpxd service is responding
+                    try:
+                        session = requests.Session()
+                        session.trust_env = False  # Ignore proxy environment vars
+                        
+                        # Check REST API endpoint
+                        api_url = f'https://{vc_hostname}/api'
+                        api_response = None
+                        try:
+                            api_response = session.get(api_url, verify=False, timeout=10, proxies=None)
+                        except requests.exceptions.RequestException as e:
+                            lsf.write_output(f'  API endpoint check failed ({vc_hostname}): {e}')
+                        
+                        # Check UI endpoint
+                        ui_url = f'https://{vc_hostname}/ui/'
+                        ui_response = None
+                        try:
+                            ui_response = session.get(ui_url, verify=False, timeout=10, proxies=None)
+                        except requests.exceptions.RequestException as e:
+                            lsf.write_output(f'  UI endpoint check failed ({vc_hostname}): {e}')
+                        
+                        api_ok = api_response and api_response.status_code in [200, 401, 403, 405]
+                        ui_ok = ui_response and ui_response.status_code == 200
+
+                        # Perform VIM API (pyVmomi) probe to confirm vpxd is ready
+                        parts = entry.split(':')
+                        vc_user = parts[2].strip() if len(parts) >= 3 else 'administrator@vsphere.local'
+                        vc_pwd = lsf.get_password()
+                        vim_ok = False
+                        if api_ok or ui_ok:
+                            try:
+                                from pyVim import connect as _pyvim_conn
+                                try:
+                                    _probe_si = _pyvim_conn.SmartConnectNoSSL(host=vc_hostname, user=vc_user, pwd=vc_pwd, port=443)
+                                except AttributeError:
+                                    _probe_si = _pyvim_conn.SmartConnect(host=vc_hostname, user=vc_user, pwd=vc_pwd, port=443, disableSslCertValidation=True)
+                                if _probe_si:
+                                    vim_ok = True
+                                    _pyvim_conn.Disconnect(_probe_si)
+                            except Exception:
+                                vim_ok = False
+                        
+                        if vim_ok or api_ok:
+                            vcenter_available = True
+                            elapsed = int(time.time() - start_wait)
+                            det_type = 'VIM API (vpxd)' if vim_ok else 'REST API'
+                            lsf.write_output(f'vCenter {vc_hostname} is available after {elapsed} seconds (detected via {det_type})')
+                            return True
+                        else:
+                            api_status = api_response.status_code if api_response else 'no response'
+                            ui_status = ui_response.status_code if ui_response else 'no response'
+                            lsf.write_output(f'  Endpoint status ({vc_hostname}) - API: {api_status} (vpxd starting), UI: {ui_status}')
+                    except Exception as e:
+                        lsf.write_output(f'  vCenter {vc_hostname} check error: {e}')
+                
+                elapsed = int(time.time() - start_wait)
+                remaining = VCENTER_WAIT_TIMEOUT - elapsed
+                lsf.write_output(f'vCenter {vc_hostname} not ready yet, waiting... ({remaining}s remaining)')
+                time.sleep(VCENTER_CHECK_INTERVAL)
+            
+            if not vcenter_available:
+                lsf.labfail(f'vCenter {vc_hostname} did not become available within {VCENTER_WAIT_TIMEOUT // 60} minutes')
+            return False
+
+        with ThreadPoolExecutor(max_workers=max(1, len([v for v in vcenters if v]))) as executor:
+            futures = [executor.submit(_wait_for_vcenter_single, entry) for entry in vcenters if entry]
+            for future in as_completed(futures):
+                future.result()
+        
+        # Now connect to all vCenters
+        lsf.connect_vcenters(vcenters)
+    else:
+        lsf.write_output(f'Would connect to vCenters: {vcenters}')
+    
+    if dashboard:
+        vc_count = len(vcenters)  # Already filtered by get_config_list
+        dashboard.update_task('vsphere', 'vcenter_wait', TaskStatus.COMPLETE,
+                              total=vc_count, success=vc_count, failed=0)
+        dashboard.update_task('vsphere', 'vcenter_connect', TaskStatus.COMPLETE,
+                              total=vc_count, success=len(lsf.sis) if not dry_run else vc_count, failed=0)
+        dashboard.update_task('vsphere', 'datastores', TaskStatus.RUNNING)
+    
+    #==========================================================================
+    # TASK 2: Check Datastores
+    #==========================================================================
+    
+    # Use get_config_list to properly filter commented-out values
+    datastores = lsf.get_config_list('RESOURCES', 'Datastores')
+    
+    if datastores:
+        lsf.write_vpodprogress('Checking Datastores', 'GOOD-3')
+        lsf.write_output('Checking Datastores')
+        
+        for entry in datastores:
+            if dry_run:
+                lsf.write_output(f'Would check datastore: {entry}')
+                continue
+            
+            while True:
+                try:
+                    if lsf.check_datastore(entry):
+                        break
+                except Exception as e:
+                    lsf.write_output(f'Datastore check error: {e}')
+                lsf.labstartup_sleep(lsf.sleep_seconds)
+    
+    if dashboard:
+        if datastores:
+            dashboard.update_task('vsphere', 'datastores', TaskStatus.COMPLETE,
+                                  total=len(datastores), success=len(datastores), failed=0)
+        else:
+            dashboard.update_task('vsphere', 'datastores', TaskStatus.SKIPPED,
+                                  'No datastores configured',
+                                  total=0, success=0, failed=0, skipped=0)
+        dashboard.update_task('vsphere', 'maintenance', TaskStatus.RUNNING)
+    
+    #==========================================================================
+    # TASK 3: ESXi Hosts Exit Maintenance Mode
+    #==========================================================================
+    
+    # Parse ESXi hosts to determine which should stay in maintenance mode
+    # Use get_config_list to properly filter commented-out values
+    esx_hosts = lsf.get_config_list('RESOURCES', 'ESXiHosts')
+    
+    # Build list of hosts to keep in maintenance mode
+    for entry in esx_hosts:
+        if ':' in entry:
+            parts = entry.split(':')
+            host = parts[0].strip()
+            mm_flag = parts[1].strip().lower() if len(parts) > 1 else 'no'
+            if mm_flag == 'yes':
+                lsf.mm += f'{host}:'
+    
+    if not dry_run:
+        while not lsf.check_maintenance():
+            lsf.write_vpodprogress('Exit Maintenance', 'GOOD-3')
+            lsf.write_output('Taking ESXi hosts out of Maintenance Mode...')
+            lsf.exit_maintenance()
+            lsf.labstartup_sleep(lsf.sleep_seconds)
+        
+        lsf.write_output('All ESXi hosts are out of Maintenance Mode')
+    
+    if dashboard:
+        host_count = len(esx_hosts) if esx_hosts else len(lsf.get_all_hosts()) if not dry_run else 0
+        dashboard.update_task('vsphere', 'maintenance', TaskStatus.COMPLETE,
+                              total=host_count, success=host_count, failed=0)
+        dashboard.update_task('vsphere', 'drs', TaskStatus.RUNNING)
+    
+    #==========================================================================
+    # TASK 4: Configure DRS on Specified Clusters
+    #
+    # Clusters explicitly flagged ":on" in [RESOURCES] Clusters get Fully
+    # Automated DRS - this is an explicit per-lab operator override and
+    # always wins. Clusters flagged ":off" (or with no flag - the shipped
+    # config.ini default) get a new conservative default instead of being
+    # left completely unmanaged: Partially Automated with the migration
+    # threshold slider at its most conservative (leftmost) position. This
+    # keeps DRS from fighting the explicit VM/host placement policy enforced
+    # later in Startup/VCFfinal.py Task 4 (VCF Automation + vCenter
+    # co-location, VSP anti-affinity, 32-vCPU-per-host cap).
+    #
+    # CONDITIONAL ENFORCEMENT FOR dsm.* VMs:
+    # When active dsm.* VMs exist in [RESOURCES] VMs, automatically force
+    # Fully Automated DRS AND vSphere HA (admission control disabled) on Site A
+    # Workload (cluster-wld01-01a) and Site B clusters, while maintaining standard
+    # Partially Automated DRS on Site A Management cluster (cluster-mgmt-01a).
+    #==========================================================================
+
+    # Check if active (uncommented) dsm.* VMs exist in [RESOURCES] VMs
+    vm_entries = lsf.get_config_list('RESOURCES', 'VMs')
+    has_dsm_vms = any(entry.split(':')[0].strip().lower().startswith('dsm') for entry in vm_entries)
+
+    # Use get_config_list to properly filter commented-out values
+    clusters = lsf.get_config_list('RESOURCES', 'Clusters')
+
+    fully_automated_clusters = []
+    conservative_clusters = []
+    for entry in clusters:
+        if ':' in entry:
+            parts = entry.split(':')
+            cluster_name = parts[0].strip()
+            drs_flag = parts[1].strip().lower() if len(parts) > 1 else 'off'
+        else:
+            cluster_name = entry.strip()
+            drs_flag = 'off'
+        if not cluster_name:
+            continue
+        if drs_flag == 'on':
+            fully_automated_clusters.append(cluster_name)
+        else:
+            conservative_clusters.append(cluster_name)
+
+    drs_clusters = fully_automated_clusters + conservative_clusters
+    # vim.cluster.DrsConfigInfo.vmotionRate is INVERTED relative to the vSphere
+    # Client UI slider: API value 5 renders as the leftmost/"Conservative" (less
+    # frequent vMotions) position, and API value 1 renders as rightmost/
+    # "Aggressive". Confirmed empirically 2026-08-06: setting vmotionRate=1
+    # produced a live UI slider reading "Aggressive (More Frequent vMotions)"
+    # at position 5. Use 5 here to get the actual leftmost/Conservative UI position.
+    DRS_CONSERVATIVE_VMOTION_RATE = 5  # leftmost/most-conservative migration threshold (UI), inverted API value
+
+    if has_dsm_vms:
+        lsf.write_output('dsm.* VMs detected in config.ini — applying conditional DRS and vSphere HA enforcement')
+        target_clusters = {}
+        if not dry_run and hasattr(lsf, 'sis') and lsf.sis:
+            for si in lsf.sis:
+                try:
+                    container = si.content.viewManager.CreateContainerView(si.content.rootFolder, [vim.ClusterComputeResource], True)
+                    for c in container.view:
+                        target_clusters[c.name] = c
+                    container.Destroy()
+                except Exception:
+                    pass
+
+        # Ensure any explicitly configured cluster names are included
+        for c_name in drs_clusters:
+            if c_name not in target_clusters:
+                target_clusters[c_name] = lsf.get_cluster(c_name) if not dry_run else None
+
+        if dry_run:
+            for c_name in target_clusters.keys():
+                if is_site_a_wld_cluster(c_name) or is_site_b_cluster(c_name):
+                    lsf.write_output(f'Would configure Fully Automated DRS and enable vSphere HA on {c_name} (dsm.* VMs active)')
+                elif is_site_a_mgmt_cluster(c_name):
+                    lsf.write_output(f'Would configure Partially Automated DRS on Site A Mgmt cluster {c_name} (skipping HA, dsm.* VMs active)')
+                else:
+                    lsf.write_output(f'Would configure standard DRS settings on cluster {c_name}')
+        else:
+            from pyVim.task import WaitForTask
+            for c_name, cluster in target_clusters.items():
+                if not cluster:
+                    lsf.write_output(f'Could not find cluster {c_name} to configure DRS/HA')
+                    continue
+
+                if is_site_a_wld_cluster(c_name) or is_site_b_cluster(c_name):
+                    # Force Fully Automated DRS AND vSphere HA (admissionControlEnabled = False)
+                    drs_current = getattr(cluster.configuration, 'drsConfig', None)
+                    das_current = getattr(cluster.configuration, 'dasConfig', None)
+
+                    drs_need_update = not drs_current or not drs_current.enabled or drs_current.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated
+                    das_need_update = not das_current or not das_current.enabled or das_current.admissionControlEnabled
+
+                    if drs_need_update or das_need_update:
+                        lsf.write_output(f'Configuring Fully Automated DRS and vSphere HA on {cluster.name}...')
+                        try:
+                            spec = vim.cluster.ConfigSpecEx()
+                            drs_spec = vim.cluster.DrsConfigInfo()
+                            drs_spec.enabled = True
+                            drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated
+                            spec.drsConfig = drs_spec
+
+                            das_spec = vim.cluster.DasConfigInfo()
+                            das_spec.enabled = True
+                            das_spec.admissionControlEnabled = False
+                            spec.dasConfig = das_spec
+
+                            task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                            WaitForTask(task)
+                            lsf.write_output(f'Successfully configured Fully Automated DRS and vSphere HA on {cluster.name}')
+                        except Exception as e:
+                            lsf.write_output(f'Failed to configure DRS/HA on {cluster.name}: {str(e)}')
+                    else:
+                        lsf.write_output(f'DRS (Fully Automated) and vSphere HA are already configured on {cluster.name}')
+
+                elif is_site_a_mgmt_cluster(c_name):
+                    # EXCLUDED from dsm HA - apply standard Partially Automated DRS
+                    drs_current = getattr(cluster.configuration, 'drsConfig', None)
+                    if (not drs_current
+                            or not drs_current.enabled
+                            or drs_current.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                            or drs_current.vmotionRate != DRS_CONSERVATIVE_VMOTION_RATE):
+                        lsf.write_output(f'Setting Partially Automated DRS (conservative threshold) on Site A Mgmt cluster {cluster.name}...')
+                        try:
+                            spec = vim.cluster.ConfigSpecEx()
+                            drs_spec = vim.cluster.DrsConfigInfo()
+                            drs_spec.enabled = True
+                            drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                            drs_spec.vmotionRate = DRS_CONSERVATIVE_VMOTION_RATE
+                            spec.drsConfig = drs_spec
+
+                            task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                            WaitForTask(task)
+                            lsf.write_output(f'Successfully set Partially Automated DRS on Site A Mgmt cluster {cluster.name}')
+                        except Exception as e:
+                            lsf.write_output(f'Failed to configure DRS on {cluster.name}: {str(e)}')
+                    else:
+                        lsf.write_output(f'DRS is already Partially Automated/conservative on Site A Mgmt cluster {cluster.name}')
+                else:
+                    lsf.write_output(f'Maintaining standard DRS settings on cluster {cluster.name}')
+
+        lsf.write_output('DRS and HA configuration complete for dsm.* environment')
+
+    elif drs_clusters and not dry_run:
+        from pyVim.task import WaitForTask
+        for cluster_name in fully_automated_clusters:
+            cluster = lsf.get_cluster(cluster_name)
+            if cluster:
+                if not cluster.configuration.drsConfig.enabled or cluster.configuration.drsConfig.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated:
+                    lsf.write_output(f'Enabling fully automated DRS on {cluster.name}...')
+                    try:
+                        spec = vim.cluster.ConfigSpecEx()
+                        drs_spec = vim.cluster.DrsConfigInfo()
+                        drs_spec.enabled = True
+                        drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.fullyAutomated
+                        spec.drsConfig = drs_spec
+
+                        task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                        WaitForTask(task)
+                        lsf.write_output(f'Successfully enabled fully automated DRS on {cluster.name}')
+                    except Exception as e:
+                        lsf.write_output(f'Failed to configure DRS on {cluster.name}: {str(e)}')
+                else:
+                    lsf.write_output(f'DRS is already fully automated on {cluster.name}')
+            else:
+                lsf.write_output(f'Could not find cluster {cluster_name} to configure DRS')
+
+        for cluster_name in conservative_clusters:
+            cluster = lsf.get_cluster(cluster_name)
+            if cluster:
+                current = cluster.configuration.drsConfig
+                if (not current.enabled
+                        or current.defaultVmBehavior != vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                        or current.vmotionRate != DRS_CONSERVATIVE_VMOTION_RATE):
+                    lsf.write_output(f'Setting Partially Automated DRS (conservative migration threshold) on {cluster.name}...')
+                    try:
+                        spec = vim.cluster.ConfigSpecEx()
+                        drs_spec = vim.cluster.DrsConfigInfo()
+                        drs_spec.enabled = True
+                        drs_spec.defaultVmBehavior = vim.cluster.DrsConfigInfo.DrsBehavior.partiallyAutomated
+                        drs_spec.vmotionRate = DRS_CONSERVATIVE_VMOTION_RATE
+                        spec.drsConfig = drs_spec
+
+                        task = cluster.ReconfigureComputeResource_Task(spec=spec, modify=True)
+                        WaitForTask(task)
+                        lsf.write_output(f'Successfully set Partially Automated/conservative DRS on {cluster.name}')
+                    except Exception as e:
+                        lsf.write_output(f'Failed to configure DRS on {cluster.name}: {str(e)}')
+                else:
+                    lsf.write_output(f'DRS is already Partially Automated/conservative on {cluster.name}')
+            else:
+                lsf.write_output(f'Could not find cluster {cluster_name} to configure DRS')
+
+        lsf.write_output('DRS is configured on all required clusters')
+    
+    if dashboard:
+        if drs_clusters:
+            dashboard.update_task('vsphere', 'drs', TaskStatus.COMPLETE,
+                                  total=len(drs_clusters), success=len(drs_clusters), failed=0)
+        else:
+            dashboard.update_task('vsphere', 'drs', TaskStatus.SKIPPED,
+                                  'No DRS clusters configured',
+                                  total=0, success=0, failed=0, skipped=0)
+        dashboard.update_task('vsphere', 'shell_warning', TaskStatus.RUNNING)
+    
+    #==========================================================================
+    # TASK 5: Suppress Shell Warning on ESXi Hosts
+    #==========================================================================
+    
+    shell_warning_count = 0
+    shell_warning_failed = 0
+    SHELL_WARN_MAX_RETRIES = 5
+    SHELL_WARN_RETRY_DELAY = 10  # seconds
+    if not dry_run:
+        import time as _time_shell
+        esxhosts = lsf.get_all_hosts()
+        for host in esxhosts:
+            option_manager = host.configManager.advancedOption
+            
+            # Pre-flight check: query option first to avoid unnecessary UpdateOptions calls
+            # that trigger NotEnoughLicenses retries when License Service is initializing.
+            already_suppressed = False
+            try:
+                cur_opts = option_manager.QueryOptions(name='UserVars.SuppressShellWarning')
+                if cur_opts:
+                    for opt in cur_opts:
+                        if opt.key == 'UserVars.SuppressShellWarning' and str(opt.value) == '1':
+                            already_suppressed = True
+                            break
+            except Exception:
+                pass
+
+            if already_suppressed:
+                lsf.write_output(f'Shell warning already suppressed on {host.name}')
+                shell_warning_count += 1
+                continue
+
+            option = vim.option.OptionValue(
+                key='UserVars.SuppressShellWarning',
+                value=1
+            )
+            succeeded = False
+            for attempt in range(1, SHELL_WARN_MAX_RETRIES + 1):
+                try:
+                    lsf.write_output(f'Suppressing shell warning on {host.name}')
+                    option_manager.UpdateOptions(changedValue=[option])
+                    shell_warning_count += 1
+                    succeeded = True
+                    break
+                except vmodl.fault.NotEnoughLicenses:
+                    if attempt < SHELL_WARN_MAX_RETRIES:
+                        lsf.write_output(
+                            f'  License Service not yet available for {host.name}, '
+                            f'retrying in {SHELL_WARN_RETRY_DELAY}s ({attempt}/{SHELL_WARN_MAX_RETRIES})...'
+                        )
+                        _time_shell.sleep(SHELL_WARN_RETRY_DELAY)
+                    else:
+                        lsf.write_output(f'Could not suppress shell warning on {host.name}: License Service unavailable after {SHELL_WARN_MAX_RETRIES} retries')
+                except Exception as e:
+                    lsf.write_output(f'Could not suppress shell warning on {host.name}: {e}')
+                    break
+            if not succeeded:
+                shell_warning_failed += 1
+    
+    if dashboard:
+        total_shell = shell_warning_count + shell_warning_failed
+        if total_shell > 0:
+            dashboard.update_task('vsphere', 'shell_warning', TaskStatus.COMPLETE,
+                                  total=total_shell, success=shell_warning_count, failed=shell_warning_failed)
+        else:
+            dashboard.update_task('vsphere', 'shell_warning', TaskStatus.SKIPPED,
+                                  'No hosts to configure',
+                                  total=0, success=0, failed=0, skipped=0)
+        dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.RUNNING)
+    
+    #==========================================================================
+    # TASK 6: Verify vCenter UI Ready
+    #==========================================================================
+    
+    if not dry_run:
+        lsf.write_vpodprogress('Checking vCenter', 'GOOD-3')
+        lsf.write_output('Checking vCenter readiness...')
+        
+        def _check_ui_ready(url):
+            while not lsf.test_url(url, expected_text='loading-container', timeout=5):
+                lsf.write_output(f'Waiting for vCenter UI: {url}')
+                lsf.labstartup_sleep(lsf.sleep_seconds)
+
+        vc_urls = []
+        for entry in vcenters:
+            if entry and not entry.strip().startswith('#'):
+                vc = entry.split(':')[0].strip()
+                vc_urls.append(f'https://{vc}/ui/')
+        
+        with ThreadPoolExecutor(max_workers=max(1, len(vc_urls))) as executor:
+            futures = [executor.submit(_check_ui_ready, url) for url in vc_urls]
+            for future in as_completed(futures):
+                future.result()
+    
+    if dashboard:
+        vc_ready_count = len([v for v in vcenters if v and not v.strip().startswith('#')])
+        dashboard.update_task('vsphere', 'vcenter_ready', TaskStatus.COMPLETE,
+                              total=vc_ready_count, success=vc_ready_count, failed=0)
+        dashboard.update_task('vsphere', 'autostart_services', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 6b: Ensure SSH and bash shell are enabled on vCenters
+    # The autostart services check (TASK 7) requires SSH access to each
+    # vCenter. On fresh lab environments that haven't had confighol run,
+    # SSH may be disabled and the root shell may be the VAMI appliance
+    # shell instead of bash. Use the vCenter REST API to enable SSH and
+    # set the shell, then verify SSH connectivity.
+    #==========================================================================
+    
+    if not dry_run:
+        import time as _time_ssh
+        
+        lsf.write_output('Ensuring SSH and bash shell are enabled on vCenters...')
+        
+        for entry in vcenters:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            
+            parts = entry.split(':')
+            vc_hostname = parts[0].strip()
+            vc_user = parts[2].strip() if len(parts) > 2 else 'administrator@vsphere.local'
+            
+            try:
+                session = requests.Session()
+                session.trust_env = False
+                
+                # Get API session token
+                session_resp = session.post(
+                    f'https://{vc_hostname}/api/session',
+                    auth=(vc_user, lsf.password),
+                    verify=False, timeout=15, proxies=None
+                )
+                if session_resp.status_code not in (200, 201):
+                    lsf.write_output(f'  {vc_hostname}: Could not get API session (HTTP {session_resp.status_code}), skipping SSH/shell check')
+                    continue
+                
+                api_token = session_resp.text.strip().strip('"')
+                api_headers = {'vmware-api-session-id': api_token}
+                
+                # Check and enable SSH
+                ssh_resp = session.get(
+                    f'https://{vc_hostname}/api/appliance/access/ssh',
+                    headers=api_headers, verify=False, timeout=15, proxies=None
+                )
+                ssh_enabled = False
+                if ssh_resp.status_code == 200:
+                    ssh_enabled = ssh_resp.json() is True or ssh_resp.json() == True
+                
+                if not ssh_enabled:
+                    lsf.write_output(f'  {vc_hostname}: SSH not enabled - enabling via REST API...')
+                    enable_resp = session.put(
+                        f'https://{vc_hostname}/api/appliance/access/ssh',
+                        headers=api_headers, json=True,
+                        verify=False, timeout=15, proxies=None
+                    )
+                    if enable_resp.status_code in [200, 204]:
+                        lsf.write_output(f'  {vc_hostname}: SSH enabled successfully')
+                    else:
+                        lsf.write_output(f'  {vc_hostname}: WARNING - Failed to enable SSH (HTTP {enable_resp.status_code})')
+                else:
+                    lsf.write_output(f'  {vc_hostname}: SSH already enabled')
+                
+                # Check and enable bash shell
+                shell_resp = session.get(
+                    f'https://{vc_hostname}/api/appliance/access/shell',
+                    headers=api_headers, verify=False, timeout=15, proxies=None
+                )
+                shell_enabled = False
+                if shell_resp.status_code == 200:
+                    shell_data = shell_resp.json()
+                    if isinstance(shell_data, dict):
+                        shell_enabled = shell_data.get('enabled', False)
+                    else:
+                        shell_enabled = shell_data is True or shell_data == True
+                
+                if not shell_enabled:
+                    lsf.write_output(f'  {vc_hostname}: Bash shell not enabled - enabling via REST API...')
+                    shell_enable_resp = session.put(
+                        f'https://{vc_hostname}/api/appliance/access/shell',
+                        headers=api_headers,
+                        json={'enabled': True, 'timeout': 0},
+                        verify=False, timeout=15, proxies=None
+                    )
+                    if shell_enable_resp.status_code in [200, 204]:
+                        lsf.write_output(f'  {vc_hostname}: Bash shell enabled successfully')
+                    else:
+                        lsf.write_output(f'  {vc_hostname}: WARNING - Failed to enable bash shell (HTTP {shell_enable_resp.status_code})')
+                else:
+                    lsf.write_output(f'  {vc_hostname}: Bash shell already enabled')
+                
+                # Also ensure root user has /bin/bash as shell via SSH
+                # (the REST API enables shell access but may not change the login shell)
+                if lsf.test_tcp_port(vc_hostname, 22, timeout=5):
+                    chsh_result = lsf.ssh('chsh -s /bin/bash root 2>/dev/null; echo OK',
+                                          f'root@{vc_hostname}')
+                    if hasattr(chsh_result, 'stdout') and 'OK' in chsh_result.stdout:
+                        lsf.write_output(f'  {vc_hostname}: Root shell set to /bin/bash')
+                    else:
+                        lsf.write_output(f'  {vc_hostname}: Note - chsh not available (shell may already be bash)')
+                
+                # Delete the API session
+                session.delete(f'https://{vc_hostname}/api/session',
+                               headers=api_headers, verify=False, timeout=10, proxies=None)
+                
+            except Exception as e:
+                lsf.write_output(f'  {vc_hostname}: WARNING - SSH/shell enablement check failed: {e}')
+    
+    #==========================================================================
+    # TASK 7: Verify all Autostart vCenter services are Started
+    # Some services configured for AUTOMATIC startup fail to start during
+    # vCenter boot (e.g. vapi-endpoint, trustmanagement). Check each vCenter
+    # and start any AUTOMATIC services that are not in STARTED state.
+    #==========================================================================
+    
+    autostart_total = 0
+    autostart_started = 0
+    autostart_fixed = 0
+    autostart_failed = 0
+    
+    if not dry_run:
+        import time as _time
+        
+        lsf.write_output('Verifying vCenter autostart services...')
+        
+        AUTOSTART_START_TIMEOUT = 60  # seconds to wait for a service to start
+        AUTOSTART_CHECK_INTERVAL = 10  # seconds between status checks
+        
+        for entry in vcenters:
+            if not entry or entry.strip().startswith('#'):
+                continue
+            
+            vc_hostname = entry.split(':')[0].strip()
+            lsf.write_output(f'Checking autostart services on {vc_hostname}...')
+            
+            # Query all AUTOMATIC services and their RunState via vmon-cli
+            # Use run_command with single-quoted SSH command to avoid
+            # double-quote conflicts in the lsf.ssh() wrapper
+            ssh_opts = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+            check_cmd = (
+                f"{lsf.sshpass} -p {lsf.password} ssh {ssh_opts} root@{vc_hostname} "
+                "'for svc in $(vmon-cli --list 2>/dev/null); do "
+                'info=$(vmon-cli -s $svc 2>/dev/null); '
+                'starttype=$(echo "$info" | grep "Starttype:" | head -1 | sed "s/.*Starttype: //"); '
+                'if [ "$starttype" = "AUTOMATIC" ]; then '
+                'state=$(echo "$info" | grep "RunState:" | head -1 | sed "s/.*RunState: //"); '
+                'echo "$svc:$state"; '
+                "fi; done'"
+            )
+            
+            result = lsf.run_command(check_cmd)
+            
+            if not hasattr(result, 'stdout') or not result.stdout:
+                lsf.write_output(f'  WARNING: Could not query services on {vc_hostname}')
+                autostart_failed += 1
+                continue
+            
+            # Parse results: each line is "service_name:STATE"
+            not_started = []
+            vc_service_count = 0
+            
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if ':' not in line:
+                    continue
+                
+                svc_name, svc_state = line.split(':', 1)
+                svc_name = svc_name.strip()
+                svc_state = svc_state.strip()
+                vc_service_count += 1
+                
+                if svc_state == 'STARTED':
+                    autostart_started += 1
+                else:
+                    not_started.append((svc_name, svc_state))
+            
+            autostart_total += vc_service_count
+            
+            if not not_started:
+                lsf.write_output(f'  All {vc_service_count} autostart services on {vc_hostname} are running')
+                continue
+            
+            # Start services that are not running
+            lsf.write_output(f'  Found {len(not_started)} autostart service(s) not started on {vc_hostname}:')
+            for svc_name, svc_state in not_started:
+                lsf.write_output(f'    {svc_name}: {svc_state} - starting...')
+                
+                start_result = lsf.ssh(f'vmon-cli --start {svc_name} 2>&1', f'root@{vc_hostname}')
+                
+                # Wait for service to reach STARTED state
+                started = False
+                wait_start = _time.time()
+                while (_time.time() - wait_start) < AUTOSTART_START_TIMEOUT:
+                    verify_result = lsf.ssh(
+                        f"vmon-cli -s {svc_name} 2>/dev/null | grep 'RunState:' | head -1 | sed 's/.*RunState: //'",
+                        f'root@{vc_hostname}'
+                    )
+                    if hasattr(verify_result, 'stdout') and verify_result.stdout.strip() == 'STARTED':
+                        started = True
+                        break
+                    _time.sleep(AUTOSTART_CHECK_INTERVAL)
+                
+                if started:
+                    lsf.write_output(f'    {svc_name}: Started successfully')
+                    autostart_started += 1
+                    autostart_fixed += 1
+                else:
+                    lsf.write_output(f'    WARNING: {svc_name} did not start within {AUTOSTART_START_TIMEOUT}s')
+                    autostart_failed += 1
+        
+        if autostart_fixed > 0:
+            lsf.write_output(f'Autostart services check complete: {autostart_fixed} service(s) were started')
+        elif autostart_failed > 0:
+            lsf.write_output(f'Autostart services check complete: {autostart_failed} service(s) failed to start')
+        else:
+            lsf.write_output('All autostart services are running on all vCenters')
+    
+    if dashboard:
+        if autostart_total > 0 or dry_run:
+            status = TaskStatus.COMPLETE if autostart_failed == 0 else TaskStatus.FAILED
+            msg = ''
+            if autostart_fixed > 0:
+                msg = f'{autostart_fixed} service(s) required restart'
+            if autostart_failed > 0:
+                msg = f'{autostart_failed} service(s) failed to start'
+            dashboard.update_task('vsphere', 'autostart_services', status,
+                                  msg,
+                                  total=autostart_total, success=autostart_started,
+                                  failed=autostart_failed)
+        else:
+            dashboard.update_task('vsphere', 'autostart_services', TaskStatus.SKIPPED,
+                                  'No vCenters configured')
+        dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    #==========================================================================
+    # TASK 8: Start Nested VMs
+    #==========================================================================
+    
+    # Use get_config_list to properly filter commented-out values
+    vms_to_start = lsf.get_config_list('RESOURCES', 'VMs')
+    
+    if vms_to_start:
+        lsf.write_vpodprogress('Starting VMs', 'GOOD-4')
+        lsf.write_output('Starting nested VMs')
+        
+        if not dry_run:
+            while True:
+                try:
+                    lsf.start_nested(vms_to_start)
+                    break
+                except Exception as e:
+                    lsf.write_output(f'VM startup error: {e}')
+                lsf.labstartup_sleep(lsf.sleep_seconds)
+        
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.COMPLETE,
+                                  total=len(vms_to_start), success=len(vms_to_start), failed=0)
+    else:
+        lsf.write_output('No VMs configured to start')
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vms', TaskStatus.SKIPPED, 
+                                  'No VMs defined in config',
+                                  total=0, success=0, failed=0, skipped=0)
+    
+    #==========================================================================
+    # TASK 9: Start vApps
+    #==========================================================================
+    
+    if dashboard:
+        dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.RUNNING)
+        dashboard.generate_html()
+    
+    # Use get_config_list to properly filter commented-out values
+    vapps = lsf.get_config_list('RESOURCES', 'vApps')
+    
+    if vapps:
+        lsf.write_output('Starting vApps')
+        
+        if not dry_run:
+            while True:
+                try:
+                    lsf.start_nested(vapps)
+                    break
+                except Exception as e:
+                    lsf.write_output(f'vApp startup error: {e}')
+                lsf.labstartup_sleep(lsf.sleep_seconds)
+        
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.COMPLETE,
+                                  total=len(vapps), success=len(vapps), failed=0)
+    else:
+        lsf.write_output('No vApps configured to start')
+        if dashboard:
+            dashboard.update_task('vsphere', 'power_on_vapps', TaskStatus.SKIPPED, 
+                                  'No vApps defined in config',
+                                  total=0, success=0, failed=0, skipped=0)
+    
+    if dashboard:
+        total_nested = len(vms_to_start) + len(vapps)
+        dashboard.update_task('vsphere', 'nested_vms', TaskStatus.COMPLETE,
+                              total=total_nested, success=total_nested, failed=0)
+    
+    #==========================================================================
+    # TASK 10: Clear Host Alarms
+    #==========================================================================
+    
+    if not dry_run:
+        lsf.write_output('Clearing host alarms')
+        try:
+            lsf.clear_host_alarms()
+        except Exception as e:
+            lsf.write_output(f'Could not clear alarms: {e}')
+    
+    #==========================================================================
+    # Cleanup
+    #==========================================================================
+    
+    if not dry_run:
+        lsf.write_output('Disconnecting vCenters...')
+        for si in lsf.sis:
+            try:
+                connect.Disconnect(si)
+            except Exception:
+                pass
+    
+    ##=========================================================================
+    ## End Core Team code
+    ##=========================================================================
+    
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+
+    # Avi configuration playbooks (workload-domain + mgmt-domain
+    # avi_config_*.yml under avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/)
+    # -- run here (2026-08-20), after TASK 6/6b/7 above have already confirmed
+    # vCenter is actually up, rather than from VCF.py's tail (too early --
+    # see this module's v3.7 changelog for why that caused the Avi cloud to
+    # hang not-Ready).
+    lsf.write_output('Running avi configuration playbook - workload domain')
+    try:
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_wld_a.yml",
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_wld_a.yml", "--vault-password-file",
+            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        # Playbook already succeeded at this point - don't let a transient I/O error
+        # while logging its output turn a successful run into a lab failure.
+        try:
+            lsf.write_output(result.stdout)
+        except OSError as log_err:
+            lsf.write_output(f'avi workload-domain configuration succeeded, but logging its output failed: {log_err}')
+    except Exception as e:
+        lsf.write_output(e)
+        try:
+            lsf.write_output(e.stdout)
+            lsf.write_output(e.stderr)
+        except Exception:
+            pass
+        lsf.labfail('vSphere module failed at avi workload-domain configuration step')
+
+    lsf.write_output('Running avi configuration playbook - management domain')
+    try:
+        result = subprocess.run(["/usr/bin/ansible-playbook", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/avi_config_mgmt_a.yml",
+            "-i", "/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/avi_configs/fy27-updates/inv_mgmt_a.yml", "--vault-password-file",
+            "/home/holuser/vaultsecret.txt"], capture_output=True, text=True, check=True)
+        # Playbook already succeeded at this point - don't let a transient I/O error
+        # while logging its output turn a successful run into a lab failure.
+        try:
+            lsf.write_output(result.stdout)
+        except OSError as log_err:
+            lsf.write_output(f'avi management-domain configuration succeeded, but logging its output failed: {log_err}')
+    except Exception as e:
+        lsf.write_output(e)
+        try:
+            lsf.write_output(e.stdout)
+            lsf.write_output(e.stderr)
+        except Exception:
+            pass
+        lsf.labfail('vSphere module failed at avi management-domain configuration step')
+
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
+    
+    lsf.write_output(f'{MODULE_NAME} completed')
+
+
+#==============================================================================
+# STANDALONE EXECUTION
+#==============================================================================
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=MODULE_DESCRIPTION)
+    parser.add_argument('--standalone', action='store_true',
+                        help='Run in standalone test mode')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be done without making changes')
+    parser.add_argument('--skip-init', action='store_true',
+                        help='Skip lsf.init() call')
+    parser.add_argument('run_seconds', nargs='?', type=int, default=0,
+                        help='Seconds already elapsed (for labstartup integration)')
+    parser.add_argument('labcheck', nargs='?', default='False',
+                        help='Whether this is a labcheck run')
+    
+    args = parser.parse_args()
+    
+    import lsfunctions as lsf
+    
+    if not args.skip_init:
+        lsf.init(router=False)
+    
+    # Handle legacy arguments
+    if args.run_seconds > 0:
+        import datetime
+        lsf.start_time = datetime.datetime.now() - datetime.timedelta(seconds=args.run_seconds)
+    
+    if args.labcheck == 'True':
+        lsf.labcheck = True
+    
+    if args.standalone:
+        print(f'Running {MODULE_NAME} in standalone mode')
+        print(f'Lab SKU: {lsf.lab_sku}')
+        print(f'Dry run: {args.dry_run}')
+        print()
+    
+    main(lsf=lsf, standalone=args.standalone, dry_run=args.dry_run)

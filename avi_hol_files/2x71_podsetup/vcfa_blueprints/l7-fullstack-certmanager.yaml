@@ -109,12 +109,16 @@ resources:
                   - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false update
                   - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
                 users:
-                  - name: aviuser
+                  - name: holuser
                     passwd:
                       name: ${env.deploymentName}-bootstrap-secret
-                      key: aviuser-passwd
+                      key: holuser-passwd
                     lock_passwd: false
                     sudo: ALL=(ALL) NOPASSWD:ALL
+                    shell: /bin/bash
+                    ssh_authorized_keys:
+                      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7g2UVzeb551EVgpvy24KlswRL7Nr5cbJm/tuObWuw2HpUZ5HtoFyV3SbRyWWAU+CJDw0OaZVoxOGB5zV8jyKWoVrU4HAB7dABZNXXBreAbat7h9kf03KeJofRO/KFqj47FDJhj2yE3nCArK4aeOiuum4p7t7KL6zFXbXs7DGxeuEtxONLvMDqhyDyyQSJ7VUlA8AnO7mdHtnZ1kfTE/EHH0lj3qxaiZqkNC2onn/d64ctsGcmzgCt9BkgooQNd3c8HMCVs5LIZrc2ZbZvGGOvmApZwNCnKooTFGDawTNflPEV3FNdN6VN3lrR3mhaVKN5N2BS3froY/gY3Tq4a0kd
+
           storageClass: cluster-wld01-01a-optimal-datastore-default-policy-autoraid
   Certificate_1:
     type: CCI.Supervisor.Resource
@@ -167,12 +171,16 @@ resources:
                   - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false update
                   - /usr/bin/apt -o acquire::http::proxy="http://10.1.1.1:3128" -o acquire::https::proxy=false install -y apache2 php php-mysql libapache2-mod-php php-cli php-common php-intl php-gd php-mbstring php-xml php-zip php-curl php-xmlrpc unzip open-vm-tools
                 users:
-                  - name: aviuser
+                  - name: holuser
                     passwd:
                       name: ${env.deploymentName}-bootstrap-secret
-                      key: aviuser-passwd
+                      key: holuser-passwd
                     lock_passwd: false
                     sudo: ALL=(ALL) NOPASSWD:ALL
+                    shell: /bin/bash
+                    ssh_authorized_keys:
+                      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7g2UVzeb551EVgpvy24KlswRL7Nr5cbJm/tuObWuw2HpUZ5HtoFyV3SbRyWWAU+CJDw0OaZVoxOGB5zV8jyKWoVrU4HAB7dABZNXXBreAbat7h9kf03KeJofRO/KFqj47FDJhj2yE3nCArK4aeOiuum4p7t7KL6zFXbXs7DGxeuEtxONLvMDqhyDyyQSJ7VUlA8AnO7mdHtnZ1kfTE/EHH0lj3qxaiZqkNC2onn/d64ctsGcmzgCt9BkgooQNd3c8HMCVs5LIZrc2ZbZvGGOvmApZwNCnKooTFGDawTNflPEV3FNdN6VN3lrR3mhaVKN5N2BS3froY/gY3Tq4a0kd
+                  
           storageClass: cluster-wld01-01a-optimal-datastore-default-policy-autoraid
   Username_Secret:
     type: CCI.Supervisor.Resource
@@ -185,4 +193,4 @@ resources:
           name: ${env.deploymentName}-bootstrap-secret
           namespace: ${resource.CCI_Supervisor_Namespace_1.name}
         stringData:
-          aviuser-passwd: $1$xITZYmhL$wz6xxzHHCnaZBJFkzfXIz0
+          holuser-passwd: $6$yu1umgMUJaYMNUxj$tX2b6SPmkR/N1vOtJctU.wdCs7iPeGOnkGZUeIfY53yMhPy4VfvDiJwcZ.8yjy0eLPnXScVAnjqxyFXiqSkds1

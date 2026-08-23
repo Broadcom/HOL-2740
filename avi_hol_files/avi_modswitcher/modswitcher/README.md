@@ -18,7 +18,16 @@ still need updating.
   without this, GNOME can't match the *running* window back to the pinned
   dock icon (it matches by window class, not by which script launched it),
   and clicking the dock icon appears to open a second, generic, unrelated
-  icon instead of the window merging into the same dock slot.
+  icon instead of the window merging into the same dock slot. The run
+  dialog's output console also explicitly re-scrolls to the bottom after
+  each chunk of output — `QPlainTextEdit.appendPlainText()` only follows
+  new text if the scrollbar happens to already be exactly at the bottom at
+  that instant, which flakes under bursty output (like verbose
+  `ansible-playbook -v` output). The fix only snaps to the bottom if the
+  view was already there before the append, so manually scrolling up to
+  re-read earlier output during a run doesn't get fought — new output
+  won't yank you back down until you scroll to the bottom yourself again
+  (standard `tail -f`-style behavior).
 - **`manifest.yaml`** — all configuration: which SKUs exist, which modules
   each one has, and where each module's playbook lives. Edit this file to
   add/remove/reorder SKUs and modules — no code changes needed.
