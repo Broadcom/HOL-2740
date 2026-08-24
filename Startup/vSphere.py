@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 # vSphere.py - HOLFY27 Core vSphere Startup Module
-# Version 3.8 - 2026-08-24
+# Version 3.9 - 2026-08-24
 # Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # vSphere infrastructure startup sequence
+#
+# v3.9 Changes (2026-08-24):
+# - convert_edge_tep_dhcp_to_static(): after the PUT that switches an edge's
+#   TEP ip_assignment_spec to StaticIpListSpec, NSX takes several seconds to
+#   actually realize it (observed live testing v3.8) - added
+#   _wait_for_edge_tep_state(), which polls the transport node's
+#   /api/v1/transport-nodes/{id}/state endpoint's top-level "state" field
+#   until it reaches "success" (or a failure state / timeout), instead of
+#   moving on immediately after the PUT returns 200.
 #
 # v3.8 Changes (2026-08-24):
 # - CUSTOM section: added convert_edge_tep_dhcp_to_static(), run at the very
@@ -130,6 +139,40 @@ EDGE_TEP_STATIC_CONFIG = {
 }
 EDGE_TEP_DEFAULT_GATEWAY = '10.1.3.129'
 EDGE_TEP_SUBNET_MASK = '255.255.255.128'
+EDGE_TEP_STATE_POLL_INTERVAL = 10  # seconds between transport-node /state checks
+EDGE_TEP_STATE_POLL_TIMEOUT = 300  # seconds to wait for realization to reach 'success'
+EDGE_TEP_STATE_FAILURE_STATES = ('failed', 'partial_success', 'orphaned')
+
+
+def _wait_for_edge_tep_state(session, nsx_host, headers, tn_id, edge_name, lsf):
+    """Poll a transport node's /state until its config reaches 'success' (or a failure state / timeout)."""
+    import time
+    import requests
+    start = time.time()
+    last_state = None
+    while (time.time() - start) < EDGE_TEP_STATE_POLL_TIMEOUT:
+        try:
+            state_resp = session.get(
+                f'https://{nsx_host}/api/v1/transport-nodes/{tn_id}/state',
+                headers=headers, verify=False, timeout=30, proxies=None,
+            )
+            last_state = state_resp.json().get('state') if state_resp.status_code == 200 else None
+        except requests.exceptions.RequestException as e:
+            lsf.write_output(f'{edge_name}: state check failed: {e}')
+            last_state = None
+
+        if last_state == 'success':
+            lsf.write_output(f'{edge_name}: TEP configuration reached state "success"')
+            return True
+        if last_state in EDGE_TEP_STATE_FAILURE_STATES:
+            lsf.write_output(f'{edge_name}: TEP configuration reached failure state "{last_state}"')
+            return False
+
+        lsf.write_output(f'{edge_name}: TEP configuration state is "{last_state}", waiting...')
+        time.sleep(EDGE_TEP_STATE_POLL_INTERVAL)
+
+    lsf.write_output(f'{edge_name}: TEP configuration did not reach "success" within {EDGE_TEP_STATE_POLL_TIMEOUT}s (last state: "{last_state}")')
+    return False
 
 
 def convert_edge_tep_dhcp_to_static(lsf, dry_run=False):
@@ -200,7 +243,8 @@ def convert_edge_tep_dhcp_to_static(lsf, dry_run=False):
                 headers=headers, json=transport_node, verify=False, timeout=60, proxies=None,
             )
             if put_resp.status_code == 200:
-                lsf.write_output(f'{edge_name}: TEP IP assignment successfully converted to static')
+                lsf.write_output(f'{edge_name}: TEP IP assignment update accepted, waiting for realization...')
+                _wait_for_edge_tep_state(session, nsx_host, headers, transport_node['id'], edge_name, lsf)
             else:
                 lsf.write_output(f'{edge_name}: failed to update transport node (HTTP {put_resp.status_code}): {put_resp.text}')
         except requests.exceptions.RequestException as e:
