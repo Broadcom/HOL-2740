@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 # vSphere.py - HOLFY27 Core vSphere Startup Module
-# Version 3.7 - 2026-08-20
+# Version 3.8 - 2026-08-24
 # Author - Burke Azbill and HOL Core Team (HOL-2740 customizations by Nick Robbins)
 # vSphere infrastructure startup sequence
+#
+# v3.8 Changes (2026-08-24):
+# - CUSTOM section: added convert_edge_tep_dhcp_to_static(), run at the very
+#   tail of the module (after the Avi config playbooks). edge-wld01-01a and
+#   edge-mgmt-01a ship in the vApp template with their TEP host-switch
+#   ip_assignment_spec set to AssignedByDhcp; this converts each to a
+#   StaticIpListSpec (10.1.3.221-222 / 10.1.3.211-212, gw 10.1.3.129/25) via
+#   the NSX Manager API. Placed after the Avi playbooks since those already
+#   depend on NSX being reachable/stable, and this doesn't need to run
+#   before them.
 #
 # v3.7 Changes (2026-08-20):
 # - CUSTOM section: added the workload-domain and mgmt-domain avi_config_*.yml
@@ -95,6 +105,111 @@ def is_site_b_cluster(name):
     """Return True if cluster is a Site B cluster (ends in 'b', or contains 'regionb'/'site-b')."""
     c = name.lower().strip()
     return c.endswith('b') or 'regionb' in c or 'site-b' in c
+
+#==============================================================================
+# EDGE TEP IP ASSIGNMENT HELPERS
+#
+# edge-wld01-01a and edge-mgmt-01a ship with their TEP host-switch
+# ip_assignment_spec set to AssignedByDhcp (hand-configured in the vApp
+# template - there is no prior automation for this). This converts each to
+# a StaticIpListSpec via the NSX Manager API. Each edge has one host switch
+# with two pnics (fp-eth0/fp-eth1, one TEP IP per uplink), so ip_list needs
+# exactly two addresses per edge - confirmed live against both NSX Managers
+# 2026-08-24 (both edges: 1 host switch, 2 pnics, AssignedByDhcp).
+#==============================================================================
+
+EDGE_TEP_STATIC_CONFIG = {
+    'edge-wld01-01a': {
+        'nsx_manager': 'nsx-wld01-a.site-a.vcf.lab',
+        'ip_list': ['10.1.3.221', '10.1.3.222'],
+    },
+    'edge-mgmt-01a': {
+        'nsx_manager': 'nsx-mgmt-a.site-a.vcf.lab',
+        'ip_list': ['10.1.3.211', '10.1.3.212'],
+    },
+}
+EDGE_TEP_DEFAULT_GATEWAY = '10.1.3.129'
+EDGE_TEP_SUBNET_MASK = '255.255.255.128'
+
+
+def convert_edge_tep_dhcp_to_static(lsf, dry_run=False):
+    """Convert edge-wld01-01a/edge-mgmt-01a TEP host-switch IP assignment from DHCP to a static IP list via the NSX Manager API."""
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    for edge_name, cfg in EDGE_TEP_STATIC_CONFIG.items():
+        nsx_host = cfg['nsx_manager']
+        session = requests.Session()
+        session.trust_env = False
+
+        try:
+            login_resp = session.post(
+                f'https://{nsx_host}/api/session/create',
+                data={'j_username': 'admin', 'j_password': lsf.password},
+                verify=False, timeout=30, proxies=None,
+            )
+        except requests.exceptions.RequestException as e:
+            lsf.write_output(f'{edge_name}: could not reach NSX Manager {nsx_host}: {e}')
+            continue
+
+        if login_resp.status_code != 200:
+            lsf.write_output(f'{edge_name}: NSX session login failed on {nsx_host} (HTTP {login_resp.status_code})')
+            continue
+
+        headers = {'X-XSRF-TOKEN': login_resp.headers.get('X-XSRF-TOKEN', '')}
+
+        try:
+            tn_resp = session.get(
+                f'https://{nsx_host}/api/v1/transport-nodes',
+                headers=headers, verify=False, timeout=30, proxies=None,
+            )
+            transport_node = next(
+                (tn for tn in tn_resp.json().get('results', []) if tn.get('display_name') == edge_name),
+                None,
+            )
+            if not transport_node:
+                lsf.write_output(f'{edge_name}: transport node not found on {nsx_host}')
+                continue
+
+            host_switches = transport_node.get('host_switch_spec', {}).get('host_switches', [])
+            if len(host_switches) != 1:
+                lsf.write_output(f'{edge_name}: expected exactly one TEP host switch, found {len(host_switches)} - skipping')
+                continue
+
+            host_switch = host_switches[0]
+            current_spec = host_switch.get('ip_assignment_spec', {})
+            if current_spec.get('resource_type') != 'AssignedByDhcp':
+                lsf.write_output(f'{edge_name}: TEP IP assignment is already {current_spec.get("resource_type")}, not DHCP - skipping')
+                continue
+
+            if dry_run:
+                lsf.write_output(f'Would convert {edge_name} TEP IP assignment from DHCP to static {cfg["ip_list"]}')
+                continue
+
+            host_switch['ip_assignment_spec'] = {
+                'resource_type': 'StaticIpListSpec',
+                'ip_list': cfg['ip_list'],
+                'default_gateway': EDGE_TEP_DEFAULT_GATEWAY,
+                'subnet_mask': EDGE_TEP_SUBNET_MASK,
+            }
+
+            lsf.write_output(f'Converting {edge_name} TEP IP assignment from DHCP to static {cfg["ip_list"]} on {nsx_host}...')
+            put_resp = session.put(
+                f'https://{nsx_host}/api/v1/transport-nodes/{transport_node["id"]}',
+                headers=headers, json=transport_node, verify=False, timeout=60, proxies=None,
+            )
+            if put_resp.status_code == 200:
+                lsf.write_output(f'{edge_name}: TEP IP assignment successfully converted to static')
+            else:
+                lsf.write_output(f'{edge_name}: failed to update transport node (HTTP {put_resp.status_code}): {put_resp.text}')
+        except requests.exceptions.RequestException as e:
+            lsf.write_output(f'{edge_name}: NSX API call failed: {e}')
+        finally:
+            session.post(
+                f'https://{nsx_host}/api/session/destroy',
+                headers=headers, verify=False, timeout=15, proxies=None,
+            )
 
 #==============================================================================
 # MAIN FUNCTION
@@ -1010,6 +1125,13 @@ def main(lsf=None, standalone=False, dry_run=False):
         except Exception:
             pass
         lsf.labfail('vSphere module failed at avi management-domain configuration step')
+
+    # Convert edge-wld01-01a/edge-mgmt-01a TEP IP assignment from DHCP to
+    # static (see EDGE TEP IP ASSIGNMENT HELPERS above). Not treated as a
+    # lab-failing step - if it doesn't succeed the edges keep working on
+    # DHCP-assigned TEPs, just not on the addresses this is meant to pin them to.
+    lsf.write_output('Converting edge TEP IP assignment from DHCP to static')
+    convert_edge_tep_dhcp_to_static(lsf, dry_run=dry_run)
 
     ##=========================================================================
     ## End CUSTOM section
