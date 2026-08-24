@@ -223,6 +223,7 @@
         max_vs_per_se: 100
         self_se_election: true
         se_deprovision_delay: 120
+        disable_tso: true
 
     # gslb01b is a separate, dedicated GSLB SE group on this cloud (missed
     # entirely in the original snapshot, same as gslb01a on the workload
