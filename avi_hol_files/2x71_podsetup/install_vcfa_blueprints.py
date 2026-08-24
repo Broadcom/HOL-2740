@@ -114,13 +114,66 @@ def _find_blueprint(lsf, headers, name):
     return next((bp for bp in _as_list(resp.json()) if bp.get('name') == name), None)
 
 
+def _get_blueprint(lsf, headers, blueprint_id):
+    """
+    Fetch the full blueprint object, including its `content` field --
+    unlike the list response _find_blueprint() uses (confirmed live
+    2026-08-23: the list payload omits `content` entirely, only the
+    single-object GET includes it), so this is required before any
+    content-drift comparison or PUT update.
+    """
+    import requests
+
+    resp = requests.get(
+        f'https://{VCFA_HOST}/blueprint/api/blueprints/{blueprint_id}',
+        headers=headers, verify=False, timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f'could not fetch blueprint {blueprint_id!r} (HTTP {resp.status_code}): {resp.text[:300]}')
+    return resp.json()
+
+
+def _update_blueprint_content(lsf, headers, existing, content, name):
+    """
+    PUT updated `content` onto an already-existing blueprint's draft.
+
+    Confirmed live 2026-08-23 that PUT /blueprint/api/blueprints/{id} is
+    the actual update mechanism for a blueprint's draft content (the
+    versions/release endpoints below only ever snapshot+release whatever
+    content the draft currently holds -- they take no content of their
+    own). Without this call, editing a blueprint's YAML in git and
+    re-running this script has no effect: every subsequent
+    version+release just re-stamps the same stale content the blueprint
+    was originally created with.
+    """
+    import requests
+
+    resp = requests.put(
+        f'https://{VCFA_HOST}/blueprint/api/blueprints/{existing["id"]}',
+        headers=headers, verify=False, timeout=30,
+        json={
+            'name': existing['name'],
+            'description': existing['description'],
+            'content': content,
+            'projectId': existing['projectId'],
+            'requestScopeOrg': existing['requestScopeOrg'],
+        },
+    )
+    if resp.status_code not in (200, 201):
+        lsf.write_output(f'  WARNING: could not update content for blueprint {name!r} (HTTP {resp.status_code}): {resp.text[:300]}')
+        return False
+    return True
+
+
 # Version/release endpoints below follow VMware Aria Automation's documented
-# on-prem API (VCFA shares this blueprint-versioning surface) -- UNLIKE every
-# other endpoint in this module, this apiVersion/path pair has NOT been
-# independently confirmed live against this pod's own VCFA build. If it's
-# wrong for this build, the failure surfaces as a WARNING per blueprint
-# (see _release_blueprint()), it won't lab-fail -- but verify by running
-# this script standalone and checking the actual response before trusting it.
+# on-prem API (VCFA shares this blueprint-versioning surface). Confirmed
+# live 2026-08-23 that this apiVersion/path pair works correctly against
+# this pod's own VCFA build: a released version's own `status` (GET
+# /blueprint/api/blueprints/{id}/versions) does read back RELEASED. The
+# blueprint's own top-level `status` field is a DIFFERENT thing (always
+# reads DRAFT -- it's the draft/editable object's own state, unrelated to
+# whether any version of it has been released) -- see
+# install_vcfa_blueprints()'s docstring for why that distinction matters.
 VCFA_BLUEPRINT_API_VERSION = '2019-09-12'
 
 
@@ -170,20 +223,47 @@ def _release_blueprint(lsf, headers, blueprint_id, name):
 
 def install_vcfa_blueprints(lsf):
     """
-    Idempotently create AND release each blueprint in BLUEPRINTS (skipping
-    any already-released one by name) in VCFA_ORG's VCFA_PROJECT_NAME
-    project, from the YAML files in vcfa_blueprints/ alongside this script.
+    Idempotently create/update AND release each blueprint in BLUEPRINTS in
+    VCFA_ORG's VCFA_PROJECT_NAME project, from the YAML files in
+    vcfa_blueprints/ alongside this script.
 
     Creating a blueprint alone leaves it in DRAFT status -- invisible in
     the Service Broker catalog students actually use. _release_blueprint()
-    is what makes a version consumable there; also retroactively releases
-    any blueprint this script created before that step existed and is
-    still sitting in DRAFT.
+    is what makes a version consumable there.
+
+    BUG FIXED 2026-08-23: this used to treat an existing blueprint's own
+    top-level `status` field as the "already released" signal and skip
+    everything else once it read RELEASED. That field never actually reads
+    RELEASED, though -- confirmed live it reads DRAFT permanently
+    regardless of how many versions have been released (it's the state of
+    the draft/editable object itself, not a rollup of its versions; the
+    real per-version release status lives at GET
+    /blueprint/api/blueprints/{id}/versions instead). Two consequences,
+    both live on this pod before this fix: (1) every run always fell into
+    the "not released -- releasing" branch and minted + released a brand
+    new version, for every blueprint, on every single run (confirmed: 5
+    versions after 5 runs); and (2) there was no path at all that updated
+    an existing blueprint's `content` from the YAML file -- the
+    version/release endpoints only ever snapshot the draft's *current*
+    content, which was set once at creation and never touched again. So
+    editing a blueprint's YAML in git and re-running this script had zero
+    effect on what the catalog actually served, while still looking like
+    it worked ("released version ... to catalog" logged every time).
+
+    Fixed by: (a) fetching the existing blueprint's real detail (incl.
+    `content`, which the list endpoint _find_blueprint() uses omits
+    entirely) and diffing it against the local YAML file byte-for-byte;
+    (b) PUTting the new content via _update_blueprint_content() when it
+    differs; (c) only minting+releasing a new version when the content
+    actually changed OR the blueprint has never had a released version at
+    all (totalReleasedVersions == 0) -- an unedited, already-released
+    blueprint is now a true no-op instead of growing a new version every
+    run.
 
     Non-fatal: any failure anywhere in this chain -- VCFA unreachable,
-    login failing, project/org not found, a single blueprint's create or
-    release call failing -- is logged as a WARNING and skipped, never
-    lsf.labfail()'d.
+    login failing, project/org not found, a single blueprint's create,
+    update, or release call failing -- is logged as a WARNING and
+    skipped, never lsf.labfail()'d.
     """
     import requests
     requests.packages.urllib3.disable_warnings()
@@ -201,16 +281,28 @@ def install_vcfa_blueprints(lsf):
 
     for name, filename in BLUEPRINTS.items():
         try:
+            content = open(os.path.join(BLUEPRINTS_DIR, filename)).read()
+
             existing = _find_blueprint(lsf, headers, name)
             if existing:
-                if (existing.get('status') or '').upper() == 'RELEASED':
-                    lsf.write_output(f'  {name}: already exists and released -- no-op')
+                detail = _get_blueprint(lsf, headers, existing['id'])
+                content_changed = detail.get('content') != content
+                never_released = (detail.get('totalReleasedVersions') or 0) == 0
+
+                if not content_changed and not never_released:
+                    lsf.write_output(f'  {name}: content unchanged and already released -- no-op')
                     continue
-                lsf.write_output(f'  {name}: exists but not released -- releasing')
+
+                if content_changed:
+                    lsf.write_output(f'  {name}: content differs from git -- updating')
+                    if not _update_blueprint_content(lsf, headers, detail, content, name):
+                        continue
+
+                reason = 'content changed' if content_changed else 'no released version yet'
+                lsf.write_output(f'  {name}: releasing new version ({reason})')
                 _release_blueprint(lsf, headers, existing['id'], name)
                 continue
 
-            content = open(os.path.join(BLUEPRINTS_DIR, filename)).read()
             resp = requests.post(
                 f'https://{VCFA_HOST}/blueprint/api/blueprints',
                 headers=headers, verify=False, timeout=30,

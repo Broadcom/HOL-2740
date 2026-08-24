@@ -1773,6 +1773,427 @@ def ensure_workload_cluster_ako_healthy(lsf, timeout_seconds=180, poll_interval=
             lsf.write_output(f'  WARNING: could not check/repair AKO health in {context}: {e}')
 
 
+# The cert-manager Issuer used by the Automation lab's Supervisor namespace
+# to sign certs via HashiCorp Vault's pki/sign/holodeck path. Same
+# console-has-the-kubeconfig / manager-doesn't constraint as the VKS
+# kubectl calls above -- see VKS_KUBECTL_HOST's comment.
+VAULT_ISSUER_NAME = 'vault-issuer'
+VAULT_SERVER_FQDN = 'vault.vcf.lab'
+# Domains this pod's exercises actually request certs for via the
+# holodeck PKI role -- vcf.lab plus each site-a subdomain fronted by Avi
+# (the load-balancer VIP domain and both VKS guest-cluster domains).
+VAULT_HOLODECK_REQUIRED_DOMAINS = (
+    'vcf.lab', 'lb.site-a.vcf.lab', 'site-a.vcf.lab',
+    'vks1.site-a.vcf.lab', 'vks2.site-a.vcf.lab',
+)
+
+
+def fix_vault_issuer_ca_trust(lsf):
+    """
+    Ensure cert-manager's vault-issuer Issuer (namespace VKS_SUPERVISOR_NS,
+    Supervisor context) trusts the TLS certificate vault.vcf.lab's API
+    listener presents.
+
+    Root cause (confirmed live 2026-08-23): vault.vcf.lab's own root CA
+    ("vcf.lab Root Authority") is regenerated per pod rebuild, but the
+    Issuer object is provisioned with no spec.vault.caBundle at all --
+    cert-manager then fails every health check against Vault with
+    "x509: certificate signed by unknown authority" and the Issuer never
+    reaches Ready, which means every cert request against
+    pki/sign/holodeck in this namespace fails too.
+
+    Fix: fetch the cert chain vault.vcf.lab actually presents (via
+    `openssl s_client -showcerts`, run on console since that's the host
+    with a network route + the Supervisor kubeconfig -- see
+    VKS_KUBECTL_HOST), identify the self-signed root (subject == issuer),
+    and merge-patch it into spec.vault.caBundle. Idempotent: skips the
+    patch entirely if the currently-live root already matches what's on
+    the Issuer (covers every run after the first on a given pod, and any
+    run where this was already fixed by hand).
+
+    Non-fatal: any failure here is logged as a warning. A broken
+    vault-issuer degrades whatever exercise depends on Vault-issued certs
+    in this namespace, but doesn't itself mean the rest of the lab is
+    unusable.
+    """
+    import base64
+
+    lsf.write_output('Checking cert-manager vault-issuer CA trust...')
+    password = lsf.get_password()
+
+    remote_py = r"""
+import base64, json, re, subprocess, sys, time
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+K = ['kubectl', '--context', 'Supervisor', '-n', '__VKS_SUPERVISOR_NS__']
+
+get = run(K + ['get', 'issuer', '__VAULT_ISSUER_NAME__', '-o', 'json'])
+if get.returncode != 0:
+    print('ISSUER_NOT_FOUND: ' + get.stderr.strip())
+    sys.exit(0)
+
+issuer = json.loads(get.stdout)
+current_ca_b64 = issuer.get('spec', {}).get('vault', {}).get('caBundle', '')
+
+chain = subprocess.run(
+    ['openssl', 's_client', '-connect', '__VAULT_SERVER_FQDN__:443',
+     '-servername', '__VAULT_SERVER_FQDN__', '-showcerts'],
+    input='', capture_output=True, text=True, timeout=20,
+).stdout
+
+certs = re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', chain, re.S)
+if not certs:
+    print('NO_CERTS_RETRIEVED')
+    sys.exit(0)
+
+root_pem = None
+for pem in certs:
+    with open('/tmp/_vault_issuer_cert.pem', 'w') as f:
+        f.write(pem)
+    subj = run(['openssl', 'x509', '-in', '/tmp/_vault_issuer_cert.pem', '-noout', '-subject']).stdout.strip()
+    iss = run(['openssl', 'x509', '-in', '/tmp/_vault_issuer_cert.pem', '-noout', '-issuer']).stdout.strip()
+    if subj.replace('subject=', '', 1) == iss.replace('issuer=', '', 1):
+        root_pem = pem
+subprocess.run(['rm', '-f', '/tmp/_vault_issuer_cert.pem'])
+
+if not root_pem:
+    print('NO_SELF_SIGNED_ROOT_FOUND')
+    sys.exit(0)
+
+new_ca_b64 = base64.b64encode(root_pem.encode()).decode()
+if new_ca_b64 == current_ca_b64:
+    print('ALREADY_TRUSTED')
+    sys.exit(0)
+
+patch = json.dumps({'spec': {'vault': {'caBundle': new_ca_b64}}})
+res = run(K + ['patch', 'issuer', '__VAULT_ISSUER_NAME__', '--type=merge', '-p', patch])
+if res.returncode != 0:
+    print('PATCH_FAILED: ' + res.stderr.strip())
+    sys.exit(0)
+
+for _ in range(6):
+    time.sleep(5)
+    st = run(K + ['get', 'issuer', '__VAULT_ISSUER_NAME__', '-o', 'json'])
+    if st.returncode == 0:
+        conds = json.loads(st.stdout).get('status', {}).get('conditions', [])
+        ready = next((c for c in conds if c.get('type') == 'Ready'), None)
+        if ready and ready.get('status') == 'True':
+            print('PATCHED_AND_VERIFIED')
+            sys.exit(0)
+print('PATCHED_BUT_NOT_YET_READY')
+"""
+    remote_py = (
+        remote_py
+        .replace('__VKS_SUPERVISOR_NS__', VKS_SUPERVISOR_NS)
+        .replace('__VAULT_ISSUER_NAME__', VAULT_ISSUER_NAME)
+        .replace('__VAULT_SERVER_FQDN__', VAULT_SERVER_FQDN)
+    )
+    script_b64 = base64.b64encode(remote_py.encode()).decode()
+    remote_cmd = (
+        f"echo {script_b64} | base64 -d > /tmp/fix_vault_issuer.py && "
+        f"python3 /tmp/fix_vault_issuer.py; rm -f /tmp/fix_vault_issuer.py"
+    )
+
+    try:
+        result = lsf.ssh(remote_cmd, VKS_KUBECTL_HOST, password)
+        out_text = (getattr(result, 'stdout', '') or '').strip()
+        lsf.write_output(f'  vault-issuer CA trust result: {out_text or "(no output)"}')
+        if 'FAILED' in out_text or 'NOT_YET_READY' in out_text or 'NOT_FOUND' in out_text:
+            lsf.write_output('  WARNING: vault-issuer may still need manual attention')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: vault-issuer CA trust check failed: {e}')
+
+
+def ensure_vault_holodeck_role_domains(lsf):
+    """
+    Ensure Vault's pki/roles/holodeck role (the role vault-issuer signs
+    through, via pki/sign/holodeck) has allowed_domains covering every
+    domain this pod's exercises actually request certs for --
+    VAULT_HOLODECK_REQUIRED_DOMAINS.
+
+    Uses the same universal pod password as the Vault root token --
+    confirmed live 2026-08-23 that vault.vcf.lab's root token equals the
+    standard pod password, same as it authenticates essentially every
+    other account across this lab (see CLAUDE.md's Credentials section).
+
+    Read-modify-write, not a partial POST: Vault's pki/roles/:name write
+    endpoint replaces the whole role, not just the fields supplied -- a
+    request containing only allowed_domains would silently reset every
+    other role parameter (key_type, ttl, allow_subdomains, etc.) to its
+    default. This reads the full current role first and re-submits it
+    verbatim with only allowed_domains extended, so nothing else about
+    the role changes.
+
+    Idempotent: no-ops (and only logs) if every required domain is
+    already present -- true on any pod where this was already applied,
+    confirmed live 2026-08-23.
+
+    Non-fatal: any failure is logged as a warning, never fails the lab --
+    a missing domain here breaks cert issuance for that one domain, not
+    the rest of the pod.
+    """
+    import base64
+    import json
+
+    lsf.write_output('Checking Vault pki/roles/holodeck allowed_domains...')
+    password = lsf.get_password()
+
+    remote_py = r"""
+import json, ssl, sys, urllib.request
+
+VAULT_HOST = '__VAULT_SERVER_FQDN__'
+ROLE = 'holodeck'
+REQUIRED_DOMAINS = __REQUIRED_DOMAINS_JSON__
+TOKEN = '__VAULT_TOKEN__'
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+def vault_request(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f'https://{VAULT_HOST}{path}', data=data, method=method,
+        headers={'X-Vault-Token': TOKEN, 'Content-Type': 'application/json'},
+    )
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+try:
+    current = vault_request('GET', f'/v1/pki/roles/{ROLE}')
+except Exception as e:
+    print(f'ROLE_READ_FAILED: {e}')
+    sys.exit(0)
+
+data = current.get('data', {})
+existing = data.get('allowed_domains', []) or []
+missing = [d for d in REQUIRED_DOMAINS if d not in existing]
+
+if not missing:
+    print('ALREADY_PRESENT')
+    sys.exit(0)
+
+data['allowed_domains'] = existing + missing
+try:
+    vault_request('POST', f'/v1/pki/roles/{ROLE}', data)
+except Exception as e:
+    print(f'ROLE_WRITE_FAILED: {e}')
+    sys.exit(0)
+
+print(f'ADDED: {missing}')
+"""
+    remote_py = (
+        remote_py
+        .replace('__VAULT_SERVER_FQDN__', VAULT_SERVER_FQDN)
+        .replace('__REQUIRED_DOMAINS_JSON__', json.dumps(list(VAULT_HOLODECK_REQUIRED_DOMAINS)))
+        .replace('__VAULT_TOKEN__', password)
+    )
+    script_b64 = base64.b64encode(remote_py.encode()).decode()
+    remote_cmd = (
+        f"echo {script_b64} | base64 -d > /tmp/fix_vault_holodeck_role.py && "
+        f"python3 /tmp/fix_vault_holodeck_role.py; rm -f /tmp/fix_vault_holodeck_role.py"
+    )
+
+    try:
+        result = lsf.ssh(remote_cmd, VKS_KUBECTL_HOST, password)
+        out_text = (getattr(result, 'stdout', '') or '').strip()
+        lsf.write_output(f'  holodeck role allowed_domains result: {out_text or "(no output)"}')
+        if 'FAILED' in out_text:
+            lsf.write_output('  WARNING: holodeck role allowed_domains may still need manual attention')
+    except Exception as e:
+        lsf.write_output(f'  WARNING: holodeck role allowed_domains check failed: {e}')
+
+
+# Namespace name has a random per-pod suffix (e.g. svc-harbor-s8b1s) --
+# discovered at runtime in ensure_harbor_healthy() rather than hardcoded.
+HARBOR_NAMESPACE_PREFIX = 'svc-harbor-'
+# Harbor is a wld01-a Supervisor Service, fronted by that domain's Avi --
+# reuse the same avi_host already defined for the NSX<->Avi credential work
+# above rather than duplicating it.
+HARBOR_AVI_HOST = NSXT_ALB_DOMAINS[0]['avi_host']
+
+
+def ensure_harbor_healthy(lsf, timeout_seconds=300, poll_interval=15, pending_stuck_seconds=300):
+    """
+    Verify the Harbor Supervisor Service (svc-harbor-<suffix> namespace) is
+    actually serving, and self-remediate the stuck-pod failure mode
+    root-caused live on 2026-08-20 (see the harbor-slow-start-podvm-
+    annotation writeup): the vSphere CSI controller's AttachVolume can't
+    find the "vmware-system-vm-uuid" annotation on a pod, either because
+    spherelet explicitly reports pod status.reason ==
+    "PodVMAnnotationsMissing", or -- the worse variant actually seen on
+    harbor-core -- spherelet gets stuck in a local pod-cache desync (a
+    tight "PodNotFound" retry loop) that never surfaces any reason at all
+    and never self-heals on its own. Both look identical from the pod's own
+    status: it just sits Pending indefinitely. Deleting the pod lets its
+    controller (Deployment/StatefulSet) recreate it fresh, usually landing
+    on a different node than whichever one had the desynced spherelet,
+    which resolved every instance seen so far within seconds.
+
+    This is deliberately more aggressive than
+    ensure_workload_cluster_ako_healthy() above: rather than only touching
+    pods with a *known* fixable waiting reason, any pod still Pending after
+    pending_stuck_seconds gets deleted regardless of reason, since the
+    worst-case variant (harbor-core) never reported one. A pod that's
+    genuinely just slow to schedule/pull on a busy boot could in theory get
+    touched by this before it would have recovered on its own -- accepted
+    tradeoff given the real incident sat stuck for 35+ minutes with zero
+    progress, and Harbor is a hard dependency for at least one lab module.
+
+    Ruled out before writing this as the fix: cluster-wide CPU/memory
+    *reservation* exhaustion (the most common documented root cause for
+    this exact CSI error upstream) was checked live via PowerCLI during the
+    2026-08-20 incident and was nowhere close to exhausted (~17% of CPU
+    reservation used) -- so this function does not attempt any
+    capacity-based diagnosis, only the pod-recreate remediation that was
+    actually confirmed to work.
+
+    Harbor isn't part of every pod build; if no svc-harbor-* namespace is
+    found this is a silent no-op.
+
+    FATAL: unlike most checks in this file, an unrecovered Harbor is treated
+    as a lab-failing condition (lsf.labfail) rather than a warning, since
+    Harbor is a hard dependency for at least one lab module -- callers
+    should expect this function can end the process.
+    """
+    import json
+    import time
+    import datetime
+    import os
+
+    lsf.write_output('Checking Harbor Supervisor Service health...')
+    password = lsf.get_password()
+
+    def _find_namespace():
+        result = lsf.ssh("kubectl --context Supervisor get ns -o name", VKS_KUBECTL_HOST, password)
+        stdout = (getattr(result, 'stdout', '') or '')
+        for line in stdout.splitlines():
+            name = line.strip().split('/')[-1]
+            if name.startswith(HARBOR_NAMESPACE_PREFIX):
+                return name
+        return None
+
+    def _get_pods(namespace):
+        cmd = f"kubectl --context Supervisor -n {namespace} get pods -o json"
+        result = lsf.ssh(cmd, VKS_KUBECTL_HOST, password)
+        stdout = (getattr(result, 'stdout', '') or '').strip()
+        if not stdout:
+            return None
+        return json.loads(stdout).get('items', [])
+
+    def _all_ready(pods):
+        return bool(pods) and all(
+            cs.get('ready')
+            for pod in pods
+            for cs in (pod.get('status', {}).get('containerStatuses', []) or [])
+        )
+
+    def _pod_age_seconds(pod):
+        ts = pod.get('metadata', {}).get('creationTimestamp')
+        if not ts:
+            return 0.0
+        created = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
+
+    try:
+        namespace = _find_namespace()
+        if not namespace:
+            lsf.write_output(f'  No {HARBOR_NAMESPACE_PREFIX}* namespace found -- Harbor not part of this build, skipping')
+            return
+
+        pods = _get_pods(namespace)
+        if pods is None:
+            lsf.write_output(f'  {namespace}: no output listing pods -- Supervisor may be unreachable, skipping')
+            return
+
+        to_delete = []
+        for pod in pods:
+            name = pod.get('metadata', {}).get('name', '<unknown>')
+            status = pod.get('status', {})
+            phase = status.get('phase')
+            reason = status.get('reason')
+            age = _pod_age_seconds(pod)
+
+            if reason == 'PodVMAnnotationsMissing':
+                lsf.write_output(f'  {namespace}/{name}: {reason} ({age:.0f}s old) -- deleting to force recreation')
+                to_delete.append(name)
+            elif phase == 'Pending' and age > pending_stuck_seconds:
+                lsf.write_output(
+                    f'  {namespace}/{name}: stuck Pending for {age:.0f}s (> {pending_stuck_seconds}s threshold) '
+                    f'-- deleting to force recreation'
+                )
+                to_delete.append(name)
+
+        for name in to_delete:
+            lsf.ssh(
+                f"kubectl --context Supervisor -n {namespace} delete pod {name} --wait=false",
+                VKS_KUBECTL_HOST, password,
+            )
+
+        if to_delete:
+            deadline = time.time() + timeout_seconds
+            recovered = False
+            while time.time() < deadline:
+                time.sleep(poll_interval)
+                pods = _get_pods(namespace)
+                if _all_ready(pods):
+                    recovered = True
+                    break
+            if recovered:
+                lsf.write_output(f'  {namespace}: all pods Ready after recreating {to_delete}')
+            else:
+                lsf.labfail(
+                    f'Harbor ({namespace}) still not healthy {timeout_seconds}s after recreating '
+                    f'stuck pod(s) {to_delete}'
+                )
+        elif _all_ready(pods):
+            lsf.write_output(f'  {namespace}: all pods already Ready -- no-op')
+        else:
+            not_ready = [
+                p.get('metadata', {}).get('name')
+                for p in pods
+                if not all(cs.get('ready') for cs in (p.get('status', {}).get('containerStatuses', []) or []))
+            ]
+            lsf.write_output(
+                f'  {namespace}: no pods stuck long enough to touch yet, but not all Ready: {not_ready} '
+                f'-- leaving alone, may still be a normal cold start'
+            )
+
+        # End-to-end verification via Avi, independent of the pod-level view above --
+        # this is what "Harbor is actually up" really means for a student.
+        try:
+            avi_session = _avi_login(os.environ['AVICTRL_PASSWORD'], HARBOR_AVI_HOST)
+            # No server-side name filter here (deliberately) -- fetch the
+            # full inventory and filter client-side, since this file has no
+            # prior confirmed-working use of Avi's search-query syntax for
+            # virtualservice-inventory and this list is small.
+            resp = avi_session.get(f'https://{HARBOR_AVI_HOST}/api/virtualservice-inventory', timeout=15)
+            resp.raise_for_status()
+            results = resp.json().get('results', [])
+            harbor_vs = next(
+                (r for r in results if 'harbor-nginx' in r.get('config', {}).get('name', '')), None
+            )
+            if not harbor_vs:
+                lsf.write_output('  WARNING: no Avi Virtual Service matching *harbor-nginx* found to verify')
+            else:
+                vs_name = harbor_vs['config']['name']
+                vs_state = harbor_vs.get('runtime', {}).get('oper_status', {}).get('state')
+                if vs_state == 'OPER_UP':
+                    lsf.write_output(f'  Avi VS {vs_name}: OPER_UP -- Harbor confirmed reachable')
+                else:
+                    lsf.labfail(
+                        f'Harbor Avi VS {vs_name} is {vs_state}, not OPER_UP, even after pod-level remediation'
+                    )
+        except Exception as e:
+            lsf.write_output(f'  WARNING: could not verify Harbor via Avi API: {e}')
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: could not check/repair Harbor health: {e}')
+
+
 def resync_nsxt_alb_cloud_connector_credentials(lsf):
     """
     Verify (fast path) that Avi's cloud-connector credential for each NSX
@@ -3289,6 +3710,21 @@ def main():
         with track_step(lsf, _telemetry_results, 'workload_cluster_ako_health'):
             ensure_workload_cluster_ako_healthy(lsf)
 
+        # cert-manager vault-issuer CA trust (Supervisor namespace
+        # VKS_SUPERVISOR_NS) -- see fix_vault_issuer_ca_trust()'s docstring
+        # for the 2026-08-23 x509-unknown-authority incident this guards
+        # against. Independent of everything else here; run alongside the
+        # other Supervisor/VKS-namespace checks above.
+        with track_step(lsf, _telemetry_results, 'vault_issuer_ca_trust'):
+            fix_vault_issuer_ca_trust(lsf)
+
+        # Vault pki/roles/holodeck allowed_domains -- see
+        # ensure_vault_holodeck_role_domains()'s docstring. Run right after
+        # the CA trust fix above since both gate the same vault-issuer /
+        # pki/sign/holodeck cert-issuance path.
+        with track_step(lsf, _telemetry_results, 'vault_holodeck_role_domains'):
+            ensure_vault_holodeck_role_domains(lsf)
+
         # Console Firefox Remote Settings proxy-bypass fix (identity-panel /
         # page-load hang). Independent of everything else here; see
         # fix_firefox_remote_settings_bypass() docstring for full root-cause
@@ -3467,6 +3903,17 @@ def main():
         # runtime of everything above to converge in the background first.
         # with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
         #     wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
+
+        # Harbor Supervisor Service health + stuck-pod self-remediation --
+        # see ensure_harbor_healthy()'s docstring for the 2026-08-20
+        # incident this guards against. Run last, same reasoning as the VKS
+        # scale-up wait above: Harbor's pods have had the full runtime of
+        # everything else in this function to converge on their own first,
+        # so anything still stuck by now is a real candidate for the
+        # delete-and-recreate remediation rather than a normal cold start.
+        # FATAL unlike most steps here -- see docstring.
+        with track_step(lsf, _telemetry_results, 'harbor_health'):
+            ensure_harbor_healthy(lsf)
 
         # Summarize ~/hol/labstartup.log (the pod's overall boot-time log,
         # not just this script's own output) -- see

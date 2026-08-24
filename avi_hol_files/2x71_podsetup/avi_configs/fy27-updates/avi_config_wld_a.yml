@@ -258,6 +258,33 @@
     # instruction). Every other field is left at its current live value -
     # do NOT revert disk/memory/max_vs_per_se/deprovision_delay to the
     # original template's sizing.
+    #
+    # disable_tso: true (added 2026-08-23) - mitigation for a confirmed SE
+    # dataplane bug: TCP segments TSO'd onto Geneve-encapsulated traffic get
+    # corrupted/dropped whenever that traffic isn't fully intra-host (any
+    # cross-host SE<->pool-member path, or same-host but co-resident with
+    # the NSX edge), causing 40-50% retransmission rates and multi-minute
+    # stalls on bulk transfers (surfaced as "Harbor is slow to start", but
+    # reproduced identically against adv-app-a/site1web1/site1web2 too - not
+    # Harbor-specific). Root-caused via packet capture (see
+    # esxi_slowness/HANDOFF-harbor-slow-start-2026-08-20.md and this
+    # session's follow-up): NIC hardware error counters are clean on every
+    # host/uplink, ARP resolution is healthy, and per-host NIC/driver config
+    # is byte-identical - the corruption is confirmed at the ENS/VDL2
+    # Geneve+TSO software offload layer, not a placement or hardware fault.
+    # An Avi version upgrade does not fix it (confirmed independently by the
+    # user in a second environment).
+    # Verified live: setting this on the SE Group applies immediately to
+    # already-running SEs with NO SE restart/redeploy required (confirmed at
+    # the packet level - captured frames show TSO flipping from `TSO 1
+    # TSOMSS 1448` to `TSO 0` with no SE reboot in between). Re-tested the
+    # two previously-broken configurations (SE/backend cross-host, and
+    # SE+edge+backend all co-resident) with this set: 0 retransmissions in
+    # both cases, vs. 40-50% before. This is why it's set here rather than
+    # via a placement/DRS-based workaround - a per-service co-residency rule
+    # doesn't scale (would need one per critical VM), while this is one
+    # group-wide setting covering every VS in the cloud, safe to re-apply
+    # every startup since it doesn't need to persist between pod rebuilds.
     - name: "Default-Group SE group sizing for {{ cloud_name }}"
       vmware.alb.avi_serviceenginegroup:
         avi_api_patch_op: replace
@@ -274,6 +301,18 @@
         max_vs_per_se: 100
         self_se_election: true
         se_deprovision_delay: 120
+        disable_tso: true
+
+
+    - name: "Default-Group SE group sizing for {{ cloud_name }}"
+      vmware.alb.avi_serviceenginegroup:
+        avi_api_patch_op: replace
+        avi_api_update_method: patch
+        avi_credentials: "{{ avi_credentials }}"
+        name: us-east-seg-ha
+        tenant: Acme-East-A
+        cloud_ref: "/api/cloud/?name={{ cloud_name }}"
+        disable_tso: true
 
     # gslb01a is a separate, dedicated GSLB SE group on this cloud (missed
     # entirely in the original snapshot - it doesn't exist in avi_config.yml

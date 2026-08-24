@@ -27,7 +27,7 @@ resources:
           name: ${env.deploymentName}-httproute
         spec:
           hostnames:
-            - ${env.deploymentName}-web.vault.avidemo.com
+            - ${env.deploymentName}-web.lb.site-a.vcf.lab
           parentRefs:
             - kind: Gateway
               name: ${env.deploymentName}-gateway
@@ -76,7 +76,7 @@ resources:
             - allowedRoutes:
                 namespaces:
                   from: Same
-              hostname: ${env.deploymentName}-web.vault.avidemo.com
+              hostname: ${env.deploymentName}-web.lb.site-a.vcf.lab
               name: https
               port: 443
               protocol: HTTPS
