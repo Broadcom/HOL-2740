@@ -1,0 +1,8 @@
+apiVersion: crd.nsx.vmware.com/v1alpha1
+kind: SubnetConnectionBindingMap
+metadata:
+  name: egress-binding1
+spec:
+  subnetName: egress-subnet
+  targetSubnetSetName: workload-cluster-1-bvs27
+  vlanTrafficTag: 1001
