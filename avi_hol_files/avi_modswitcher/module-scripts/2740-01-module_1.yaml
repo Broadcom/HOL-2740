@@ -66,7 +66,7 @@
       namespace: default
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
-      db_vm_ip: "{{ hostvars['localhost']['global_db_ip'] }}"
+      db_vm_ip: "{{ global_db_ip }}"
 
   - name: Wait for Backend LoadBalancer Service to obtain an IP
     kubernetes.core.k8s_info:
@@ -90,14 +90,22 @@
       state: present
       namespace: default
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
+    vars:
+      backend_service_ip: "{{ global_backend_ip }}"
+
+  - name: Wait for Frontend LoadBalancer Service to obtain an IP
+    kubernetes.core.k8s_info:
+      context: "workload-cluster-1"
+      api_version: v1
+      kind: Service
+      name: frontend-app-service
+      namespace: default
     register: frontend_svc_info
     until: "frontend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
     retries: 30
     delay: 10
-    vars:
-      backend_service_ip: "{{ hostvars['localhost']['global_backend_ip'] }}"
 
-  - name: Store Backend Service IP internally
+  - name: Store Frontend Service IP internally
     ansible.builtin.set_fact:
       global_frontend_ip: "{{ frontend_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
   
