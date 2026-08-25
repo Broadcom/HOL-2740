@@ -170,8 +170,8 @@
       NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
 
   - name: Add MySQL DB host dynamically
-        ansible.builtin.add_host:
-          name: 3tierapp-db.site-a.vcf.lab
+    ansible.builtin.add_host:
+      name: 3tierapp-db.site-a.vcf.lab
 
 - name: Resolve MySQL blocked host issue
   hosts: 3tierapp-db.site-a.vcf.lab
