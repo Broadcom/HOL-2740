@@ -171,6 +171,29 @@
         src: /vpodrepo/2027-labs/2740/avi_hol_files/3-TierAppDeployment
         dest: /hol/hol-2740
 
+## clean up firefox vcenter state
+
+    - name: Find folders matching the wildcard pattern
+      ansible.builtin.find:
+        paths: /home/holuser/snap/firefox/common/.mozilla/firefox/hu6lbvyx.default/storage/default
+        patterns: "*vc-*"  # Your wildcard pattern here
+        file_type: directory
+      register: found_folders
+
+    - name: Delete the matched folders
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ found_folders.files }}"
+
+    - name: Delete the cache folder
+      ansible.builtin.file:
+        path: /home/holuser/snap/firefox/common/.cache/mozilla/firefox/hu6lbvyx.default/cache2
+        state: absent
+
+
+#######
+
     # - name: copy kubeconfig for AMKO
     #   copy:
     #     src: /home/holuser/.kube/config
