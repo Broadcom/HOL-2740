@@ -1,0 +1,15 @@
+apiVersion: crd.antrea.io/v1beta1
+kind: Egress
+metadata:
+  name: 3tierapp-egress
+  labels:
+    app: backend-app
+spec:
+  appliedTo:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: 3tierapp
+    podSelector:
+      matchLabels:
+        app: backend-app
+  externalIPPool: external-ip-pool-01

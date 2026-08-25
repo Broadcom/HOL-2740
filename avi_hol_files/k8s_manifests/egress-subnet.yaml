@@ -1,0 +1,9 @@
+apiVersion: crd.nsx.vmware.com/v1alpha1
+kind: Subnet
+metadata:
+  name: egress-subnet
+spec:
+  accessMode: Public
+  subnetDHCPConfig:
+    mode: DHCPDeactivated
+  ipv4SubnetSize: 16
