@@ -169,7 +169,6 @@
       no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
       NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
 
----
 - name: Resolve MySQL blocked host issue
   hosts: 3tierapp-db.site-a.vcf.lab
   remote_user: holuser
