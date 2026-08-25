@@ -1,0 +1,12 @@
+apiVersion: crd.antrea.io/v1beta1
+kind: ExternalIPPool
+metadata:
+  name: external-ip-pool-01
+spec:
+  ipRanges:
+  - cidr: 10.150.6.0/29
+  subnetInfo:
+    prefixLength: 28
+    vlan: 1001
+    gateway:  10.150.6.1
+  nodeSelector: {}

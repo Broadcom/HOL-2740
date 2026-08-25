@@ -370,6 +370,29 @@
             index_in_header: 1
           use_true_client_ip: true
 
+    - name: "System-TCP-Proxy turn off autolearn"
+      vmware.alb.avi_networkprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        # avi_api_patch_op: replace
+        # avi_api_update_method: patch
+        name: System-TCP-Proxy
+        profile:
+          tcp_proxy_profile:
+            automatic: false
+            receive_window: 1024
+
+    - name: "System-TCP-Proxy in acme-east-a tenant turn off autolearn"
+      vmware.alb.avi_networkprofile:
+        avi_credentials: "{{ avi_credentials }}"
+        # avi_api_patch_op: replace
+        # avi_api_update_method: patch
+        name: System-TCP-Proxy
+        tenant: Acme-East-A
+        profile:
+          tcp_proxy_profile:
+            automatic: false
+            receive_window: 1024
+
     # -----------------------------------------------------------------
     # System-DNS is a system-default object but has been heavily
     # customized here, and this is the piece that was actually BROKEN and

@@ -32,15 +32,18 @@ skus:
   - id: HOL-2740-03
     title: "HOL-2740-03 - Load balancing VCF apps with Avi"
     modules:
-      - name: "Module 1 - No Pre-Provisioning Required"
+      - name: "Module 1 - Introduction to Applications"
         description: "Starting state for the lab; nothing needs to be pre-provisioned."
         playbook: ../module-scripts/2740-03-module_1.yaml
-      - name: "Module 2 - Deploy Application Virtual Services"
-        description: "Deploys the adv-app-a, secure-app-a (SSL), and tenant-app-a virtual services for region a. NOTE: identical to Module 3 below — needs real distinct content."
+      - name: "Module 2 - Introduction to Application Scaling"
+        description: "Deploys the adv-app-a, secure-app-a (SSL), and tenant-app-a virtual services for region a."
         playbook: ../module-scripts/2740-03-module_2.yaml
-      - name: "Module 3 - Deploy Application Virtual Services"
-        description: "Deploys the adv-app-a, secure-app-a (SSL), and tenant-app-a virtual services for region a. NOTE: identical to Module 2 above — needs real distinct content."
+      - name: "Module 3 - Introduction to Application Services and Security"
+        description: "Deploys the adv-app-a, secure-app-a (SSL), and tenant-app-a virtual services for region a."
         playbook: ../module-scripts/2740-03-module_3.yaml
+      - name: "Module 4 - Introduction to Application Troubleshooting"
+        description: "Deploys the adv-app-a, secure-app-a (SSL), and tenant-app-a virtual services for region a."
+        playbook: ../module-scripts/2740-03-module_4.yaml
 
   - id: HOL-2740-04
     title: "HOL-2740-04 - Increase app resiliency with VMware Avi load balancer"

@@ -26,9 +26,9 @@
       AVI_HOST: 'alb-a.site-a.vcf.lab'
       NSX_HOST: 'nsx-wld01-a.site-a.vcf.lab'
       AVI_USER: 'admin'
-      AVI_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      AVI_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
       NSX_USER: 'admin'
-      NSX_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      NSX_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
     register: script_output
 
   - name: Print the script stdout
@@ -41,7 +41,7 @@
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-vm.yaml.j2') | from_yaml_all | list }}"
       context: "Supervisor"
     vars:
-      db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
 
   - name: Query vSphere VMService for external status allocation
     kubernetes.core.k8s_info:
@@ -66,7 +66,7 @@
       namespace: default
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
-      db_vm_ip: "{{ hostvars['localhost']['global_db_ip'] }}"
+      db_vm_ip: "{{ global_db_ip }}"
 
   - name: Wait for Backend LoadBalancer Service to obtain an IP
     kubernetes.core.k8s_info:
@@ -90,31 +90,44 @@
       state: present
       namespace: default
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
+    vars:
+      backend_service_ip: "{{ global_backend_ip }}"
+
+  - name: Wait for Frontend LoadBalancer Service to obtain an IP
+    kubernetes.core.k8s_info:
+      context: "workload-cluster-1"
+      api_version: v1
+      kind: Service
+      name: frontend-app-service
+      namespace: default
     register: frontend_svc_info
-    until: "backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+    until: "frontend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
     retries: 30
     delay: 10
-    vars:
-      backend_service_ip: "{{ hostvars['localhost']['global_backend_ip'] }}"
 
-  - name: Store Backend Service IP internally
+  - name: Store Frontend Service IP internally
     ansible.builtin.set_fact:
       global_frontend_ip: "{{ frontend_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
   
   - name: Authenticate with Technitium DNS
     ansible.builtin.uri:
-      url: "http://10.1.10.129:5380/api/user/login"
+      url: "http://dns.vcf.lab:5380/api/user/login"
       method: POST
       body_format: form-urlencoded
       body:
         user: "admin"
-        pass: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+        pass: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
     register: technitium_auth
-    no_log: true # Prevents logging the token/password
+    no_log: true
+    environment:
+      #http_proxy: http://proxy:3128
+      #https_proxy: http://proxy:3128
+      no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+      NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
 
   - name: Create or overwrite A Record
     ansible.builtin.uri:
-      url: "http://10.1.10.129:5380/api/zones/records/add"
+      url: "http://dns.vcf.lab:5380/api/zones/records/add"
       method: POST
       body_format: form-urlencoded
       body:
@@ -128,10 +141,15 @@
     # Optional: URI module will always report 'changed' on a successful POST. 
     # You can suppress that if you want strict visual idempotency in your playbook output.
     changed_when: false
+    environment:
+      #http_proxy: http://proxy:3128
+      #https_proxy: http://proxy:3128
+      no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+      NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
 
   - name: Create or overwrite A Record
     ansible.builtin.uri:
-      url: "http://10.1.10.129:5380/api/zones/records/add"
+      url: "http://dns.vcf.lab:5380/api/zones/records/add"
       method: POST
       body_format: form-urlencoded
       body:
@@ -145,3 +163,8 @@
     # Optional: URI module will always report 'changed' on a successful POST. 
     # You can suppress that if you want strict visual idempotency in your playbook output.
     changed_when: false
+    environment:
+      #http_proxy: http://proxy:3128
+      #https_proxy: http://proxy:3128
+      no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+      NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"

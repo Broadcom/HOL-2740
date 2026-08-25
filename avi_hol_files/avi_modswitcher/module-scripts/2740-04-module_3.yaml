@@ -4,8 +4,8 @@
   gather_facts: false
 
   environment:
-    no_proxy: "localhost,127.0.0.0/8,::1,.vcf.lab,.vcf.sddc.lab,172.16.0.0/16,192.168.0.0/16"
-    NO_PROXY: "localhost,127.0.0.0/8,::1,.vcf.lab,.vcf.sddc.lab,172.16.0.0/16,192.168.0.0/16"
+    no_proxy: "localhost,127.0.0.0/8,::1,site-a.vcf.lab,10.1.1.90,10.0.0.0/8"
+    NO_PROXY: "localhost,127.0.0.0/8,::1,site-a.vcf.lab,10.1.1.90,10.0.0.0/8"
 
   pre_tasks:
     - name: Have we run before?
