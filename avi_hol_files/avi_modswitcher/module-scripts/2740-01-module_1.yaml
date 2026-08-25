@@ -26,9 +26,9 @@
       AVI_HOST: 'alb-a.site-a.vcf.lab'
       NSX_HOST: 'nsx-wld01-a.site-a.vcf.lab'
       AVI_USER: 'admin'
-      AVI_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      AVI_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
       NSX_USER: 'admin'
-      NSX_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      NSX_PASSWORD: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
     register: script_output
 
   - name: Print the script stdout
@@ -41,7 +41,7 @@
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-vm.yaml.j2') | from_yaml_all | list }}"
       context: "Supervisor"
     vars:
-      db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+      db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
 
   - name: Query vSphere VMService for external status allocation
     kubernetes.core.k8s_info:
@@ -116,9 +116,9 @@
       body_format: form-urlencoded
       body:
         user: "admin"
-        pass: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
+        pass: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
     register: technitium_auth
-    no_log: true # Prevents logging the token/password
+    no_log: true
 
   - name: Create or overwrite A Record
     ansible.builtin.uri:
