@@ -371,7 +371,7 @@
           use_true_client_ip: true
 
     - name: "System-TCP-Proxy turn off autolearn"
-      vmware.alb.avi_applicationprofile:
+      vmware.alb.avi_networkprofile:
         avi_credentials: "{{ avi_credentials }}"
         # avi_api_patch_op: replace
         # avi_api_update_method: patch
@@ -382,7 +382,7 @@
             receive_window: 1024
 
     - name: "System-TCP-Proxy in acme-east-a tenant turn off autolearn"
-      vmware.alb.avi_applicationprofile:
+      vmware.alb.avi_networkprofile:
         avi_credentials: "{{ avi_credentials }}"
         # avi_api_patch_op: replace
         # avi_api_update_method: patch
