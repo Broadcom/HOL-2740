@@ -4,9 +4,9 @@ metadata:
   name: external-ip-pool-01
 spec:
   ipRanges:
-  - cidr: 192.168.16.40/29
+  - cidr: 10.150.6.0/29
   subnetInfo:
     prefixLength: 28
     vlan: 1001
-    gateway:  192.168.16.33
+    gateway:  10.150.6.1
   nodeSelector: {}
