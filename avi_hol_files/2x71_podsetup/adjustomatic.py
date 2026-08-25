@@ -38,6 +38,97 @@ VKS_SUPERVISOR_NS = 'acme-east-prod-wrp4h'
 VKS_WORKLOAD_CLUSTERS = ('workload-cluster-1',)
 
 
+def add_cidr_to_ipspace(lsf, ipspace_name, cidr_to_add):
+    """
+    Add a CIDR to a VCF Automation external IP address space via the provider API.
+    Uses VCFA's cloudapi session auth with 'system' org (provider management context).
+    Endpoint: /cloudapi/v1/ipSpaces with internalScopeCidrBlocks array.
+    Idempotent: no-ops if the CIDR already exists in the space.
+    """
+    import base64
+    import requests
+
+    VCFA_HOST = 'auto-a.site-a.vcf.lab'
+    VCFA_ORG = 'system'  # Provider management uses 'system' org
+    VCFA_USERNAME = f'admin@{VCFA_ORG}'
+    admin_password = lsf.get_password()
+
+    try:
+        # Get VCFA provider management access token
+        creds = base64.b64encode(f'{VCFA_USERNAME}:{admin_password}'.encode()).decode()
+        resp = requests.post(
+            f'https://{VCFA_HOST}/cloudapi/1.0.0/sessions/provider',
+            headers={
+                'Authorization': f'Basic {creds}',
+                'Accept': 'application/json;version=9.0.0',
+                'Content-Type': 'application/json;version=9.0.0'
+            },
+            verify=False, timeout=15,
+        )
+        if resp.status_code != 200:
+            lsf.write_output(f'  WARNING: VCFA provider login failed (HTTP {resp.status_code}): {resp.text[:200]}')
+            return False
+
+        access_token = resp.headers.get('x-vmware-vcloud-access-token')
+        if not access_token:
+            lsf.write_output('  WARNING: VCFA login succeeded but no x-vmware-vcloud-access-token header')
+            return False
+
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Accept': 'application/json;version=9.0.0',
+            'Content-Type': 'application/json'
+        }
+
+        # Get all IP spaces to find the one we need
+        url = f'https://{VCFA_HOST}/cloudapi/v1/ipSpaces?page=1&pageSize=100'
+        resp = requests.get(url, headers=headers, verify=False, timeout=15)
+
+        if resp.status_code != 200:
+            lsf.write_output(f'  WARNING: could not list IP spaces (HTTP {resp.status_code}): {resp.text[:200]}')
+            return False
+
+        ipspaces_response = resp.json()
+        ipspace_list = ipspaces_response.get('values', [])
+        ipspace_obj = next((ip for ip in ipspace_list if ip.get('name') == ipspace_name), None)
+
+        if not ipspace_obj:
+            lsf.write_output(f'  WARNING: IP space {ipspace_name} not found')
+            return False
+
+        # Check if CIDR already exists in internalScopeCidrBlocks
+        cidr_blocks = ipspace_obj.get('internalScopeCidrBlocks', []) or []
+        if any(block.get('cidr') == cidr_to_add for block in cidr_blocks):
+            lsf.write_output(f'  {ipspace_name}: CIDR {cidr_to_add} already present -- no-op')
+            return True
+
+        # Add new CIDR block
+        import uuid
+        new_block = {
+            'id': ipspace_name,
+            'name': f'{ipspace_name}-{uuid.uuid4().hex[:5]}',
+            'cidr': cidr_to_add
+        }
+        cidr_blocks.append(new_block)
+        ipspace_obj['internalScopeCidrBlocks'] = cidr_blocks
+
+        # Update IP space via PUT
+        ipspace_id = ipspace_obj.get('id')
+        url = f'https://{VCFA_HOST}/cloudapi/v1/ipSpaces/{ipspace_id}'
+        resp = requests.put(url, json=ipspace_obj, headers=headers, verify=False, timeout=15)
+
+        if resp.status_code not in (200, 201, 204):
+            lsf.write_output(f'  WARNING: failed to update {ipspace_name} (HTTP {resp.status_code}): {resp.text[:200]}')
+            return False
+
+        lsf.write_output(f'  {ipspace_name}: added CIDR {cidr_to_add}')
+        return True
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: error updating IP space: {e}')
+        return False
+
+
 def scale_vks_worker_nodepools(lsf, target_replicas=3):
     """
     Scale the worker node pool of each cluster in VKS_WORKLOAD_CLUSTERS up
@@ -3838,6 +3929,13 @@ def main():
         # skips on any failure rather than failing the lab.
         with track_step(lsf, _telemetry_results, 'vcfa_namespace_storage_quota'):
             install_vcfa_blueprints.patch_supervisor_namespace_storage_quota(lsf)
+
+        # VCF Automation external IP address space configuration -- add
+        # required CIDR blocks for workload domain external IP pool.
+        # Non-fatal; logs and skips on any failure rather than failing the lab.
+        with track_step(lsf, _telemetry_results, 'vcfa_ipspace_cidrs'):
+            lsf.write_output('Configuring VCF Automation IP address spaces')
+            add_cidr_to_ipspace(lsf, 'ipspace-wld-a', '10.150.6.0/23')
 
         # try:
         #     lsf.write_output("Running first stages playbook")
