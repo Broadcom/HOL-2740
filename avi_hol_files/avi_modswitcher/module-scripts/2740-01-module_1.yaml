@@ -111,7 +111,7 @@
   
   - name: Authenticate with Technitium DNS
     ansible.builtin.uri:
-      url: "http://10.1.10.129:5380/api/user/login"
+      url: "http://dns.vcf.lab:5380/api/user/login"
       method: POST
       body_format: form-urlencoded
       body:
@@ -119,10 +119,15 @@
         pass: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
     register: technitium_auth
     no_log: true
+    environment:
+      #http_proxy: http://proxy:3128
+      #https_proxy: http://proxy:3128
+      no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+      NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
 
   - name: Create or overwrite A Record
     ansible.builtin.uri:
-      url: "http://10.1.10.129:5380/api/zones/records/add"
+      url: "http://dns.vcf.lab:5380/api/zones/records/add"
       method: POST
       body_format: form-urlencoded
       body:
@@ -136,10 +141,15 @@
     # Optional: URI module will always report 'changed' on a successful POST. 
     # You can suppress that if you want strict visual idempotency in your playbook output.
     changed_when: false
+    environment:
+      #http_proxy: http://proxy:3128
+      #https_proxy: http://proxy:3128
+      no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+      NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
 
   - name: Create or overwrite A Record
     ansible.builtin.uri:
-      url: "http://10.1.10.129:5380/api/zones/records/add"
+      url: "http://dns.vcf.lab:5380/api/zones/records/add"
       method: POST
       body_format: form-urlencoded
       body:
@@ -153,3 +163,8 @@
     # Optional: URI module will always report 'changed' on a successful POST. 
     # You can suppress that if you want strict visual idempotency in your playbook output.
     changed_when: false
+    environment:
+      #http_proxy: http://proxy:3128
+      #https_proxy: http://proxy:3128
+      no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+      NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
