@@ -216,10 +216,10 @@ def main(lsf=None, standalone=False, dry_run=False):
     #==========================================================================
     # TASK 2: Final Verification (Pings and URLs)
     #==========================================================================
-    
+
     if not dry_run:
         lsf.write_output('Running final resource verification...')
-        
+
         # Check Pings one last time
         if lsf.config.has_option('RESOURCES', 'Pings'):
             pings_raw = lsf.config.get('RESOURCES', 'Pings')
@@ -227,26 +227,26 @@ def main(lsf=None, standalone=False, dry_run=False):
                 pings = [p.strip() for p in pings_raw.split('\n') if p.strip()]
             else:
                 pings = [p.strip() for p in pings_raw.split(',') if p.strip()]
-            
+
             for host in pings:
                 if lsf.test_ping(host, count=1, timeout=2):
                     # Quiet success
                     pass
                 else:
                     lsf.write_output(f'Final ping FAIL: {host}')
-        
+
         # Check URLs one last time
         if lsf.config.has_option('RESOURCES', 'URLS'):
             urls_raw = lsf.config.get('RESOURCES', 'URLS')
             url_targets = []
-            
+
             # Parse properly like in urls.py
             for line in urls_raw.split('\n'):
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
                 url_targets.append(line)
-            
+
             for url_spec in url_targets:
                 if ',' in url_spec:
                     parts = url_spec.split(',', 1)
@@ -255,7 +255,7 @@ def main(lsf=None, standalone=False, dry_run=False):
                 else:
                     url = url_spec.strip()
                     expected_text = None
-                
+
                 if url:
                     # Quick check, 5 second timeout, ignore SSL
                     if lsf.test_url(url, expected_text=expected_text, verify_ssl=False, timeout=5):
@@ -264,16 +264,6 @@ def main(lsf=None, standalone=False, dry_run=False):
                         lsf.write_output(f'Final URL FAIL: {url}')
                         if expected_text:
                              lsf.write_output(f'  Expected: {expected_text}')
-
-    ##=========================================================================
-    ## CUSTOM - Insert your code here using the file in your vPod_repo
-    ##=========================================================================
-    
-    # Example: Add custom final checks here
-    
-    ##=========================================================================
-    ## End CUSTOM section
-    ##=========================================================================
 
     #==========================================================================
     # TASK 3: LabCheck Schedule
@@ -368,6 +358,47 @@ def main(lsf=None, standalone=False, dry_run=False):
             lsf.write_output(f'Cleared alarms on {cleared} vCenter session(s)')
         except Exception as e:
             lsf.write_output(f'Could not clear vCenter alarms: {e}')
+
+    ##=========================================================================
+    ## CUSTOM - Insert your code here using the file in your vPod_repo
+    ##=========================================================================
+    ## Moved here (2026-07-25) from after TASK 9, at the very end of this
+    ## file. It ran there for a long time, but TASK 6 (Signal Router) below
+    ## fires lsf.signal_router('ready') -- which the router's getrules.sh
+    ## treats as the signal to switch squid from the permissive
+    ## startup-only allowlist (merged with the lab's startlist, e.g.
+    ## powershellgallery.com) to the final restrictive one. With
+    ## adjustomatic running AFTER that signal, anything it does that needs
+    ## startlist-only destinations (e.g. installing the PowerCLI
+    ## VMware.vSphere.SsoAdmin module) was silently failing because the
+    ## router had already locked down proxy access before adjustomatic
+    ## even started. Running it here, before the ready signal, fixes that.
+    ##=========================================================================
+
+    lsf.write_vpodprogress('Running adjustomatic', 'GOOD-9')
+    lsf.write_output('Running adjustomatic')
+    # Re-enabled (2026-08-04): the 2026-08-01 controlled corruption test
+    # (commit 3a0d131) confirmed the NSX<->Avi TLS cert-chain corruption
+    # traced to resync_nsxt_alb_enforcement_point_tokens() /
+    # resync_nsxt_alb_cloud_connector_credentials(). Those two functions
+    # stay commented out inside adjustomatic.main() itself (see that
+    # function's body) -- do not re-enable them without a real fix. Every
+    # other adjustomatic step, including the VCFA blueprint installer, is
+    # safe to run again.
+    if not lsf.labcheck:
+        try:
+            sys.path.append('/vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup')
+            import adjustomatic
+            adjustomatic.main()
+        except Exception as e:
+            lsf.write_output(e)
+            lsf.write_output("could not import or an error occured with adjustomatic script")
+            lsf.labfail('Adjustomatic script failed')
+            exit(1)
+
+    ##=========================================================================
+    ## End CUSTOM section
+    ##=========================================================================
 
     #==========================================================================
     # TASK 6: Lab Ready Recording & Signal Router

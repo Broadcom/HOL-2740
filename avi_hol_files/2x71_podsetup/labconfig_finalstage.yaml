@@ -193,6 +193,27 @@
 
 
 #######
+## Settings for adjusting terminal colors for readability
+
+    - name: Set 'ls' directory colors to bold cyan
+      ansible.builtin.lineinfile:
+        path: ~/.bashrc
+        line: 'export LS_COLORS="${LS_COLORS}:di=01;36"'
+        state: present
+        insertafter: EOF
+
+    - name: Change prompt (PS1) working directory color to cyan
+      ansible.builtin.replace:
+        path: ~/.bashrc
+        # Search for the bold blue color code
+        regexp: '01;34m'
+        # Replace it with bold cyan
+        replace: '01;36m'
+        # Constrain the search to only the PS1 prompt section to be safe
+        after: 'if \[ "\$color_prompt" = yes \]; then'
+        before: 'unset color_prompt'
+#####
+
 
     # - name: copy kubeconfig for AMKO
     #   copy:
