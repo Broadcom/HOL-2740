@@ -179,6 +179,11 @@
   gather_facts: false
 
   tasks:
+    - name: Wait for the host to be reachable via SSH
+      ansible.builtin.wait_for_connection:
+        delay: 20     # Number of seconds to wait before starting the check
+        timeout: 300  # Maximum number of seconds to wait for a successful connection
+
     - name: Execute mysqladmin to flush hosts
       ansible.builtin.command: "mysqladmin -u root -p'{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}' flush-hosts"
       register: flush_result
