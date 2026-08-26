@@ -168,3 +168,30 @@
       #https_proxy: http://proxy:3128
       no_proxy: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
       NO_PROXY: "dns.vcf.lab, localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
+
+  - name: Add MySQL DB host dynamically
+    ansible.builtin.add_host:
+      name: 3tierapp-db.site-a.vcf.lab
+
+- name: Resolve MySQL blocked host issue
+  hosts: 3tierapp-db.site-a.vcf.lab
+  remote_user: holuser
+  gather_facts: false
+
+  tasks:
+    - name: Execute mysqladmin to flush hosts
+      ansible.builtin.command: "mysqladmin -u root -p'{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}' flush-hosts"
+      register: flush_result
+      # Optional: Use 'become: true' if holuser needs sudo to run this
+      
+    - name: Display flush command output
+      ansible.builtin.debug:
+        var: flush_result.stdout
+
+    - name: Increase max_connect_errors limit dynamically
+      ansible.builtin.command: "mysql -u root -p'{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}' -e 'SET GLOBAL max_connect_errors = 4294967295;'"
+      register: set_var_result
+      
+    - name: Display set variable output
+      ansible.builtin.debug:
+        var: set_var_result.stdout
