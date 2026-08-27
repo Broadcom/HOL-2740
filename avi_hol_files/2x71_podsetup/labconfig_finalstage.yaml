@@ -124,6 +124,33 @@
             extra_args: --index-url https://packages.vcfd.broadcom.net/artifactory/api/pypi/pypi-remote/simple
             virtualenv: /home/holuser/py312venv
 
+
+
+    - name: Configure Docker daemon proxy settings
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          {
+            "proxies": {
+              "http-proxy": "http://proxy.site-a.vcf.lab:3128",
+              "https-proxy": "http://proxy.site-a.vcf.lab:3128",
+              "no-proxy": "localhost,127.0.0.1,harbor.site-a.vcf.lab,.vcf.lab"
+            }
+          }
+      register: docker_daemon_config
+      become: true
+
+    - name: Restart Docker service if daemon.json was modified
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+      when: docker_daemon_config.changed
+      become: true
+
+
     ##  Use readme in the root folder of git repo
     - name: Update readme on desktop
       copy:
