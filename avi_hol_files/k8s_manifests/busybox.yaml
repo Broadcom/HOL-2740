@@ -7,5 +7,5 @@ metadata:
 spec:
   containers:
   - name: busybox
-    image: quay.io/quay/busybox
+    image: harbor.site-a.vcf.lab/library/busybox
     command: ["/bin/sh", "-c", "sleep 3600"]
