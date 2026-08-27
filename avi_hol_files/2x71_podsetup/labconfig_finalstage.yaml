@@ -293,12 +293,12 @@
 
     - name: Pull BusyBox image from Quay
       community.docker.docker_image:
-        name: quay.io/busybox/busybox:latest
+        name: quay.io/quay/busybox:latest
         source: pull
 
     - name: Tag and push BusyBox image to Harbor
       community.docker.docker_image:
-        name: quay.io/busybox/busybox:latest
+        name: quay.io/quay/busybox:latest
         repository: harbor.site-a.vcf.lab/library/busybox:latest
         push: true
         source: local
