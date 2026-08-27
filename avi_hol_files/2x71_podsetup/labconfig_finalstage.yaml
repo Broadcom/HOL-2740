@@ -261,6 +261,22 @@
       loop:
         - 'file:///hol/migrationtools/uploads uploads' 
         - 'file:///hol/hol-2740/migration_files/f5_migration f5_migration' 
+        - 'file://hol/hol-2740/k8s_manifests k8s_manifests'
+
+
+    - name: Pull BusyBox image from Quay
+      community.docker.docker_image:
+        name: quay.io/busybox/busybox:latest
+        source: pull
+
+    - name: Tag and push BusyBox image to Harbor
+      community.docker.docker_image:
+        name: quay.io/busybox/busybox:latest
+        repository: harbor.site-a.vcf.lab/library/busybox:latest
+        push: true
+        source: local
+
+
 
 
     # - name: Pull traffic generator image
