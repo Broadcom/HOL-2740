@@ -129,6 +129,107 @@ def add_cidr_to_ipspace(lsf, ipspace_name, cidr_to_add):
         return False
 
 
+def ensure_ipspace_quota(lsf, ipspace_name, min_max_cidr_count):
+    """
+    Ensure an IP space's defaultQuota.maxCidrCount is at least min_max_cidr_count,
+    via the VCF Automation provider API (/cloudapi/v1/ipSpaces).
+
+    Each VPC subnet (kind: Subnet, crd.nsx.vmware.com/v1alpha1, created via the
+    Supervisor context -- see subnet-public1.yaml) consumes one CIDR allocation
+    slot from its namespace's IP space. VCFA's default quota only allows 1 --
+    confirmed live 2026-08-29 that a pod with a pre-existing egress-subnet (its
+    own CIDR consumer, unrelated to VM networking -- see egress-subnet.yaml)
+    already exhausts that slot, so any new public subnet for VM Operator
+    networking (e.g. the 3-tier app's public-subnet-attached VMs) fails to
+    realize with NSX error 520059 ("IpAddressBlocks ... have exceeded quota")
+    even though the underlying NSX IP block itself has plenty of free capacity
+    -- this is a VCFA-level policy quota, not a real address-space shortage.
+
+    Idempotent: no-ops if the current quota already meets or exceeds
+    min_max_cidr_count. Quota updates are async (HTTP 202) -- this polls
+    briefly for REALIZED status but does not fail the lab if it doesn't
+    confirm in time (a subsequent subnet-creation step will simply retry
+    against a settling quota).
+    """
+    import base64
+    import requests
+    import time as _time
+
+    VCFA_HOST = 'auto-a.site-a.vcf.lab'
+    VCFA_ORG = 'system'
+    VCFA_USERNAME = f'admin@{VCFA_ORG}'
+    admin_password = lsf.get_password()
+
+    try:
+        creds = base64.b64encode(f'{VCFA_USERNAME}:{admin_password}'.encode()).decode()
+        resp = requests.post(
+            f'https://{VCFA_HOST}/cloudapi/1.0.0/sessions/provider',
+            headers={
+                'Authorization': f'Basic {creds}',
+                'Accept': 'application/json;version=9.0.0',
+                'Content-Type': 'application/json;version=9.0.0'
+            },
+            verify=False, timeout=15,
+        )
+        if resp.status_code != 200:
+            lsf.write_output(f'  WARNING: VCFA provider login failed (HTTP {resp.status_code}): {resp.text[:200]}')
+            return False
+
+        access_token = resp.headers.get('x-vmware-vcloud-access-token')
+        if not access_token:
+            lsf.write_output('  WARNING: VCFA login succeeded but no x-vmware-vcloud-access-token header')
+            return False
+
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Accept': 'application/json;version=9.0.0',
+            'Content-Type': 'application/json'
+        }
+
+        url = f'https://{VCFA_HOST}/cloudapi/v1/ipSpaces?page=1&pageSize=100'
+        resp = requests.get(url, headers=headers, verify=False, timeout=15)
+        if resp.status_code != 200:
+            lsf.write_output(f'  WARNING: could not list IP spaces (HTTP {resp.status_code}): {resp.text[:200]}')
+            return False
+
+        ipspace_list = resp.json().get('values', [])
+        ipspace_obj = next((ip for ip in ipspace_list if ip.get('name') == ipspace_name), None)
+        if not ipspace_obj:
+            lsf.write_output(f'  WARNING: IP space {ipspace_name} not found')
+            return False
+
+        current_max_cidr = ipspace_obj.get('defaultQuota', {}).get('maxCidrCount')
+        if current_max_cidr is not None and current_max_cidr >= min_max_cidr_count:
+            lsf.write_output(f'  {ipspace_name}: maxCidrCount already {current_max_cidr} -- no-op')
+            return True
+
+        ipspace_obj.setdefault('defaultQuota', {})['maxCidrCount'] = min_max_cidr_count
+        ipspace_id = ipspace_obj.get('id')
+        put_url = f'https://{VCFA_HOST}/cloudapi/v1/ipSpaces/{ipspace_id}'
+        resp = requests.put(put_url, json=ipspace_obj, headers=headers, verify=False, timeout=20)
+
+        if resp.status_code not in (200, 202):
+            lsf.write_output(f'  WARNING: failed to update {ipspace_name} quota (HTTP {resp.status_code}): {resp.text[:200]}')
+            return False
+
+        # Async task -- briefly poll for REALIZED before moving on (non-fatal if it doesn't confirm in time).
+        for _ in range(10):
+            _time.sleep(3)
+            resp = requests.get(put_url, headers=headers, verify=False, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('status') == 'REALIZED' and data.get('defaultQuota', {}).get('maxCidrCount', 0) >= min_max_cidr_count:
+                    lsf.write_output(f'  {ipspace_name}: maxCidrCount raised to {min_max_cidr_count}')
+                    return True
+
+        lsf.write_output(f'  {ipspace_name}: quota update submitted but not confirmed REALIZED within poll window')
+        return True
+
+    except Exception as e:
+        lsf.write_output(f'  WARNING: error updating IP space quota: {e}')
+        return False
+
+
 def scale_vks_worker_nodepools(lsf, target_replicas=3):
     """
     Scale the worker node pool of each cluster in VKS_WORKLOAD_CLUSTERS up
@@ -3936,6 +4037,15 @@ def main():
         with track_step(lsf, _telemetry_results, 'vcfa_ipspace_cidrs'):
             lsf.write_output('Configuring VCF Automation IP address spaces')
             add_cidr_to_ipspace(lsf, 'ipspace-wld-a', '10.150.6.0/23')
+
+        # Raise ipspace-wld-a's per-VPC subnet quota so the 3-tier app's
+        # public subnet (subnet-public1.yaml, applied by the 2740-01
+        # modswitcher module) can coexist with the pre-existing
+        # egress-subnet -- see ensure_ipspace_quota()'s docstring for the
+        # 2026-08-29 "IpAddressBlocks ... have exceeded quota" incident this
+        # guards against. Non-fatal; logs and skips on any failure.
+        with track_step(lsf, _telemetry_results, 'vcfa_ipspace_quota'):
+            ensure_ipspace_quota(lsf, 'ipspace-wld-a', 2)
 
         # try:
         #     lsf.write_output("Running first stages playbook")

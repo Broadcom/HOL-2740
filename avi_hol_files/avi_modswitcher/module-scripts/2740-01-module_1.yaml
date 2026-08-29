@@ -12,23 +12,15 @@
       definition: "{{ lookup('file', '/hol/hol-2740/avimart_demo/antrea-addonconfig.yaml') | from_yaml }}"
       context: "Supervisor"
 
+  - name: Create public subnet for VM network interface
+    kubernetes.core.k8s:
+      state: present
+      definition: "{{ lookup('file', '/hol/hol-2740/avi_hol_files/k8s_manifests/subnet-public1.yaml') | from_yaml }}"
+      context: "Supervisor"
+
   - name: Change the active kubeconfig context globally on disk
     ansible.builtin.shell:
       cmd: kubectl config use-context workload-cluster-1
-
-  - name: Create public subnet in VCF Automation provider portal
-    ansible.builtin.shell:
-      cmd: python3 /hol/hol-2740/avi_hol_files/avi_modswitcher/module-scripts/create_public_subnet.py auto-a.site-a.vcf.lab "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}" default-us-east-1-subnet-public1 us-east-1 default-us-east-1 ipspace-wld-a
-    register: subnet_creation
-    ignore_errors: true
-    environment:
-      PYTHONPATH: /home/holuser/py312venv/lib/python3.12/site-packages
-
-  - name: Display subnet creation output
-    ansible.builtin.debug:
-      var: subnet_creation.stdout_lines
-    when: subnet_creation.stdout_lines is defined
-
 
   - name: Run setup script
     ansible.builtin.shell:
@@ -56,21 +48,21 @@
     vars:
       db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
 
-  - name: Query vSphere VMService for external status allocation
+  - name: Query VirtualMachine for its assigned public-subnet IP
     kubernetes.core.k8s_info:
       context: "Supervisor"
       api_version: vmoperator.vmware.com/v1alpha5
-      kind: VirtualMachineService
+      kind: VirtualMachine
       name: "mysql-db"
       namespace: "acme-east-prod-wrp4h"
-    register: db_vm_svc_info
-    until: "db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+    register: db_vm_info
+    until: "db_vm_info.resources[0].status.network.primaryIP4 is defined"
     retries: 30
     delay: 10
 
   - name: Store Database Node IP internally
     ansible.builtin.set_fact:
-      global_db_ip: "{{ db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
+      global_db_ip: "{{ db_vm_info.resources[0].status.network.primaryIP4 }}"
 
   - name: Parse backend template and apply to cluster
     kubernetes.core.k8s:

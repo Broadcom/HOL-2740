@@ -21,10 +21,13 @@ spec:
   className: best-effort-small
   powerState: PoweredOn
   storageClass: cluster-wld01-01a-optimal-datastore-default-policy-autoraid
-  networkInterfaces:
-    - name: eth0
-      subnetRef:
-        name: default-us-east-1-subnet-public1
+  network:
+    interfaces:
+      - name: eth0
+        network:
+          apiVersion: crd.nsx.vmware.com/v1alpha1
+          kind: Subnet
+          name: subnet-public1
   bootstrap:
     cloudInit:
       cloudConfig:
@@ -92,25 +95,3 @@ spec:
           - "groupadd -f admingroup"
           - "usermod -aG admingroup root"
           - "usermod -aG admingroup sys"
-
-
-
----
-apiVersion: vmoperator.vmware.com/v1alpha5
-kind: VirtualMachineService
-metadata:
-  name: mysql-db
-  namespace: acme-east-prod-wrp4h
-spec:
-  ports:
-  - name: ssh
-    port: 22
-    protocol: TCP
-    targetPort: 22
-  - name: mysql
-    port: 3306
-    protocol: TCP
-    targetPort: 3306
-  selector:
-    vm.name: db-vm
-  type: LoadBalancer

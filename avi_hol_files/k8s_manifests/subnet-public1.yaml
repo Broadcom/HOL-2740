@@ -1,0 +1,10 @@
+apiVersion: crd.nsx.vmware.com/v1alpha1
+kind: Subnet
+metadata:
+  name: subnet-public1
+  namespace: acme-east-prod-wrp4h
+spec:
+  accessMode: Public
+  subnetDHCPConfig:
+    mode: DHCPServer
+  ipv4SubnetSize: 64
