@@ -21,6 +21,10 @@ spec:
   className: best-effort-small
   powerState: PoweredOn
   storageClass: cluster-wld01-01a-optimal-datastore-default-policy-autoraid
+  networkInterfaces:
+    - name: eth0
+      subnetRef:
+        name: default-us-east-1-subnet-public1
   bootstrap:
     cloudInit:
       cloudConfig:

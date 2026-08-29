@@ -16,6 +16,19 @@
     ansible.builtin.shell:
       cmd: kubectl config use-context workload-cluster-1
 
+  - name: Create public subnet in VCF Automation provider portal
+    ansible.builtin.shell:
+      cmd: python3 /hol/hol-2740/avi_hol_files/avi_modswitcher/module-scripts/create_public_subnet.py auto-a.site-a.vcf.lab "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}" default-us-east-1-subnet-public1 us-east-1 default-us-east-1 ipspace-wld-a
+    register: subnet_creation
+    ignore_errors: true
+    environment:
+      PYTHONPATH: /home/holuser/py312venv/lib/python3.12/site-packages
+
+  - name: Display subnet creation output
+    ansible.builtin.debug:
+      var: subnet_creation.stdout_lines
+    when: subnet_creation.stdout_lines is defined
+
 
   - name: Run setup script
     ansible.builtin.shell:
