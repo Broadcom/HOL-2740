@@ -302,6 +302,8 @@
         repository: harbor.site-a.vcf.lab/library/busybox:latest
         push: true
         source: local
+      retries: 20
+      delay: 5
 
 
 
