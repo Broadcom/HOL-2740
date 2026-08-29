@@ -291,11 +291,20 @@
         {{ (mysql_db_guest_net.json | selectattr('ip', 'defined') | map(attribute='ip.ip_addresses') | sum(start=[])
             | selectattr('state', 'equalto', 'PREFERRED') | map(attribute='ip_address') | first) }}
 
+  - name: Create a namespace called '3tierapp'
+    kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: 3tierapp
+
   - name: Parse backend template and apply to cluster
     kubernetes.core.k8s:
       context: "workload-cluster-1"
       state: present
-      namespace: default
+      namespace: 3tierapp
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       db_vm_ip: "{{ global_db_ip }}"
@@ -306,7 +315,7 @@
       api_version: v1
       kind: Service
       name: backend-app-service
-      namespace: default
+      namespace: 3tierapp
     register: backend_svc_info
     until: "backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
     retries: 30
@@ -320,7 +329,7 @@
     kubernetes.core.k8s:
       context: "workload-cluster-1"
       state: present
-      namespace: default
+      namespace: 3tierapp
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       backend_service_ip: "{{ global_backend_ip }}"
@@ -331,7 +340,7 @@
       api_version: v1
       kind: Service
       name: frontend-app-service
-      namespace: default
+      namespace: 3tierapp
     register: frontend_svc_info
     until: "frontend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
     retries: 30
