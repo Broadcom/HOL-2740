@@ -209,12 +209,23 @@
   # 2026-08-29 via the library item's `?action=filter` response. That's
   # stable across pod rebuilds; only the dvportgroup id on the right-hand
   # side is pod-specific, hence the lookup above instead of hardcoding it.
+  #
+  # This synchronous deploy call (OVF import + disk clone) has taken well
+  # over 30s in practice -- Ansible's uri module default timeout -- and a
+  # client-side read timeout does NOT mean the deploy failed: the request
+  # was already accepted and vCenter keeps building the VM after Ansible
+  # gives up waiting on the response. Confirmed live 2026-08-29 (a run that
+  # "failed" here had actually deployed the VM). So: a long explicit
+  # timeout as the main defense, plus ignore_errors so a timeout that
+  # happens anyway doesn't abort the play -- the retrying vm-id lookup
+  # right below this will simply wait for the VM to show up either way.
   - name: Deploy mysql-db from the Ubuntu 24.04 OVF template
     ansible.builtin.uri:
       url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/ovf/library-item/{{ ubuntu_ovf_item_id }}?action=deploy"
       method: POST
       headers: "{{ vc_headers }}"
       validate_certs: false
+      timeout: 600
       body_format: json
       body:
         target:
@@ -241,10 +252,14 @@
                   value: "{{ mysql_db_userdata_b64 }}"
       status_code: 200
     when: not existing_mysql_db_vm_id
+    ignore_errors: true
 
   # Re-list rather than trust the deploy response's own resource_id field --
   # simpler and matches how the VM was located everywhere else in this task
-  # (existence check above, power-on/guest-IP lookup below).
+  # (existence check above, power-on/guest-IP lookup below). Retries so a
+  # deploy call that outlived its own timeout above still gets picked up
+  # once vCenter actually finishes creating the VM, rather than failing
+  # immediately on a one-shot lookup.
   - name: Resolve mysql-db's vm id
     ansible.builtin.uri:
       url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/vm"
@@ -252,19 +267,26 @@
       headers: "{{ vc_headers }}"
       validate_certs: false
     register: vc_vms_after_deploy
+    until: (vc_vms_after_deploy.json | selectattr('name', 'equalto', 'mysql-db') | list | length) > 0
+    retries: 30
+    delay: 10
 
   - name: Set fact for mysql-db's vm id
     ansible.builtin.set_fact:
       mysql_db_vm_id: "{{ (vc_vms_after_deploy.json | selectattr('name', 'equalto', 'mysql-db') | map(attribute='vm') | first) }}"
 
-  - name: Power on mysql-db
+  # Unconditional (not gated on existing_mysql_db_vm_id) so re-running this
+  # play against an already-existing-but-powered-off mysql-db still leaves
+  # it running, instead of silently skipping power-on and then hanging
+  # forever in the guest-IP wait below. 400 is tolerated for the (far more
+  # common) case where it's already powered on.
+  - name: Ensure mysql-db is powered on
     ansible.builtin.uri:
       url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/vm/{{ mysql_db_vm_id }}/power?action=start"
       method: POST
       headers: "{{ vc_headers }}"
       validate_certs: false
       status_code: [204, 400]
-    when: not existing_mysql_db_vm_id
 
   # /guest/networking/interfaces 503s ("VMware Tools are not running") until
   # cloud-init's first boot finishes bringing up Tools -- tolerate that and
