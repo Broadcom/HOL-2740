@@ -1,0 +1,66 @@
+#cloud-config
+# Rendered by 2740-01-module_1.yaml and passed to vCenter as the OVF
+# "user-data" property (base64-encoded) when deploying mysql-db directly via
+# the vCenter REST API -- see that playbook's "Deploy the mysql-db VM" tasks
+# for why this is no longer a VM Operator VirtualMachine manifest. Content
+# (users/write_files/runcmd) is unchanged from the old mysql-vm.yaml.j2.
+ssh_pwauth: true
+users:
+  - name: holuser
+    gecos: holuser
+    plain_text_passwd: "{{ db_password }}"
+    lock_passwd: false
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    groups:
+      - sudo
+      - users
+      - admin
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7g2UVzeb551EVgpvy24KlswRL7Nr5cbJm/tuObWuw2HpUZ5HtoFyV3SbRyWWAU+CJDw0OaZVoxOGB5zV8jyKWoVrU4HAB7dABZNXXBreAbat7h9kf03KeJofRO/KFqj47FDJhj2yE3nCArK4aeOiuum4p7t7KL6zFXbXs7DGxeuEtxONLvMDqhyDyyQSJ7VUlA8AnO7mdHtnZ1kfTE/EHH0lj3qxaiZqkNC2onn/d64ctsGcmzgCt9BkgooQNd3c8HMCVs5LIZrc2ZbZvGGOvmApZwNCnKooTFGDawTNflPEV3FNdN6VN3lrR3mhaVKN5N2BS3froY/gY3Tq4a0kd
+
+write_files:
+  - content: |
+      ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ db_password }}';
+    append: true
+    path: /alteruser.txt
+
+  - content: |
+      CREATE USER 'holuser'@'%' IDENTIFIED WITH mysql_native_password BY '{{ db_password }}';
+      CREATE DATABASE demo;
+      GRANT ALL PRIVILEGES ON demo.* TO 'holuser'@'%';
+
+
+      CREATE TABLE demo.user (
+        id INTEGER PRIMARY KEY AUTO_INCREMENT,
+        username varchar(255) NOT NULL,
+        password varchar(255) NOT NULL,
+        UNIQUE (username)
+      );
+
+
+      CREATE TABLE demo.entry (
+        id INTEGER PRIMARY KEY AUTO_INCREMENT,
+        author_id INTEGER NOT NULL,
+        created TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        title varchar(255) NOT NULL,
+        body varchar(5400) NOT NULL,
+        FOREIGN KEY (author_id) REFERENCES user (id)
+      );
+
+      INSERT INTO demo.user (username,password) VALUES('holuser','{{ db_password }}');
+      INSERT INTO demo.entry (author_id,title,body) VALUES(1,"Welcome to the request page, this is the first entry","This entry is owned by holuser and can only be modified by him. You can create your own post by registering and logging in!");
+    append: true
+    path: /init.sql
+
+runcmd:
+  - "apt -o acquire::http::proxy=\"http://10.1.1.1:3128\" -o acquire::https::proxy=false update"
+  - "apt -o acquire::http::proxy=\"http://10.1.1.1:3128\" -o acquire::https::proxy=false -y install mysql-server"
+  - "systemctl start mysql.service"
+  - "mysql < /alteruser.txt"
+  - "mysql -u root -p'{{ db_password }}' < /init.sql"
+  - "sed -i '0,/bind-address/s//#bind-address/' /etc/mysql/mysql.conf.d/mysqld.cnf"
+  - "systemctl restart mysql.service"
+  - "groupadd -f admingroup"
+  - "usermod -aG admingroup root"
+  - "usermod -aG admingroup sys"
