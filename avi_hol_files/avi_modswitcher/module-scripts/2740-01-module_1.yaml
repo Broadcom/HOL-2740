@@ -214,6 +214,7 @@
       url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/ovf/library-item/{{ ubuntu_ovf_item_id }}?action=deploy"
       method: POST
       headers: "{{ vc_headers }}"
+      validate_certs: false
       body_format: json
       body:
         target:
