@@ -113,7 +113,7 @@ def create_public_subnet(vcfa_host, admin_pass, subnet_name='default-us-east-1-s
         'dhcpMode': 'DHCP_SERVER'
     }
 
-    subnet_url = f'https://{vcfa_host}/cloudapi/v1/subnets'
+    subnet_url = f'https://{vcfa_host}/provider/v1/subnets'
     resp = requests.post(subnet_url, json=subnet_payload, headers=headers, verify=False, timeout=15)
 
     if resp.status_code not in (200, 201, 202):
