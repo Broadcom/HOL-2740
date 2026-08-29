@@ -1,3 +1,22 @@
+# Public subnet for the 3-tier app's mysql-db VM (see
+# 3-TierAppDeployment/codeSamples/mysql-vm.yaml.j2's
+# spec.network.interfaces[].network, which refers to this Subnet by name).
+# accessMode: Public + DHCPServer gives the VM a real, directly-routable IP
+# on the workload domain -- no VirtualMachineService/LoadBalancer VIP needed
+# in front of it, unlike a VM on the namespace's default private network.
+#
+# Applied via the Supervisor context (kubectl/kubernetes.core.k8s), NOT the
+# VCF Automation provider-portal REST API -- that API only manages org-level
+# IP address space allocations (ipSpaces/CIDR blocks), it has no endpoint
+# that creates a subnet a VM can actually attach to. Confirmed live
+# 2026-08-29 against a real pod; modeled on the existing egress-subnet.yaml
+# in this same directory.
+#
+# Consumes one CIDR allocation from ipspace-wld-a. That IP space's default
+# per-VPC quota only allows 1 such allocation, and egress-subnet already used
+# it -- so this Subnet will fail to realize with NSX error 520059
+# ("IpAddressBlocks ... have exceeded quota") unless the quota has been
+# raised. adjustomatic.py's ensure_ipspace_quota() does this on every boot.
 apiVersion: crd.nsx.vmware.com/v1alpha1
 kind: Subnet
 metadata:

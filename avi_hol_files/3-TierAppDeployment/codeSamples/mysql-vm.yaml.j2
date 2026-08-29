@@ -21,6 +21,19 @@ spec:
   className: best-effort-small
   powerState: PoweredOn
   storageClass: cluster-wld01-01a-optimal-datastore-default-policy-autoraid
+  # spec.network.interfaces[].network{apiVersion,kind,name} is the real VM
+  # Operator v1alpha5 schema for attaching to a specific network -- confirmed
+  # live via `kubectl explain virtualmachine.spec.network.interfaces.network`
+  # against the Supervisor cluster (2026-08-29); it isn't documented anywhere
+  # else in this repo or in any VCFA blueprint sample. subnet-public1 (see
+  # k8s_manifests/subnet-public1.yaml) must already exist and be REALIZED
+  # before this VM is created, or it will fail to get an IP.
+  #
+  # Because this VM sits on a public/routable subnet, it does NOT need a
+  # VirtualMachineService (LoadBalancer VIP) in front of it the way a
+  # default-private-network VM would -- see 2740-01-module_1.yaml's "Query
+  # VirtualMachine for its assigned public-subnet IP" task, which reads the
+  # VM's own status.network.primaryIP4 directly instead.
   network:
     interfaces:
       - name: eth0

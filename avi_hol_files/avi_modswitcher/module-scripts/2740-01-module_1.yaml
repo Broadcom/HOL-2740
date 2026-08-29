@@ -12,10 +12,21 @@
       definition: "{{ lookup('file', '/hol/hol-2740/avimart_demo/antrea-addonconfig.yaml') | from_yaml }}"
       context: "Supervisor"
 
+  # subnet-public1.yaml (crd.nsx.vmware.com/v1alpha1 Subnet, accessMode: Public)
+  # must exist and be REALIZED before "Deploy the mysql VM" below, since that
+  # VM's spec.network.interfaces[].network refers to it by name. Applying it
+  # here via the Supervisor context (not the VCFA provider-portal REST API --
+  # that API only manages org-level IP address space allocations, it cannot
+  # create a subnet a VM can actually attach to) mirrors the existing
+  # egress-subnet.yaml pattern. If this Subnet ever fails to realize with an
+  # NSX "IpAddressBlocks ... have exceeded quota" error, see
+  # ensure_ipspace_quota() in adjustomatic.py -- confirmed live 2026-08-29
+  # that the ipspace-wld-a IP space's default per-VPC quota only allows 1
+  # subnet, and egress-subnet already consumes that slot.
   - name: Create public subnet for VM network interface
     kubernetes.core.k8s:
       state: present
-      definition: "{{ lookup('file', '/hol/hol-2740/avi_hol_files/k8s_manifests/subnet-public1.yaml') | from_yaml }}"
+      definition: "{{ lookup('file', '/hol/hol-2740/k8s_manifests/subnet-public1.yaml') | from_yaml }}"
       context: "Supervisor"
 
   - name: Change the active kubeconfig context globally on disk
@@ -48,6 +59,13 @@
     vars:
       db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
 
+  # mysql-vm.yaml.j2 no longer creates a VirtualMachineService for mysql-db --
+  # that LoadBalancer-VIP wrapper was only needed because the VM used to sit
+  # on the namespace's default (private) network. Now that it's attached
+  # directly to subnet-public1 (a routable public subnet), the VM already has
+  # its own real IP, so we read that straight from the VirtualMachine object's
+  # status.network.primaryIP4 instead of a service's
+  # status.loadBalancer.ingress[0].ip.
   - name: Query VirtualMachine for its assigned public-subnet IP
     kubernetes.core.k8s_info:
       context: "Supervisor"
