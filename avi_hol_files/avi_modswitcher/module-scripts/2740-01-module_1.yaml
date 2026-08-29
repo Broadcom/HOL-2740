@@ -448,6 +448,16 @@
         delay: 20     # Number of seconds to wait before starting the check
         timeout: 300  # Maximum number of seconds to wait for a successful connection
 
+    # SSH comes up during cloud-init's early user-provisioning stage --
+    # well before the `runcmd` stage that apt-installs and starts
+    # mysql-server. Reachable-via-SSH is not the same as "cloud-init (and
+    # therefore mysql) is done" -- confirmed live 2026-08-29 hitting
+    # "Can't connect to local MySQL server through socket" because the
+    # flush-hosts task below ran while mysql-server was still installing.
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+
     - name: Execute mysqladmin to flush hosts
       ansible.builtin.command: "mysqladmin -u root -p'{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}' flush-hosts"
       register: flush_result
