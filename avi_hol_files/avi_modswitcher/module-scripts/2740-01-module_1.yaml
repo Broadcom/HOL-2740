@@ -16,7 +16,6 @@
     ansible.builtin.shell:
       cmd: kubectl config use-context workload-cluster-1
 
-
   - name: Run setup script
     ansible.builtin.shell:
       cmd: source ./prepare-demo.sh
@@ -35,35 +34,312 @@
     ansible.builtin.debug:
       var: script_output.stdout_lines
 
-  - name: Deploy the mysql VM
-    kubernetes.core.k8s:
-      state: present
-      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-vm.yaml.j2') | from_yaml_all | list }}"
-      context: "Supervisor"
+  # mysql-db is built directly via the vCenter REST API instead of a VM
+  # Operator/VPC-networked VirtualMachine (the old mysql-vm.yaml.j2 approach,
+  # attached to subnet-public1). Reason: subnet-public1 lives in whatever NSX
+  # Project owns this namespace's VPC (Acme-East-A here), and a DFW policy
+  # created in the Default project -- which is where 3tierapp-db_policy and
+  # every other security-policy/group in this repo live -- never gets
+  # realized against objects in a different Project. That's not a bug to
+  # work around with cross-Project Shares; it's project isolation working as
+  # designed. The fix is to put mysql-db back in Default-project scope, on
+  # the same classic NSX segment (wld01-servers) that site1web1/site1web2
+  # already use -- confirmed live 2026-08-29 tracing exactly this symptom
+  # (a pod with no Antrea Egress-CR membership could still reach mysql-db on
+  # 3306 despite a DFW DROP rule that should have blocked it).
+  - name: Authenticate to vCenter (workload domain)
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/session"
+      method: POST
+      url_username: "administrator@wld.sso"
+      url_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
+      force_basic_auth: true
+      validate_certs: false
+      status_code: 201
+    register: vc_session
+    no_log: true
+
+  - name: Set vCenter session header fact
+    ansible.builtin.set_fact:
+      vc_headers:
+        vmware-api-session-id: "{{ vc_session.json }}"
+    no_log: true
+
+  - name: Check for an already-existing mysql-db VM
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/vm"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_existing_vms
+
+  # Explicit empty-string fallback rather than `| first` on a possibly-empty
+  # selectattr result (which raises) or `default(None)` (which some Ansible
+  # versions render as the truthy *string* "None" once passed back through
+  # a `{{ }}` template, silently breaking every `when: not
+  # existing_mysql_db_vm_id` guard below).
+  - name: Note whether mysql-db already exists
+    ansible.builtin.set_fact:
+      existing_mysql_db_vm_id: >-
+        {{ (vc_existing_vms.json | selectattr('name', 'equalto', 'mysql-db') | map(attribute='vm') | list)[0]
+           if (vc_existing_vms.json | selectattr('name', 'equalto', 'mysql-db') | list | length > 0)
+           else '' }}
+
+  - name: Generate a unique cloud-init instance-id
+    ansible.builtin.command: uuidgen
+    register: mysql_db_instance_id
+    changed_when: false
+    when: not existing_mysql_db_vm_id
+
+  - name: Render mysql-db cloud-init user-data
+    ansible.builtin.set_fact:
+      mysql_db_userdata_b64: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-db-cloudinit.yaml.j2') | b64encode }}"
     vars:
       db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
+    when: not existing_mysql_db_vm_id
 
-  - name: Query vSphere VMService for external status allocation
-    kubernetes.core.k8s_info:
-      context: "Supervisor"
-      api_version: vmoperator.vmware.com/v1alpha5
-      kind: VirtualMachineService
-      name: "mysql-db"
-      namespace: "acme-east-prod-wrp4h"
-    register: db_vm_svc_info
-    until: "db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
+  - name: List content library IDs
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/content/library"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_library_ids
+    when: not existing_mysql_db_vm_id
+
+  - name: Get details for each content library
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/content/library/{{ item }}"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    loop: "{{ vc_library_ids.json }}"
+    register: vc_library_details
+    when: not existing_mysql_db_vm_id
+
+  - name: Find the CloudImages library id
+    ansible.builtin.set_fact:
+      cloudimages_library_id: "{{ (vc_library_details.results | selectattr('json.name', 'equalto', 'CloudImages') | map(attribute='item') | first) }}"
+    when: not existing_mysql_db_vm_id
+
+  - name: List items in the CloudImages library
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/content/library/item?library_id={{ cloudimages_library_id }}"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_cloudimages_item_ids
+    when: not existing_mysql_db_vm_id
+
+  - name: Get details for each item in the CloudImages library
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/content/library/item/{{ item }}"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    loop: "{{ vc_cloudimages_item_ids.json }}"
+    register: vc_cloudimages_item_details
+    when: not existing_mysql_db_vm_id
+
+  - name: Find the Ubuntu 24.04 OVF item id
+    ansible.builtin.set_fact:
+      ubuntu_ovf_item_id: "{{ (vc_cloudimages_item_details.results | selectattr('json.name', 'equalto', 'Ubuntu 24.04') | map(attribute='item') | first) }}"
+    when: not existing_mysql_db_vm_id
+
+  - name: List vCenter networks
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/network"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_networks
+    when: not existing_mysql_db_vm_id
+
+  - name: Find the wld01-servers network id
+    ansible.builtin.set_fact:
+      wld01_servers_network_id: "{{ (vc_networks.json | selectattr('name', 'equalto', 'wld01-servers') | map(attribute='network') | first) }}"
+    when: not existing_mysql_db_vm_id
+
+  - name: List vCenter resource pools
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/resource-pool"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_resource_pools
+    when: not existing_mysql_db_vm_id
+
+  - name: Find the top-level Resources pool id
+    ansible.builtin.set_fact:
+      vc_resource_pool_id: "{{ (vc_resource_pools.json | selectattr('name', 'equalto', 'Resources') | map(attribute='resource_pool') | first) }}"
+    when: not existing_mysql_db_vm_id
+
+  - name: List vCenter VM folders
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/folder"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_folders
+    when: not existing_mysql_db_vm_id
+
+  - name: Find the default vm folder id
+    ansible.builtin.set_fact:
+      vc_vm_folder_id: "{{ (vc_folders.json | selectattr('name', 'equalto', 'vm') | selectattr('type', 'equalto', 'VIRTUAL_MACHINE') | map(attribute='folder') | first) }}"
+    when: not existing_mysql_db_vm_id
+
+  - name: List vCenter datastores
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/datastore"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_datastores
+    when: not existing_mysql_db_vm_id
+
+  # This workload domain only ever has the one shared vSAN datastore, so no
+  # name filter -- just take whatever's first.
+  - name: Use the first available datastore
+    ansible.builtin.set_fact:
+      vc_datastore_id: "{{ vc_datastores.json[0].datastore }}"
+    when: not existing_mysql_db_vm_id
+
+  # network_mappings' key ("VM Network") is the OVF descriptor's own internal
+  # network label baked into the Ubuntu cloud image -- confirmed live
+  # 2026-08-29 via the library item's `?action=filter` response. That's
+  # stable across pod rebuilds; only the dvportgroup id on the right-hand
+  # side is pod-specific, hence the lookup above instead of hardcoding it.
+  #
+  # This synchronous deploy call (OVF import + disk clone) has taken well
+  # over 30s in practice -- Ansible's uri module default timeout -- and a
+  # client-side read timeout does NOT mean the deploy failed: the request
+  # was already accepted and vCenter keeps building the VM after Ansible
+  # gives up waiting on the response. Confirmed live 2026-08-29 (a run that
+  # "failed" here had actually deployed the VM). So: a long explicit
+  # timeout as the main defense, plus ignore_errors so a timeout that
+  # happens anyway doesn't abort the play -- the retrying vm-id lookup
+  # right below this will simply wait for the VM to show up either way.
+  - name: Deploy mysql-db from the Ubuntu 24.04 OVF template
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/ovf/library-item/{{ ubuntu_ovf_item_id }}?action=deploy"
+      method: POST
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+      timeout: 600
+      body_format: json
+      body:
+        target:
+          resource_pool_id: "{{ vc_resource_pool_id }}"
+          folder_id: "{{ vc_vm_folder_id }}"
+        deployment_spec:
+          name: "mysql-db"
+          annotation: "3-tier app database VM -- see 2740-01-module_1.yaml for why this is deployed directly instead of via VM Operator."
+          accept_all_EULA: true
+          network_mappings:
+            "VM Network": "{{ wld01_servers_network_id }}"
+          storage_mappings: {}
+          storage_provisioning: thin
+          default_datastore_id: "{{ vc_datastore_id }}"
+          additional_parameters:
+            - "@class": "com.vmware.vcenter.ovf.property_params"
+              type: PropertyParams
+              properties:
+                - id: instance-id
+                  value: "{{ mysql_db_instance_id.stdout }}"
+                - id: hostname
+                  value: "mysql-db"
+                - id: user-data
+                  value: "{{ mysql_db_userdata_b64 }}"
+      status_code: 200
+    when: not existing_mysql_db_vm_id
+    ignore_errors: true
+
+  # Re-list rather than trust the deploy response's own resource_id field --
+  # simpler and matches how the VM was located everywhere else in this task
+  # (existence check above, power-on/guest-IP lookup below). Retries so a
+  # deploy call that outlived its own timeout above still gets picked up
+  # once vCenter actually finishes creating the VM, rather than failing
+  # immediately on a one-shot lookup.
+  - name: Resolve mysql-db's vm id
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/vm"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+    register: vc_vms_after_deploy
+    until: (vc_vms_after_deploy.json | selectattr('name', 'equalto', 'mysql-db') | list | length) > 0
+    retries: 30
+    delay: 10
+
+  - name: Set fact for mysql-db's vm id
+    ansible.builtin.set_fact:
+      mysql_db_vm_id: "{{ (vc_vms_after_deploy.json | selectattr('name', 'equalto', 'mysql-db') | map(attribute='vm') | first) }}"
+
+  # Unconditional (not gated on existing_mysql_db_vm_id) so re-running this
+  # play against an already-existing-but-powered-off mysql-db still leaves
+  # it running, instead of silently skipping power-on and then hanging
+  # forever in the guest-IP wait below. 400 is tolerated for the (far more
+  # common) case where it's already powered on.
+  - name: Ensure mysql-db is powered on
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/vm/{{ mysql_db_vm_id }}/power?action=start"
+      method: POST
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+      status_code: [204, 400]
+
+  # /guest/networking/interfaces 503s ("VMware Tools are not running") until
+  # cloud-init's first boot finishes bringing up Tools -- tolerate that and
+  # keep polling rather than failing the task. `state == 'PREFERRED'` picks
+  # the real IPv4 address out of the interface's address list (which also
+  # includes a link-local IPv6 entry).
+  - name: Wait for mysql-db to report a guest IP
+    ansible.builtin.uri:
+      url: "https://vc-wld01-a.site-a.vcf.lab/api/vcenter/vm/{{ mysql_db_vm_id }}/guest/networking/interfaces"
+      method: GET
+      headers: "{{ vc_headers }}"
+      validate_certs: false
+      status_code: [200, 503]
+    register: mysql_db_guest_net
+    until: >-
+      mysql_db_guest_net.status == 200 and
+      (mysql_db_guest_net.json | selectattr('ip', 'defined') | map(attribute='ip.ip_addresses') | sum(start=[])
+        | selectattr('state', 'equalto', 'PREFERRED') | list | length) > 0
     retries: 30
     delay: 10
 
   - name: Store Database Node IP internally
     ansible.builtin.set_fact:
-      global_db_ip: "{{ db_vm_svc_info.resources[0].status.loadBalancer.ingress[0].ip }}"
+      global_db_ip: >-
+        {{ (mysql_db_guest_net.json | selectattr('ip', 'defined') | map(attribute='ip.ip_addresses') | sum(start=[])
+            | selectattr('state', 'equalto', 'PREFERRED') | map(attribute='ip_address') | first) }}
+
+  # pod-security.kubernetes.io/enforce=privileged matches the 'default'
+  # namespace's own label -- without it, this namespace falls back to the
+  # cluster's stricter default Pod Security Admission level and the
+  # backend/frontend Deployments below fail outright with "violates
+  # PodSecurity restricted:latest" (FailedCreate, 0/1 replicas, no Pod ever
+  # created) since neither app image's manifest sets the securityContext
+  # fields "restricted" requires -- confirmed live 2026-08-29. Matching
+  # 'default' rather than hardening the Deployments themselves, since these
+  # are pre-built third-party images ("developer-utilities-backend/frontend")
+  # already proven working unmodified under 'privileged'.
+  - name: Create a namespace called '3tierapp'
+    kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: 3tierapp
+          labels:
+            pod-security.kubernetes.io/enforce: privileged
 
   - name: Parse backend template and apply to cluster
     kubernetes.core.k8s:
       context: "workload-cluster-1"
       state: present
-      namespace: default
+      namespace: 3tierapp
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       db_vm_ip: "{{ global_db_ip }}"
@@ -74,7 +350,7 @@
       api_version: v1
       kind: Service
       name: backend-app-service
-      namespace: default
+      namespace: 3tierapp
     register: backend_svc_info
     until: "backend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
     retries: 30
@@ -88,7 +364,7 @@
     kubernetes.core.k8s:
       context: "workload-cluster-1"
       state: present
-      namespace: default
+      namespace: 3tierapp
       definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       backend_service_ip: "{{ global_backend_ip }}"
@@ -99,7 +375,7 @@
       api_version: v1
       kind: Service
       name: frontend-app-service
-      namespace: default
+      namespace: 3tierapp
     register: frontend_svc_info
     until: "frontend_svc_info.resources[0].status.loadBalancer.ingress[0].ip is defined"
     retries: 30
@@ -183,6 +459,16 @@
       ansible.builtin.wait_for_connection:
         delay: 20     # Number of seconds to wait before starting the check
         timeout: 300  # Maximum number of seconds to wait for a successful connection
+
+    # SSH comes up during cloud-init's early user-provisioning stage --
+    # well before the `runcmd` stage that apt-installs and starts
+    # mysql-server. Reachable-via-SSH is not the same as "cloud-init (and
+    # therefore mysql) is done" -- confirmed live 2026-08-29 hitting
+    # "Can't connect to local MySQL server through socket" because the
+    # flush-hosts task below ran while mysql-server was still installing.
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
 
     - name: Execute mysqladmin to flush hosts
       ansible.builtin.command: "mysqladmin -u root -p'{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}' flush-hosts"
