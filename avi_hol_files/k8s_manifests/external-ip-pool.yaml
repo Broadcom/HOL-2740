@@ -1,10 +1,18 @@
+# ipRanges must NOT include .0 (network) or .1 (gateway, see subnetInfo.gateway
+# below) -- a plain `cidr: 10.150.6.0/29` includes both, and Antrea's IPAM will
+# happily hand out .1 as an Egress IP. That collides with the egress-subnet's
+# own gateway address: any pod assigned .1 as its Egress IP gets silently
+# blackholed (ARP/routing conflict with the real gateway), not firewalled --
+# confirmed live 2026-08-29 tracing a 3-tier-app backend pod that could open a
+# TCP connection to nothing at all. Start the assignable range at .2 instead.
 apiVersion: crd.antrea.io/v1beta1
 kind: ExternalIPPool
 metadata:
   name: external-ip-pool-01
 spec:
   ipRanges:
-  - cidr: 10.150.6.0/29
+  - start: 10.150.6.2
+    end: 10.150.6.6
   subnetInfo:
     prefixLength: 28
     vlan: 1001
