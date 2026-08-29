@@ -314,6 +314,16 @@
         {{ (mysql_db_guest_net.json | selectattr('ip', 'defined') | map(attribute='ip.ip_addresses') | sum(start=[])
             | selectattr('state', 'equalto', 'PREFERRED') | map(attribute='ip_address') | first) }}
 
+  # pod-security.kubernetes.io/enforce=privileged matches the 'default'
+  # namespace's own label -- without it, this namespace falls back to the
+  # cluster's stricter default Pod Security Admission level and the
+  # backend/frontend Deployments below fail outright with "violates
+  # PodSecurity restricted:latest" (FailedCreate, 0/1 replicas, no Pod ever
+  # created) since neither app image's manifest sets the securityContext
+  # fields "restricted" requires -- confirmed live 2026-08-29. Matching
+  # 'default' rather than hardening the Deployments themselves, since these
+  # are pre-built third-party images ("developer-utilities-backend/frontend")
+  # already proven working unmodified under 'privileged'.
   - name: Create a namespace called '3tierapp'
     kubernetes.core.k8s:
       state: present
@@ -322,6 +332,8 @@
         kind: Namespace
         metadata:
           name: 3tierapp
+          labels:
+            pod-security.kubernetes.io/enforce: privileged
 
   - name: Parse backend template and apply to cluster
     kubernetes.core.k8s:
