@@ -3937,6 +3937,16 @@ def main():
             lsf.write_output('Configuring VCF Automation IP address spaces')
             add_cidr_to_ipspace(lsf, 'ipspace-wld-a', '10.150.6.0/23')
 
+        # Harbor Supervisor Service health + stuck-pod self-remediation --
+        # see ensure_harbor_healthy()'s docstring for the 2026-08-20
+        # incident this guards against. Run last, same reasoning as the VKS
+        # scale-up wait above: Harbor's pods have had the full runtime of
+        # everything else in this function to converge on their own first,
+        # so anything still stuck by now is a real candidate for the
+        # delete-and-recreate remediation rather than a normal cold start.
+        # FATAL unlike most steps here -- see docstring.
+        with track_step(lsf, _telemetry_results, 'harbor_health'):
+            ensure_harbor_healthy(lsf)
 
         # try:
         #     lsf.write_output("Running first stages playbook")
@@ -4003,16 +4013,7 @@ def main():
         # with track_step(lsf, _telemetry_results, 'vks_nodepool_scaleup_wait'):
         #     wait_for_vks_nodepool_scaleup(lsf, _vks_scale_start, target_replicas=3, timeout_seconds=600)
 
-        # Harbor Supervisor Service health + stuck-pod self-remediation --
-        # see ensure_harbor_healthy()'s docstring for the 2026-08-20
-        # incident this guards against. Run last, same reasoning as the VKS
-        # scale-up wait above: Harbor's pods have had the full runtime of
-        # everything else in this function to converge on their own first,
-        # so anything still stuck by now is a real candidate for the
-        # delete-and-recreate remediation rather than a normal cold start.
-        # FATAL unlike most steps here -- see docstring.
-        with track_step(lsf, _telemetry_results, 'harbor_health'):
-            ensure_harbor_healthy(lsf)
+
 
         # Summarize ~/hol/labstartup.log (the pod's overall boot-time log,
         # not just this script's own output) -- see
