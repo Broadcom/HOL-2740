@@ -592,7 +592,7 @@
 
     - name: Render mysql-db cloud-init user-data
       ansible.builtin.set_fact:
-        mysql_db_userdata_b64: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/mysql-db-cloudinit.yaml.j2') | b64encode }}"
+        mysql_db_userdata_b64: "{{ lookup('ansible.builtin.template', '/vpodrepo/2027-labs/2740/avi_hol_files/3-TierAppDeployment/codeSamples/mysql-db-cloudinit.yaml.j2') | b64encode }}"
       vars:
         db_password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') | trim }}"
       when: not existing_mysql_db_vm_id
