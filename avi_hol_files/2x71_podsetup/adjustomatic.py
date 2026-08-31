@@ -2107,7 +2107,7 @@ HARBOR_NAMESPACE_PREFIX = 'svc-harbor-'
 HARBOR_AVI_HOST = NSXT_ALB_DOMAINS[0]['avi_host']
 
 
-def ensure_harbor_healthy(lsf, timeout_seconds=300, poll_interval=15, pending_stuck_seconds=300):
+def ensure_harbor_healthy(lsf, timeout_seconds=900, poll_interval=15, pending_stuck_seconds=300):
     """
     Verify the Harbor Supervisor Service (svc-harbor-<suffix> namespace) is
     actually serving, and self-remediate the stuck-pod failure mode
