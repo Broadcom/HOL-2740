@@ -152,7 +152,7 @@
       context: "workload-cluster-1"
       state: present
       namespace: 3tierapp
-      definition: "{{ lookup('ansible.builtin.template', '/vpodrepo/2027-labs/2740/avi_hol_files/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/backend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       db_vm_ip: "{{ global_db_ip }}"
 
@@ -177,7 +177,7 @@
       context: "workload-cluster-1"
       state: present
       namespace: 3tierapp
-      definition: "{{ lookup('ansible.builtin.template', '/vpodrepo/2027-labs/2740/avi_hol_files/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
+      definition: "{{ lookup('ansible.builtin.template', '/hol/hol-2740/3-TierAppDeployment/codeSamples/frontend-app.yaml.j2') | from_yaml_all | list }}"
     vars:
       backend_service_ip: "{{ global_backend_ip }}"
 
