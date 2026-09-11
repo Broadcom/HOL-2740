@@ -1,4 +1,15 @@
 provider_installation {
-  dev_overrides {
-      "vmware/nsxt" = "/hol/hol-2740/migration_files/nsx-t-migration/terraform-nsx-lb-deployment/.terraform/providers/registry.terraform.io/vmware/nsxt/3.9.0/linux_amd64"
-}}
+  filesystem_mirror {
+    path    = "/home/holuser/terraform_provider"
+    include = [
+      "registry.terraform.io/vmware/nsxt",
+      "registry.terraform.io/vmware/avi",
+    ]
+  }
+  direct {
+    exclude = [
+      "registry.terraform.io/vmware/nsxt",
+      "registry.terraform.io/vmware/avi",
+    ]
+  }
+}

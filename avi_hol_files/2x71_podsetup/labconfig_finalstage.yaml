@@ -154,8 +154,8 @@
     ##  Use readme in the root folder of git repo
     - name: Update readme on desktop
       copy:
-        src: /vpodrepo/2027-labs/2740/avi_hol_files/README.txt
-        dest: /home/holuser/Desktop/README.txt
+        src: /vpodrepo/2027-labs/2740/README.md
+        dest: /home/holuser/Desktop/README.md
         force: true
 
     - name: Remove buildchecklist
@@ -495,6 +495,10 @@
 
 
  
+    # Superseded by the filesystem_mirror tasks below -- dev_overrides/unpacked
+    # -provider-directory is the wrong tool for installing a released provider
+    # (ignores version constraints, skips checksum verification/lock file).
+    # See terraform_registry_error/nsxt_provider_proxy_fix.md for why.
     # - name: Creates avi terraform provider directory
     #   file:
     #     path: /hol/hol-2740/automation_lab/terraform/.terraform/providers/registry.terraform.io/vmware/avi/30.2.1/linux_amd64
@@ -507,7 +511,7 @@
     #   environment:
     #     http_proxy: http://proxy:3128
     #     https_proxy: http://proxy:3128
-    #     no_proxy: "localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16" 
+    #     no_proxy: "localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
 
     # - name: Unarchive avi terraform provider
     #   ansible.builtin.unarchive:
@@ -515,11 +519,52 @@
     #     dest: /hol/hol-2740/automation_lab/terraform/.terraform/providers/registry.terraform.io/vmware/avi/30.2.1/linux_amd64
     #     remote_src: yes
 
+    # Zip form (not unpacked) in the mirror dir, per the filesystem_mirror
+    # layout confirmed in terraform_registry_error/nsxt_provider_proxy_fix.md --
+    # terraform computes its own zh: hash from this, no unarchive needed.
+    - name: Creates avi terraform provider mirror directory
+      file:
+        path: /home/holuser/terraform_provider/registry.terraform.io/vmware/avi
+        state: directory
 
-    # - name: Put terraform RC in home folder
-    #   copy:
-    #     src: /vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/terraform.rc
-    #     dest: /home/holuser/.terraformrc
+    # NOTE: registry.terraform.io/vmware/nsxt release assets on GitHub were
+    # previously 403'd by the corporate proxy (see nsxt_provider_proxy_fix.md) --
+    # that mirror's zip was placed manually, this task is not (yet) automated
+    # here. If this same 403 shows up for vmware/avi, fall back to the same
+    # manual download-and-copy-to-mirror procedure documented there.
+    - name: Download avi terraform provider into filesystem mirror
+      ansible.builtin.get_url:
+        url: https://github.com/vmware/terraform-provider-avi/releases/download/v32.1.1/terraform-provider-avi_32.1.1_linux_amd64.zip
+        dest: /home/holuser/terraform_provider/registry.terraform.io/vmware/avi/terraform-provider-avi_32.1.1_linux_amd64.zip
+      environment:
+        http_proxy: http://proxy.site-a.vcf.lab:3128
+        https_proxy: http://proxy.site-a.vcf.lab:3128
+        no_proxy: "localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
+
+    - name: Put terraform RC in home folder
+      copy:
+        src: /vpodrepo/2027-labs/2740/avi_hol_files/2x71_podsetup/terraform.rc
+        dest: /home/holuser/.terraformrc
+
+    # Confirms the avi provider actually installs from the filesystem_mirror
+    # at build time rather than only discovering a mirror/rc problem later
+    # when someone runs terraform by hand. provider.tf in this directory
+    # (copied above by "Copy automation lab files folder") pins
+    # source = "vmware/avi", avi_version = "32.1.1", matching the mirror.
+    # terraform init still makes one network call to registry.terraform.io
+    # for provider metadata (see nsxt_provider_proxy_fix.md's Root Cause
+    # section) -- only the release-asset download is served from the mirror
+    # -- so the proxy env is still needed here.
+    - name: Run terraform init for the avi automation_lab config
+      ansible.builtin.command: terraform init
+      args:
+        chdir: /hol/hol-2740/automation_lab/terraform
+      environment:
+        http_proxy: http://proxy.site-a.vcf.lab:3128
+        https_proxy: http://proxy.site-a.vcf.lab:3128
+        no_proxy: "localhost,127.0.0.0/8,::1,.site-a.vcf.lab,172.16.0.0/16, 192.168.0.0/16"
+      register: avi_terraform_init
+      changed_when: "'Terraform has been successfully initialized' in avi_terraform_init.stdout"
 
     # - name: change system proxy settings, might be able to do this with dconf ansible module
     #   ansible.builtin.shell:
