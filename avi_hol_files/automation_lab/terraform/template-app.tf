@@ -6,36 +6,36 @@ resource avi_pool template-pool {
       data.avi_healthmonitor.system-http.id
       ]
       servers  {
-        enabled = true #Server enabled 
+        enabled = true #Server enabled
         ip  {
-          addr = "172.16.110.11" #Server IP address
+          addr = "10.1.13.11" #Server IP address
           type = "V4" #IP version
         }
         port = 30001 #Server listening port
       }
       servers  {
-        enabled = true #Server enabled 
+        enabled = true #Server enabled
         ip  {
-          addr = "172.16.110.12" #Server IP address
+          addr = "10.1.13.12" #Server IP address
           type = "V4" #IP version
         }
-        port = 30001 #Server enabled 
+        port = 30001 #Server enabled
         }
       tenant_ref = data.avi_tenant.admin.id #Tenant pool with be created in
-      tier1_lr = "/infra/tier-1s/t1-gw-sitea" #Tier 1 router the pool will be attached to
+      tier1_lr = "/infra/tier-1s/wld01-a-t1" #Tier 1 router the pool will be attached to
 }
 
 resource avi_vsvip template-vsvip {
       cloud_ref = data.avi_cloud.nsx-cloud.id #Cloud VsVIP will be created in
       dns_info { #DNS configuration
         algorithm = "DNS_RECORD_RESPONSE_CONSISTENT_HASH"
-        fqdn = "${var.deployment-name}.region01a.vcf.sddc.lab" #VsVIP fqdn
+        fqdn = "${var.deployment-name}.lb.site-a.vcf.lab" #VsVIP fqdn
         ttl = 30 #Time To Live in seconds
         type = "DNS_RECORD_A" #DNS record type
       }
       name = "${var.deployment-name}-VsVip" #Name of VsVIP
       tenant_ref = data.avi_tenant.admin.id #Tenant VsVIP will be created in
-      tier1_lr = "/infra/tier-1s/t1-gw-sitea" #Tier 1 router VsVIP will be attached to
+      tier1_lr = "/infra/tier-1s/wld01-a-t1" #Tier 1 router VsVIP will be attached to
       vip {
         auto_allocate_ip = true #Autoallocate IP address
         auto_allocate_ip_type = "V4_ONLY" #Autoallocate an IPv4 IP address
@@ -45,10 +45,10 @@ resource avi_vsvip template-vsvip {
           ######
           # This subnet block is defining the auto-allocation IPAM subnet to pull an IP from.  It can be left out
           # but terraform will detect a change when the API adds it to the configuration
-          subnet {   
-            mask = "24"
+          subnet {
+            mask = "25"
             ip_addr {
-              addr = "172.16.110.0"
+              addr = "10.1.13.128"
               type = "V4"
               }
             }

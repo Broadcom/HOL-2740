@@ -6,9 +6,13 @@ terraform {
   }
 }
 
+locals {
+  avi_password = chomp(file("/home/holuser/creds.txt"))
+}
+
 provider "avi" {
   avi_username             = "admin"
-  avi_password             = var.avi_password
+  avi_password             = local.avi_password
   avi_controller           = "alb-a.site-a.vcf.lab"
-  avi_version              = "30.2.1"
+  avi_version              = "32.1.1"
 }
