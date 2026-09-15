@@ -7,16 +7,16 @@ data avi_applicationprofile system-http {
 }
 
 data avi_cloud nsx-cloud {
-  name = "SiteA_nsx_cloud"
+  name = "Cloud-nsx-wld01-a"
 }
 data avi_tenant admin {
   name = "admin"
 }
 data avi_vrfcontext t1-gw-sitea {
-  name = "t1-gw-sitea"
+  name = "wld01-a-t1"
 }
 data avi_network vm-segment {
-  name = "ls-vmnet-a"
+  name = "wld01-avi-data"
 }
 data avi_networkprofile system-tcp-proxy {
   name = "System-TCP-Proxy"
@@ -25,7 +25,7 @@ data avi_sslprofile system-standard {
     name = "System-Standard"
 }
 data avi_sslkeyandcertificate wildcard-rsa {
-    name = "HandsOnLabs_Appcert"
+    name = "hol_wildcard"
 }
 data avi_sslkeyandcertificate default-ecc {
     name = "System-Default-Cert-EC"

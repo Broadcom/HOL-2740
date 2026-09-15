@@ -32,4 +32,8 @@ pypi.org
 packages.vcfd.broadcom.net
 files.pythonhosted.org
 quay.io
-
+# for terraform pull
+# github.com
+objects.githubusercontent.com
+release-assets.githubusercontent.com
+codeload.github.com
