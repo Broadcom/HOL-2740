@@ -81,7 +81,7 @@
         password: "{{ lookup('ansible.builtin.file', '/home/holuser/creds.txt') }}"
         port: 443
     dns_configs:
-      - domain_name: gslb.vcf.sddc.lab
+      - domain_name: global.vcf.lab
     leader_cluster_uuid: "{{ cluster_region01a['obj'].uuid }}"
 
 

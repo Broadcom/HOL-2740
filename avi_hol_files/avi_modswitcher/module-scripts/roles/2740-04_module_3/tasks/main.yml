@@ -65,14 +65,14 @@
     region: "{{region_placeholder}}"
     avi_config:
       gslbservice:
-        - name: basic-app.gslb.vcf.sddc.lab
+        - name: basic-app.global.vcf.lab
           controller_health_status_enabled: true
           down_response:
             type: GSLB_SERVICE_DOWN_RESPONSE_NONE
           enabled: true
           is_federated: true
           domain_names:
-            - basic-app.gslb.vcf.sddc.lab
+            - basic-app.global.vcf.lab
           health_monitor_refs:
             - '/api/healthmonitor?name=System-GSLB-HTTP'
           use_edns_client_subnet: true
@@ -87,7 +87,7 @@
                   ratio: 1
                   enabled: true
               enabled: true
-              name: basic-app.gslb.vcf.sddc.lab-pool-1
+              name: basic-app.global.vcf.lab-pool-1
               algorithm: GSLB_ALGORITHM_ROUND_ROBIN
             - priority: 10
               members:
@@ -99,7 +99,7 @@
                   ratio: 1
                   enabled: true
               enabled: true
-              name: basic-app.gslb.vcf.sddc.lab-pool-2
+              name: basic-app.global.vcf.lab-pool-2
               algorithm: GSLB_ALGORITHM_ROUND_ROBIN
           health_monitor_scope: GSLB_SERVICE_HEALTH_MONITOR_ALL_MEMBERS
           pool_algorithm: GSLB_SERVICE_ALGORITHM_PRIORITY

@@ -64,14 +64,14 @@
     region: "{{region_placeholder}}"
     avi_config:
       gslbservice:
-        - name: adv-app.gslb.vcf.sddc.lab
+        - name: adv-app.global.vcf.lab
           controller_health_status_enabled: true
           down_response:
             type: GSLB_SERVICE_DOWN_RESPONSE_ALL_RECORDS
           enabled: true
           is_federated: true
           domain_names:
-            - adv-app.gslb.vcf.sddc.lab
+            - adv-app.global.vcf.lab
           health_monitor_refs:
             - '/api/healthmonitor?name=System-GSLB-HTTP'
           use_edns_client_subnet: true
