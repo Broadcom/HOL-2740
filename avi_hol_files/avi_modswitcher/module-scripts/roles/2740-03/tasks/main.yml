@@ -6,7 +6,9 @@
 - name: Set the default state to present
   set_fact:
     avi_config_state: "{{ avi_config_state|default('present') }}"
-    region_subnet: 10.1.13.128
+    region_subnet: "{{ '10.1.13.128' if (region | default('a') | lower) == 'a' else '10.1.14.128' }}"
+    dns_domain: "{{ 'lb.site-a.vcf.lab' if (region | default('a') | lower) == 'a' else 'lb.site-b.vcf.lab' }}"
+    data_network: "{{ 'wld01-avi-data' if (region | default('a') | lower) == 'a' else 'mgmt-avi-data' }}"
 
 
 - name: Define adv-app-a Virtual Service
@@ -38,7 +40,7 @@
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
-              fqdn: "adv-app-a.lb.site-a.vcf.lab"
+              fqdn: "adv-app-a.{{ dns_domain }}"
               algorithm: DNS_RECORD_RESPONSE_CONSISTENT_HASH
               ttl: 30
           vip:
@@ -51,7 +53,7 @@
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network/?name=wld01-avi-data"
+                  network_ref: "/api/network/?name={{ data_network }}"
               enabled: true
               ipam_network_subnet:
                 subnet:
@@ -59,7 +61,7 @@
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network/?name=wld01-avi-data"
+                network_ref: "/api/network/?name={{ data_network }}"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
@@ -122,7 +124,7 @@
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
-              fqdn: "secure-app-a.lb.site-a.vcf.lab"
+              fqdn: "secure-app-a.{{ dns_domain }}"
               algorithm: DNS_RECORD_RESPONSE_CONSISTENT_HASH
               ttl: 30
           vip:
@@ -135,7 +137,7 @@
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network/?name=wld01-avi-data"
+                  network_ref: "/api/network/?name={{ data_network }}"
               enabled: true
               ipam_network_subnet:
                 subnet:
@@ -143,7 +145,7 @@
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network/?name=wld01-avi-data"
+                network_ref: "/api/network/?name={{ data_network }}"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
@@ -219,7 +221,7 @@
           dns_info:
             - num_records_in_response: 1
               type: DNS_RECORD_A
-              fqdn: "tenant-app-a.lb.site-a.vcf.lab"
+              fqdn: "tenant-app-a.{{ dns_domain }}"
               algorithm: DNS_RECORD_RESPONSE_CONSISTENT_HASH
               ttl: 30
           vip:
@@ -232,7 +234,7 @@
                       ip_addr:
                         type: V4
                         addr: "{{ region_subnet }}"
-                  network_ref: "/api/network/?name=wld01-avi-data"
+                  network_ref: "/api/network/?name={{ data_network }}"
               enabled: true
               ipam_network_subnet:
                 subnet:
@@ -240,7 +242,7 @@
                   ip_addr:
                     type: V4
                     addr: "{{ region_subnet }}"
-                network_ref: "/api/network/?name=wld01-avi-data"
+                network_ref: "/api/network/?name={{ data_network }}"
               auto_allocate_floating_ip: true
               avi_allocated_vip: false
               auto_allocate_ip_type: V4_ONLY
