@@ -3,42 +3,51 @@
 - pause:
     seconds: 2
 
-- name: Collect basic-app-a details
+- name: Collect secure-app-a details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01a }}"
     http_method: get
     path: virtualservice
 
     params:
-      { name: basic-app-a }
+      { name: secure-app-a }
   register: vs_basic_app_a
 
-- name: Collect basic-app-a details
+- name: Collect secure-app-a details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01a }}"
     http_method: get
     path: vsvip
     params:
-      { name.contains: basic-app-a }
+      { name.contains: secure-app-a }
   register: vsvip_basic_app_a
 
-- name: Collect basic-app-b details
+- name: Collect secure-app-b details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01b }}"
     http_method: get
     path: virtualservice
     params:
-      { name: basic-app-b }
+      { name: secure-app-b }
   register: vs_basic_app_b
 
-- name: Collect basic-app-b details
+- name: Collect secure-app-b details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01b }}"
     http_method: get
     path: vsvip
     params:
-      { name.contains: basic-app-b }
+      { name.contains: secure-app-b }
   register: vsvip_basic_app_b
+
+- name: Verify the virtual services the global service needs exist
+  ansible.builtin.assert:
+    that:
+      - vs_basic_app_a['obj']['count'] | int > 0
+      - vsvip_basic_app_a['obj']['count'] | int > 0
+      - vs_basic_app_b['obj']['count'] | int > 0
+      - vsvip_basic_app_b['obj']['count'] | int > 0
+    fail_msg: "A virtual service this global service points at was not found - check the lookups above"
 
 - name: Collect region01a cluster details
   vmware.alb.avi_api_session:

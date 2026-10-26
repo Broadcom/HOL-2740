@@ -39,6 +39,15 @@
       { name.contains: adv-app-b }
   register: vsvip_adv_app_b
 
+- name: Verify the virtual services the global service needs exist
+  ansible.builtin.assert:
+    that:
+      - vs_adv_app_a['obj']['count'] | int > 0
+      - vsvip_adv_app_a['obj']['count'] | int > 0
+      - vs_adv_app_b['obj']['count'] | int > 0
+      - vsvip_adv_app_b['obj']['count'] | int > 0
+    fail_msg: "A virtual service this global service points at was not found - check the lookups above"
+
 - name: Collect region01a cluster details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01a }}"
