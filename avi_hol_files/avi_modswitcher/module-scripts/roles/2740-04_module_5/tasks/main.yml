@@ -63,6 +63,16 @@
     path: cluster
   register: cluster_region01b
 
+- name: Define geo DB profile (manual p.126-127; students build this by hand in module 5)
+  vmware.alb.avi_gslbgeodbprofile:
+    avi_credentials: "{{ avi_creds_region01a }}"
+    name: geoprofile1
+    is_federated: true
+    entries:
+      - priority: 10
+        # 'file' was removed in Avi 31.1.1; entries reference the fileobject instead
+        file_obj_ref: "/api/fileobject?name=AviGeoDb.txt.gz"
+
 - set_fact:
     region_placeholder: "{{region}}"
 
