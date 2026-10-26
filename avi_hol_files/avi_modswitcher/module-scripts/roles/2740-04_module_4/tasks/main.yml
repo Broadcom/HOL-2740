@@ -104,26 +104,26 @@
                   enabled: true
                 - ip:
                     type: V4
-                    addr: 172.16.110.10
+                    addr: 10.1.13.11
                   ratio: 1
                   enabled: true
               enabled: true
-              name: adv-app-pool1
+              name: Palo Alto
               algorithm: GSLB_ALGORITHM_CONSISTENT_HASH
             - priority: 5
               members:
                 - ip:
                     type: V4
-                    addr: 172.16.110.10
+                    addr: 10.1.13.11
                   ratio: 1
                   enabled: true
                 - ip:
                     type: V4
-                    addr: 172.16.210.10
+                    addr: 10.1.14.11
                   ratio: 1
                   enabled: true
               enabled: true
-              name: adv-app-pool2
+              name: Barcelona
               algorithm: GSLB_ALGORITHM_ROUND_ROBIN
           ttl: 2
           min_members: 0
