@@ -28,19 +28,19 @@
   roles:
     - role: 2740-03
       vars:
-        region: 'b'
+        region: 'a'
         avi_role_config_log_mode: 'False'
 
     - role: 2740-03
       vars:
-        region: 'a'
+        region: 'b'
         avi_role_config_log_mode: 'False'
 
     - role: 2740-04_module_1
       vars:
         region: 'b'
         avi_role_config_log_mode: 'False'
- 
+
     - role: 2740-04_module_1
       vars:
         region: 'a'
@@ -57,6 +57,8 @@
         avi_role_config_log_mode: 'False'
 
   vars:
+    cloud_name: "{{ 'Cloud-nsx-wld01-a' if region | lower == 'a' else 'Cloud-nsx-mgmt-a' }}"
+    t1_uuid: "{{ 'wld01-a-t1' if region | lower == 'a' else 'mgmt-a-t1' }}"
     avi_creds:
       controller: "{{ 'alb-' + region | lower + '.site-a.vcf.lab'}}"
       username: "admin"

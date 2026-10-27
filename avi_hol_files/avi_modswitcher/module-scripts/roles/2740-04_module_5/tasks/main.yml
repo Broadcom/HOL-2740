@@ -3,42 +3,51 @@
 - pause:
     seconds: 2
 
-- name: Collect basic-app-a details
+- name: Collect secure-app-a details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01a }}"
     http_method: get
     path: virtualservice
 
     params:
-      { name: basic-app-a }
-  register: vs_basic_app_a
+      { name: secure-app-a }
+  register: vs_secure_app_a
 
-- name: Collect basic-app-a details
+- name: Collect secure-app-a details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01a }}"
     http_method: get
     path: vsvip
     params:
-      { name.contains: basic-app-a }
-  register: vsvip_basic_app_a
+      { name.contains: secure-app-a }
+  register: vsvip_secure_app_a
 
-- name: Collect basic-app-b details
+- name: Collect secure-app-b details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01b }}"
     http_method: get
     path: virtualservice
     params:
-      { name: basic-app-b }
-  register: vs_basic_app_b
+      { name: secure-app-b }
+  register: vs_secure_app_b
 
-- name: Collect basic-app-b details
+- name: Collect secure-app-b details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01b }}"
     http_method: get
     path: vsvip
     params:
-      { name.contains: basic-app-b }
-  register: vsvip_basic_app_b
+      { name.contains: secure-app-b }
+  register: vsvip_secure_app_b
+
+- name: Verify the virtual services the global service needs exist
+  ansible.builtin.assert:
+    that:
+      - vs_secure_app_a['obj']['count'] | int > 0
+      - vsvip_secure_app_a['obj']['count'] | int > 0
+      - vs_secure_app_b['obj']['count'] | int > 0
+      - vsvip_secure_app_b['obj']['count'] | int > 0
+    fail_msg: "A virtual service this global service points at was not found - check the lookups above"
 
 - name: Collect region01a cluster details
   vmware.alb.avi_api_session:
@@ -54,6 +63,16 @@
     path: cluster
   register: cluster_region01b
 
+- name: Define geo DB profile (manual p.126-127; students build this by hand in module 5)
+  vmware.alb.avi_gslbgeodbprofile:
+    avi_credentials: "{{ avi_creds_region01a }}"
+    name: geoprofile1
+    is_federated: true
+    entries:
+      - priority: 10
+        # 'file' was removed in Avi 31.1.1; entries reference the fileobject instead
+        file_obj_ref: "/api/fileobject?name=AviGeoDb.txt.gz"
+
 - set_fact:
     region_placeholder: "{{region}}"
 
@@ -65,14 +84,14 @@
     region: "{{region_placeholder}}"
     avi_config:
       gslbservice:
-        - name: geo-app01.gslb.vcf.sddc.lab
+        - name: secure-app.global.vcf.lab
           controller_health_status_enabled: true
           down_response:
             type: GSLB_SERVICE_DOWN_RESPONSE_NONE
           enabled: true
           is_federated: true
           domain_names:
-            - geo-app.gslb.vcf.sddc.lab
+            - secure-app.global.vcf.lab
           health_monitor_refs:
             - '/api/healthmonitor?name=System-GSLB-HTTP'
           use_edns_client_subnet: true
@@ -82,24 +101,24 @@
                 - ratio: 1
                   ip:
                     type: V4
-                    addr: "{{ vsvip_basic_app_a['obj']['results'][0]['vip'][0]['ip_address']['addr'] }}"
+                    addr: "{{ vsvip_secure_app_a['obj']['results'][0]['vip'][0]['ip_address']['addr'] }}"
                   enabled: true
-                  vs_uuid: "{{ vs_basic_app_a['obj']['results'][0]['uuid'] }}"
+                  vs_uuid: "{{ vs_secure_app_a['obj']['results'][0]['uuid'] }}"
                   location:
                     source: GSLB_LOCATION_SRC_INHERIT_FROM_SITE
                   cluster_uuid: "{{ cluster_region01a['obj'].uuid }}"
                 - ratio: 1
                   ip:
                     type: V4
-                    addr: "{{ vsvip_basic_app_b['obj']['results'][0]['vip'][0]['ip_address']['addr'] }}"
+                    addr: "{{ vsvip_secure_app_b['obj']['results'][0]['vip'][0]['ip_address']['addr'] }}"
                   enabled: true
-                  vs_uuid: "{{ vs_basic_app_b['obj']['results'][0]['uuid'] }}"
+                  vs_uuid: "{{ vs_secure_app_b['obj']['results'][0]['uuid'] }}"
                   location:
                     source: GSLB_LOCATION_SRC_INHERIT_FROM_SITE
                   cluster_uuid: "{{ cluster_region01b['obj'].uuid }}"
               enabled: true
-              name: pool1
-              algorithm: GSLB_ALGORITHM_ROUND_ROBIN
+              name: Palo Alto
+              algorithm: GSLB_ALGORITHM_GEO
           site_persistence_enabled: false
           min_members: 0
           health_monitor_scope: GSLB_SERVICE_HEALTH_MONITOR_ALL_MEMBERS

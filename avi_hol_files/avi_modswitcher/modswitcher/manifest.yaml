@@ -55,7 +55,7 @@ skus:
         description: "Deploys the global DNS virtual services and service engine groups per region, then federates the GSLB cluster and geo database profile."
         playbook: ../module-scripts/2740-04-module_2.yaml
       - name: "Module 3 - Creating a Basic Global Service"
-        description: "Creates a basic round-robin GSLB service fronting the basic-app virtual services in both regions."
+        description: "Creates a basic active/standby GSLB service fronting the adv-app virtual services in both regions."
         playbook: ../module-scripts/2740-04-module_3.yaml
       - name: "Module 4 - Creating an Advanced Global Service"
         description: "Creates an advanced GSLB service with priority-based pools and fallback members fronting the adv-app virtual services."
