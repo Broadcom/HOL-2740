@@ -39,6 +39,15 @@
       { name.contains: adv-app-b }
   register: vsvip_adv_app_b
 
+- name: Verify the virtual services the global service needs exist
+  ansible.builtin.assert:
+    that:
+      - vs_adv_app_a['obj']['count'] | int > 0
+      - vsvip_adv_app_a['obj']['count'] | int > 0
+      - vs_adv_app_b['obj']['count'] | int > 0
+      - vsvip_adv_app_b['obj']['count'] | int > 0
+    fail_msg: "A virtual service this global service points at was not found - check the lookups above"
+
 - name: Collect region01a cluster details
   vmware.alb.avi_api_session:
     avi_credentials: "{{ avi_creds_region01a }}"
@@ -64,14 +73,14 @@
     region: "{{region_placeholder}}"
     avi_config:
       gslbservice:
-        - name: adv-app.gslb.vcf.sddc.lab
+        - name: adv-app.global.vcf.lab
           controller_health_status_enabled: true
           down_response:
             type: GSLB_SERVICE_DOWN_RESPONSE_ALL_RECORDS
           enabled: true
           is_federated: true
           domain_names:
-            - adv-app.gslb.vcf.sddc.lab
+            - adv-app.global.vcf.lab
           health_monitor_refs:
             - '/api/healthmonitor?name=System-GSLB-HTTP'
           use_edns_client_subnet: true
@@ -95,26 +104,26 @@
                   enabled: true
                 - ip:
                     type: V4
-                    addr: 172.16.110.10
+                    addr: 10.1.13.11
                   ratio: 1
                   enabled: true
               enabled: true
-              name: adv-app-pool1
+              name: Palo Alto
               algorithm: GSLB_ALGORITHM_CONSISTENT_HASH
             - priority: 5
               members:
                 - ip:
                     type: V4
-                    addr: 172.16.110.10
+                    addr: 10.1.13.11
                   ratio: 1
                   enabled: true
                 - ip:
                     type: V4
-                    addr: 172.16.210.10
+                    addr: 10.1.14.11
                   ratio: 1
                   enabled: true
               enabled: true
-              name: adv-app-pool2
+              name: Barcelona
               algorithm: GSLB_ALGORITHM_ROUND_ROBIN
           ttl: 2
           min_members: 0
